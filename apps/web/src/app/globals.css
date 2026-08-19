@@ -1,28 +1,72 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #f6f4ef;
-  --foreground: #1c1917;
+  --background: #f3f4f6;
+  --foreground: #1c1f24;
+  --surface: #ffffff;
+  --surface-elevated: #ffffff;
+  --surface-subtle: #eceef1;
   --card: #ffffff;
-  --card-foreground: #1c1917;
-  --primary: #0f3d3e;
-  --primary-foreground: #f8faf8;
-  --secondary: #ece7dc;
-  --secondary-foreground: #1c1917;
-  --muted: #efeae1;
-  --muted-foreground: #57534e;
-  --accent: #ece7dc;
-  --accent-foreground: #1c1917;
+  --card-foreground: #1c1f24;
+  --primary: #1e6b66;
+  --primary-foreground: #f4fbfa;
+  --secondary: #eceef1;
+  --secondary-foreground: #1c1f24;
+  --muted: #eceef1;
+  --muted-foreground: #5f6670;
+  --accent: #1e6b66;
+  --accent-foreground: #f4fbfa;
   --destructive: #b42318;
   --destructive-foreground: #fff7f6;
-  --border: #e4ded3;
-  --input: #e4ded3;
-  --ring: #0f3d3e;
+  --positive: #1b7a4c;
+  --warning: #b45309;
+  --info: #2563eb;
+  --border: #e2e5ea;
+  --border-strong: #c9ced6;
+  --input: #e2e5ea;
+  --ring: #1e6b66;
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 0.06);
+  --radius: 0.5rem;
+  color-scheme: light;
+}
+
+html.dark {
+  --background: #0d0e10;
+  --foreground: #eceae6;
+  --surface: #15171b;
+  --surface-elevated: #1b1e24;
+  --surface-subtle: #22262c;
+  --card: #15171b;
+  --card-foreground: #eceae6;
+  --primary: #6bb5af;
+  --primary-foreground: #0d1c1b;
+  --secondary: #22262c;
+  --secondary-foreground: #eceae6;
+  --muted: #22262c;
+  --muted-foreground: #9aa1ab;
+  --accent: #6bb5af;
+  --accent-foreground: #0d1c1b;
+  --destructive: #f0887e;
+  --destructive-foreground: #2a0c0a;
+  --positive: #5dba86;
+  --warning: #e2a054;
+  --info: #7aa7f0;
+  --border: #2a2e35;
+  --border-strong: #3a4049;
+  --input: #2a2e35;
+  --ring: #6bb5af;
+  --shadow-sm: none;
+  color-scheme: dark;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-elevated: var(--surface-elevated);
+  --color-surface-subtle: var(--surface-subtle);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
   --color-primary: var(--primary);
@@ -35,19 +79,70 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-positive: var(--positive);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --radius-lg: var(--radius);
 }
 
 * {
   border-color: var(--border);
 }
 
+html,
+body {
+  height: 100%;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--primary) 22%, transparent);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.data-table tbody td {
+  padding: 0.625rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.data-table tbody tr:hover td {
+  background: var(--surface-subtle);
+}
+
+.data-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
 }

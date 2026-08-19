@@ -3,12 +3,12 @@
 import { useState, type FormEvent } from "react";
 import { Loader2 } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Panel, Section } from "@/components/ui/layout";
 import type { CompetitorDiscoveryResult, DiscoveredProductCandidate } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const MAX_SELECTED = 3;
 
@@ -33,7 +33,7 @@ function formatPrice(amount: number | null, currency: string | null): string {
   return `${currency ?? ""} ${amount}`.trim();
 }
 
-function CandidateCard({
+function CandidateRow({
   candidate,
   selected,
   disabled,
@@ -45,10 +45,16 @@ function CandidateCard({
   onToggle: () => void;
 }) {
   return (
-    <label className="flex cursor-pointer gap-3 rounded-lg border border-border p-3">
+    <label
+      className={cn(
+        "flex cursor-pointer gap-4 border-b border-border px-4 py-3 transition-colors duration-200 last:border-b-0 hover:bg-surface-subtle",
+        selected && "bg-surface-subtle",
+        disabled && !selected && "cursor-not-allowed opacity-50",
+      )}
+    >
       <input
         type="checkbox"
-        className="mt-1"
+        className="mt-2"
         checked={selected}
         disabled={disabled && !selected}
         onChange={onToggle}
@@ -58,28 +64,31 @@ function CandidateCard({
         <img
           src={candidate.image}
           alt=""
-          className="h-16 w-16 shrink-0 rounded-md object-cover bg-muted"
+          className="h-14 w-14 shrink-0 rounded-md bg-surface-subtle object-cover"
         />
       ) : (
-        <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-md bg-muted text-xs text-muted-foreground">
+        <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-md bg-surface-subtle text-[11px] text-muted-foreground">
           No image
         </div>
       )}
       <div className="min-w-0 flex-1 space-y-1">
         <p className="text-sm font-medium leading-5">{candidate.title}</p>
-        <p className="font-mono text-xs text-muted-foreground">ASIN: {candidate.asin}</p>
+        <p className="text-xs text-muted-foreground">{candidate.asin}</p>
         <p className="text-xs text-muted-foreground">
-          {formatPrice(candidate.price, candidate.currency)} ·{" "}
-          {formatValue(candidate.rating, " ★")} · {formatValue(candidate.review_count)} reviews
+          {formatPrice(candidate.price, candidate.currency)}
+          {" · "}
+          {formatValue(candidate.rating, " ★")}
+          {" · "}
+          {formatValue(candidate.review_count)} reviews
         </p>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="secondary">Relevance: {candidate.relevance_score}</Badge>
-          <span className="text-xs text-muted-foreground">
-            Search position: {candidate.position ?? "Not available"}
-          </span>
-          {candidate.is_sponsored ? <Badge variant="outline">Sponsored</Badge> : null}
+        <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+          <span>Similarity {candidate.relevance_score}</span>
+          {candidate.is_sponsored ? <span>Sponsored</span> : null}
         </div>
       </div>
+      <span className="self-center text-xs font-medium text-muted-foreground">
+        {selected ? "Selected" : "Select"}
+      </span>
     </label>
   );
 }
@@ -123,92 +132,74 @@ export function CompetitorDiscovery({
   }
 
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader className="space-y-2">
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-            Competitor Discovery
-          </p>
-          <CardTitle className="text-2xl">Suggested competitors</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={onSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="amazon-search-query">Amazon search query</Label>
-              <Input
-                id="amazon-search-query"
-                value={query}
-                onChange={(event) => onQueryChange(event.target.value)}
-                disabled={loading}
-              />
-              <p className="text-xs text-muted-foreground">
-                This is a suggested Amazon search, not a list of confirmed competitors.
-                You can edit it before searching.
-              </p>
-            </div>
-            {localError ? <p className="text-sm text-destructive">{localError}</p> : null}
-            <Button type="submit" size="lg" disabled={loading} className="w-full sm:w-auto">
-              {loading ? (
-                <>
-                  <Loader2 className="animate-spin" />
-                  Searching Amazon...
-                </>
-              ) : (
-                "Search Amazon"
-              )}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
+    <Section
+      title="Competitor discovery"
+      description="Suggested Amazon search results. Relevance is title and category similarity, not sales rank. You confirm what to compare."
+    >
+      <Panel className="p-5">
+        <form onSubmit={onSubmit} className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <div className="min-w-0 flex-1 space-y-1.5">
+            <Label htmlFor="amazon-search-query">Amazon search query</Label>
+            <Input
+              id="amazon-search-query"
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              disabled={loading}
+            />
+          </div>
+          <Button type="submit" variant="outline" disabled={loading} className="shrink-0">
+            {loading ? (
+              <>
+                <Loader2 className="animate-spin" />
+                Searching Amazon for candidate listings…
+              </>
+            ) : (
+              "Search Amazon"
+            )}
+          </Button>
+        </form>
+        {localError ? <p className="mt-2 text-sm text-destructive">{localError}</p> : null}
+      </Panel>
 
       {result ? (
-        <Card>
-          <CardHeader className="space-y-2">
-            <CardTitle>Candidate listings</CardTitle>
+        <Panel>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
             <p className="text-sm text-muted-foreground">
-              Search used: {result.search_query}. Relevance is title/category similarity to your
-              listing, not sales or market position. Select up to {MAX_SELECTED}.
+              Search used: {result.search_query}. Select up to {MAX_SELECTED}.
             </p>
             <p className="text-sm font-medium">
               {selectedAsins.length} / {MAX_SELECTED} selected
             </p>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {result.candidates.length ? (
-              result.candidates.map((candidate) => (
-                <CandidateCard
-                  key={candidate.asin}
-                  candidate={candidate}
-                  selected={selectedAsins.includes(candidate.asin)}
-                  disabled={
-                    selectedAsins.length >= MAX_SELECTED && !selectedAsins.includes(candidate.asin)
-                  }
-                  onToggle={() => onToggleAsin(candidate.asin)}
-                />
-              ))
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No relevant Amazon results were found for this search.
-              </p>
-            )}
-            <Button
-              type="button"
-              size="lg"
-              disabled={compareLoading || selectedAsins.length < 1}
-              onClick={onCompare}
-            >
+          </div>
+          {result.candidates.length ? (
+            result.candidates.map((candidate) => (
+              <CandidateRow
+                key={candidate.asin}
+                candidate={candidate}
+                selected={selectedAsins.includes(candidate.asin)}
+                disabled={selectedAsins.length >= MAX_SELECTED && !selectedAsins.includes(candidate.asin)}
+                onToggle={() => onToggleAsin(candidate.asin)}
+              />
+            ))
+          ) : (
+            <p className="px-4 py-8 text-sm text-muted-foreground">
+              No relevant Amazon results were found for this search.
+            </p>
+          )}
+          <div className="px-4 py-3">
+            <Button type="button" disabled={compareLoading || selectedAsins.length < 1} onClick={onCompare}>
               {compareLoading ? (
                 <>
                   <Loader2 className="animate-spin" />
-                  Fetching competitor data...
+                  Comparing selected competitors…
                 </>
               ) : (
-                "Compare Selected"
+                "Compare selected"
               )}
             </Button>
-          </CardContent>
-        </Card>
+          </div>
+        </Panel>
       ) : null}
-    </div>
+    </Section>
   );
 }

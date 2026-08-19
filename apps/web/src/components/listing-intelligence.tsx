@@ -1,78 +1,61 @@
 "use client";
 
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
-import type {
-  AnalysisSection,
-  Finding,
-  FindingSeverity,
-  ListingAnalysis,
-  Recommendation,
-} from "@/lib/types";
-
-const SECTION_LABELS: Record<string, string> = {
-  title: "Title",
-  bullets: "Bullets",
-  description: "Description",
-  images: "Images",
-  completeness: "Completeness",
-  social_proof: "Social Proof",
-};
-
-const SEVERITY_STYLES: Record<FindingSeverity, string> = {
-  high: "border-transparent bg-destructive text-destructive-foreground",
-  medium: "border-transparent bg-amber-100 text-amber-900",
-  low: "border-transparent bg-secondary text-secondary-foreground",
-  info: "border-border bg-background text-muted-foreground",
-};
+import { Panel, Section } from "@/components/ui/layout";
+import { ScoreBar, SeverityDot, SeverityLabel } from "@/components/ui/score";
+import type { Finding, FindingSeverity, ListingAnalysis, Recommendation } from "@/lib/types";
 
 const SECTION_ORDER = [
-  "title",
-  "bullets",
-  "description",
-  "images",
-  "completeness",
-  "social_proof",
+  ["title", "Title"],
+  ["bullets", "Bullets"],
+  ["description", "Description"],
+  ["images", "Images"],
+  ["completeness", "Completeness"],
+  ["social_proof", "Social Proof"],
 ] as const;
 
-function formatMetric(value: unknown): string {
-  if (Array.isArray(value)) {
-    return value.length ? value.map(String).join(", ") : "none";
-  }
-  if (typeof value === "boolean") {
-    return value ? "yes" : "no";
-  }
-  if (value == null) {
-    return "—";
-  }
-  if (typeof value === "object") {
-    return JSON.stringify(value);
-  }
-  return String(value);
-}
-
-function metricEntries(section: AnalysisSection): Array<[string, unknown]> {
-  return Object.entries(section.metrics).filter(([, value]) => {
-    return typeof value !== "object" || Array.isArray(value) || value === null;
-  });
-}
+const SEVERITY_ORDER: FindingSeverity[] = ["high", "medium", "low", "info"];
 
 function FindingsList({ findings }: { findings: Finding[] }) {
   if (!findings.length) {
     return <p className="text-sm text-muted-foreground">No findings were generated.</p>;
   }
+
   return (
-    <ul className="space-y-3">
-      {findings.map((finding) => (
-        <li key={`${finding.code}-${finding.message}`} className="flex gap-3">
-          <Badge className={cn("mt-0.5 uppercase", SEVERITY_STYLES[finding.severity])}>
-            {finding.severity}
-          </Badge>
-          <p className="text-sm leading-6 text-foreground">{finding.message}</p>
-        </li>
-      ))}
-    </ul>
+    <div className="space-y-6">
+      {SEVERITY_ORDER.map((severity) => {
+        const items = findings.filter((finding) => finding.severity === severity);
+        if (!items.length) {
+          return null;
+        }
+        const heading =
+          severity === "high"
+            ? "High priority"
+            : severity === "medium"
+              ? "Medium"
+              : severity === "low"
+                ? "Low"
+                : "Notes";
+        return (
+          <div key={severity} className="space-y-2">
+            <p className="text-xs font-medium text-muted-foreground">{heading}</p>
+            <ul className="divide-y divide-border">
+              {items.map((finding) => (
+                <li key={`${finding.code}-${finding.message}`} className="flex gap-3 py-3 first:pt-0 last:pb-0">
+                  <SeverityDot severity={finding.severity} />
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-medium">{finding.category}</p>
+                      <SeverityLabel severity={finding.severity} />
+                    </div>
+                    <p className="text-sm leading-6 text-muted-foreground">{finding.message}</p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -85,9 +68,12 @@ function RecommendationsList({ recommendations }: { recommendations: Recommendat
     );
   }
   return (
-    <ol className="list-decimal space-y-2 pl-5 text-sm leading-6 text-foreground">
-      {recommendations.map((item) => (
-        <li key={item.code}>{item.message}</li>
+    <ol className="space-y-3">
+      {recommendations.map((item, index) => (
+        <li key={item.code} className="flex gap-3 text-sm leading-6">
+          <span className="w-5 shrink-0 tabular-nums text-muted-foreground">{index + 1}.</span>
+          <span>{item.message}</span>
+        </li>
       ))}
     </ol>
   );
@@ -95,77 +81,38 @@ function RecommendationsList({ recommendations }: { recommendations: Recommendat
 
 export function ListingIntelligence({ analysis }: { analysis: ListingAnalysis }) {
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader className="space-y-2">
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-            Listing Intelligence
-          </p>
-          <CardTitle className="text-2xl">Overall Score</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <p className="text-4xl font-semibold tracking-tight">
-            {analysis.overall_score}
-            <span className="text-lg font-medium text-muted-foreground"> / 100</span>
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Deterministic analysis {analysis.score_version}. Scores are not generated by AI.
-          </p>
-          <div className="divide-y divide-border rounded-lg border border-border">
-            {SECTION_ORDER.map((key) => {
+    <Section
+      title="Listing intelligence"
+      description={`Deterministic analysis ${analysis.score_version}. Scores are not generated by AI.`}
+    >
+      <Panel className="p-5">
+        <div className="grid gap-8 lg:grid-cols-[11rem_1fr] lg:items-start">
+          <div>
+            <p className="text-xs text-muted-foreground">Overall listing score</p>
+            <p className="mt-1 text-[2rem] font-semibold tabular-nums tracking-tight">
+              {analysis.overall_score}
+              <span className="text-base font-medium text-muted-foreground"> / 100</span>
+            </p>
+          </div>
+          <div className="space-y-3">
+            {SECTION_ORDER.map(([key, label]) => {
               const section = analysis.sections[key];
-              return (
-                <details key={key} className="group p-4">
-                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium">
-                    <span>{SECTION_LABELS[key]}</span>
-                    <span className="font-mono text-muted-foreground">
-                      {section.score}/{section.max_score}
-                    </span>
-                  </summary>
-                  <div className="mt-3 space-y-3 text-sm">
-                    <p className="capitalize text-muted-foreground">Status: {section.status}</p>
-                    <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {metricEntries(section).map(([name, value]) => (
-                        <div key={name}>
-                          <dt className="text-xs uppercase tracking-wide text-muted-foreground">
-                            {name.replaceAll("_", " ")}
-                          </dt>
-                          <dd className="font-medium">{formatMetric(value)}</dd>
-                        </div>
-                      ))}
-                    </dl>
-                    {section.findings.length ? (
-                      <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                        {section.findings.map((note) => (
-                          <li key={note}>{note}</li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </div>
-                </details>
-              );
+              return <ScoreBar key={key} label={label} score={section.score} max={section.max_score} />;
             })}
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </Panel>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Key Findings</CardTitle>
-        </CardHeader>
-        <CardContent>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Panel className="p-5">
+          <h3 className="mb-4 text-[0.95rem] font-semibold">Findings</h3>
           <FindingsList findings={analysis.findings} />
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Recommended Actions</CardTitle>
-        </CardHeader>
-        <CardContent>
+        </Panel>
+        <Panel className="p-5">
+          <h3 className="mb-4 text-[0.95rem] font-semibold">Recommended actions</h3>
           <RecommendationsList recommendations={analysis.recommendations} />
-        </CardContent>
-      </Card>
-    </div>
+        </Panel>
+      </div>
+    </Section>
   );
 }

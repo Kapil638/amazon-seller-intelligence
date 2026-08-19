@@ -4,9 +4,9 @@ import { useMemo, useState, type ChangeEvent, type DragEvent } from "react";
 import { Loader2 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Kpi, PageHeader, Panel } from "@/components/ui/layout";
+import { SeverityDot, SeverityLabel } from "@/components/ui/score";
 import { analyzeReport, ReportAnalysisError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
@@ -14,20 +14,12 @@ import type {
   CampaignSummary,
   ProductPerformanceRow,
   ReportFinding,
-  ReportFindingSeverity,
   SearchTermReportAnalysis,
   SearchTermSummary,
   WastedSpendRow,
 } from "@/lib/types";
 
 const MAX_BYTES = 26_214_400;
-
-const SEVERITY_STYLES: Record<ReportFindingSeverity, string> = {
-  high: "border-transparent bg-destructive text-destructive-foreground",
-  medium: "border-transparent bg-amber-100 text-amber-900",
-  low: "border-transparent bg-secondary text-secondary-foreground",
-  info: "border-border bg-background text-muted-foreground",
-};
 
 function formatInr(value: string | null | undefined): string {
   if (value == null || value === "") {
@@ -83,11 +75,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function Kpi({ label, value }: { label: string; value: string }) {
+function KpiGrid({ items }: { items: Array<{ label: string; value: string }> }) {
   return (
-    <div className="rounded-lg border border-border bg-background p-4">
-      <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className="mt-1 text-lg font-semibold tabular-nums">{value}</p>
+    <div className="grid gap-6 sm:grid-cols-3 lg:grid-cols-5">
+      {items.map((item) => (
+        <Kpi key={item.label} label={item.label} value={item.value} />
+      ))}
     </div>
   );
 }
@@ -159,27 +152,25 @@ export function SellerReports() {
     }
   }
 
-  return (
-    <div className="mx-auto w-full max-w-6xl space-y-8">
-      <header className="space-y-3">
-        <p className="text-xs font-medium uppercase tracking-[0.22em] text-muted-foreground">
-          Milestone 9
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Seller Reports</h1>
-        <p className="max-w-2xl text-base text-muted-foreground">
-          Upload an Amazon Seller Central export. Analytics are deterministic and stay in memory.
-          Nothing is saved.
-        </p>
-      </header>
+  const idle = !result;
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Upload Amazon Seller Central report</CardTitle>
-          <CardDescription>
-            Supported: Sponsored Products Search Term Report and Business Report (.csv or .xlsx).
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+  return (
+    <div className={idle ? "flex min-h-[calc(100dvh-7.5rem)] flex-col items-center justify-center" : "space-y-8"}>
+      <div className={idle ? "w-full max-w-2xl space-y-6" : "space-y-8"}>
+      <PageHeader
+        align={idle ? "center" : "start"}
+        title="Seller reports"
+        description="Upload an Amazon Seller Central export. Analytics are deterministic and stay in this session. Nothing is saved."
+      />
+
+      <Panel className="p-5">
+        <div className={cn("mb-4 space-y-1", idle && "text-center")}>
+          <h2 className="text-[0.95rem] font-semibold">Upload report</h2>
+          <p className="text-sm text-muted-foreground">
+            Sponsored Products Search Term Report or Business Report (.csv or .xlsx).
+          </p>
+        </div>
+        <div className="space-y-4">
           <label
             onDragOver={(event) => {
               event.preventDefault();
@@ -188,8 +179,8 @@ export function SellerReports() {
             onDragLeave={() => setDragOver(false)}
             onDrop={onDrop}
             className={cn(
-              "flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed px-6 py-10 text-center",
-              dragOver ? "border-primary bg-accent" : "border-border bg-muted/30",
+              "flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed px-6 py-10 text-center transition-colors duration-200",
+              dragOver ? "border-primary bg-surface-subtle" : "border-border bg-surface-subtle/50",
             )}
           >
             <input
@@ -198,28 +189,30 @@ export function SellerReports() {
               className="sr-only"
               onChange={onInputChange}
             />
-            <p className="text-sm font-medium">Drag & drop CSV/XLSX</p>
-            <p className="mt-1 text-sm text-muted-foreground">or choose a file</p>
+            <p className="text-sm font-medium">Drop a CSV or XLSX file</p>
+            <p className="mt-1 text-sm text-muted-foreground">or click to choose a file, up to 25 MB</p>
           </label>
 
           {file ? (
-            <p className="text-sm text-muted-foreground">
+            <p className={cn("text-sm text-muted-foreground", idle && "text-center")}>
               {file.name} · {formatBytes(file.size)}
             </p>
           ) : null}
 
-          <Button type="button" size="lg" disabled={!file || loading} onClick={() => void onAnalyze()}>
-            {loading ? (
-              <>
-                <Loader2 className="animate-spin" />
-                Analyzing report...
-              </>
-            ) : (
-              "Analyze Report"
-            )}
-          </Button>
-        </CardContent>
-      </Card>
+          <div className={idle ? "flex justify-center" : undefined}>
+            <Button type="button" disabled={!file || loading} onClick={() => void onAnalyze()}>
+              {loading ? (
+                <>
+                  <Loader2 className="animate-spin" />
+                  Analyzing report…
+                </>
+              ) : (
+                "Analyze report"
+              )}
+            </Button>
+          </div>
+        </div>
+      </Panel>
 
       {error ? (
         <Alert variant="destructive">
@@ -227,6 +220,7 @@ export function SellerReports() {
           <AlertDescription className="whitespace-pre-line">{error}</AlertDescription>
         </Alert>
       ) : null}
+      </div>
 
       {result?.report_type === "search_term_report" ? (
         <SearchTermView result={result} />
@@ -241,13 +235,14 @@ function Findings({ findings }: { findings: ReportFinding[] }) {
     return <p className="text-sm text-muted-foreground">No findings for this report.</p>;
   }
   return (
-    <ul className="space-y-3">
+    <ul className="divide-y divide-border">
       {findings.map((finding) => (
-        <li key={`${finding.code}-${finding.entity ?? ""}-${finding.message}`} className="flex gap-3">
-          <Badge className={cn("mt-0.5 uppercase", SEVERITY_STYLES[finding.severity])}>
-            {finding.severity}
-          </Badge>
-          <p className="text-sm leading-6">{finding.message}</p>
+        <li key={`${finding.code}-${finding.entity ?? ""}-${finding.message}`} className="flex gap-3 py-3 first:pt-0 last:pb-0">
+          <SeverityDot severity={finding.severity} />
+          <div className="min-w-0 space-y-1">
+            <SeverityLabel severity={finding.severity} />
+            <p className="text-sm leading-6">{finding.message}</p>
+          </div>
         </li>
       ))}
     </ul>
@@ -258,27 +253,29 @@ function SearchTermView({ result }: { result: SearchTermReportAnalysis }) {
   const summary = result.summary;
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>PPC Summary</CardTitle>
-          <CardDescription>
-            Search used {result.meta.valid_rows} valid rows
+      <Panel className="p-5">
+        <div className="mb-5 space-y-1">
+          <h2 className="text-[0.95rem] font-semibold">PPC summary</h2>
+          <p className="text-sm text-muted-foreground">
+            {result.meta.valid_rows} valid rows
             {result.meta.invalid_rows ? ` · ${result.meta.invalid_rows} skipped` : ""}. Metrics are
             observed from this file only.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-3 lg:grid-cols-5">
-          <Kpi label="Spend" value={formatInr(summary.spend)} />
-          <Kpi label="Sales" value={formatInr(summary.sales)} />
-          <Kpi label="Orders" value={formatNumber(summary.orders)} />
-          <Kpi label="ACOS" value={formatPercent(summary.acos)} />
-          <Kpi label="ROAS" value={formatRoas(summary.roas)} />
-          <Kpi label="Clicks" value={formatNumber(summary.clicks)} />
-          <Kpi label="CPC" value={formatInr(summary.cpc)} />
-          <Kpi label="CTR" value={formatPercent(summary.ctr)} />
-          <Kpi label="CVR" value={formatPercent(summary.cvr)} />
-        </CardContent>
-      </Card>
+          </p>
+        </div>
+        <KpiGrid
+          items={[
+            { label: "Spend", value: formatInr(summary.spend) },
+            { label: "Sales", value: formatInr(summary.sales) },
+            { label: "Orders", value: formatNumber(summary.orders) },
+            { label: "ACOS", value: formatPercent(summary.acos) },
+            { label: "ROAS", value: formatRoas(summary.roas) },
+            { label: "Clicks", value: formatNumber(summary.clicks) },
+            { label: "CPC", value: formatInr(summary.cpc) },
+            { label: "CTR", value: formatPercent(summary.ctr) },
+            { label: "CVR", value: formatPercent(summary.cvr) },
+          ]}
+        />
+      </Panel>
 
       {result.warnings.length ? (
         <Alert>
@@ -290,28 +287,24 @@ function SearchTermView({ result }: { result: SearchTermReportAnalysis }) {
         </Alert>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Wasted Spend</CardTitle>
-          <CardDescription>
+      <Panel className="p-5">
+        <div className="mb-4 space-y-1">
+          <h2 className="text-[0.95rem] font-semibold">Wasted spend</h2>
+          <p className="text-sm text-muted-foreground">
             Heuristic: zero-order spend at or above ₹500, or high observed ACOS (≥ 50%) with
             meaningful spend. This is not a profitability verdict.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <WastedTable rows={result.tables.wasted_spend} />
-        </CardContent>
-      </Card>
+          </p>
+        </div>
+        <WastedTable rows={result.tables.wasted_spend} />
+      </Panel>
 
       {result.tables.negative_keyword_candidates.length ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Negative-keyword candidates</CardTitle>
-            <CardDescription>
-              Review these search terms. Nothing is applied automatically.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2 text-sm">
+        <Panel className="p-5">
+          <div className="mb-4 space-y-1">
+            <h2 className="text-[0.95rem] font-semibold">Negative-keyword candidates</h2>
+            <p className="text-sm text-muted-foreground">Review these search terms. Nothing is applied automatically.</p>
+          </div>
+          <div className="space-y-2 text-sm">
             {result.tables.negative_keyword_candidates.map((item) => (
               <p key={item.search_term}>
                 <span className="font-medium">{item.search_term}</span>
@@ -319,55 +312,47 @@ function SearchTermView({ result }: { result: SearchTermReportAnalysis }) {
                 {formatInr(item.spend)} spend · {item.message}
               </p>
             ))}
-          </CardContent>
-        </Card>
+          </div>
+        </Panel>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Search Term Performance</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <SearchTermTable rows={result.tables.search_terms} />
-        </CardContent>
-      </Card>
+      <Panel className="overflow-hidden p-5">
+        <h2 className="mb-4 text-[0.95rem] font-semibold">Search term performance</h2>
+        <SearchTermTable rows={result.tables.search_terms} />
+      </Panel>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Campaign Performance</CardTitle>
-          <CardDescription>Budget efficiency is not inferred. Spend and sales are observed totals.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <CampaignTable rows={result.tables.campaigns} />
-        </CardContent>
-      </Card>
+      <Panel className="overflow-hidden p-5">
+        <div className="mb-4 space-y-1">
+          <h2 className="text-[0.95rem] font-semibold">Campaign performance</h2>
+          <p className="text-sm text-muted-foreground">
+            Budget efficiency is not inferred. Spend and sales are observed totals.
+          </p>
+        </div>
+        <CampaignTable rows={result.tables.campaigns} />
+      </Panel>
 
       {result.tables.strong_search_terms.length ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Strong observed search-term performance</CardTitle>
-            <CardDescription>
+        <Panel className="p-5">
+          <div className="mb-4 space-y-1">
+            <h2 className="text-[0.95rem] font-semibold">Strong observed search-term performance</h2>
+            <p className="text-sm text-muted-foreground">
               Orders with enough clicks and conversion. Not labeled as winning keywords.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-1 text-sm">
+            </p>
+          </div>
+          <div className="space-y-1 text-sm">
             {result.tables.strong_search_terms.map((item) => (
               <p key={item.search_term}>
                 {item.search_term} · {item.orders} orders · CVR {formatPercent(item.cvr)}
               </p>
             ))}
-          </CardContent>
-        </Card>
+          </div>
+        </Panel>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Findings</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <Findings findings={result.findings} />
-        </CardContent>
-      </Card>
+      <Panel className="p-5">
+        <h2 className="mb-4 text-[0.95rem] font-semibold">Findings</h2>
+        <Findings findings={result.findings} />
+      </Panel>
     </div>
   );
 }
@@ -376,41 +361,35 @@ function BusinessView({ result }: { result: BusinessReportAnalysis }) {
   const summary = result.summary;
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Business Summary</CardTitle>
-          <CardDescription>
+      <Panel className="p-5">
+        <div className="mb-5 space-y-1">
+          <h2 className="text-[0.95rem] font-semibold">Business summary</h2>
+          <p className="text-sm text-muted-foreground">
             {result.meta.valid_rows} valid rows
             {result.meta.invalid_rows ? ` · ${result.meta.invalid_rows} skipped` : ""}.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <Kpi label="Sessions" value={formatNumber(summary.sessions)} />
-          <Kpi label="Page Views" value={formatNumber(summary.page_views)} />
-          <Kpi label="Units Ordered" value={formatNumber(summary.units_ordered)} />
-          <Kpi label="Sales" value={formatInr(summary.ordered_product_sales)} />
-          <Kpi label="Conversion" value={formatPercent(summary.conversion)} />
-          <Kpi label="Buy Box %" value={formatPercent(summary.buy_box_percentage)} />
-        </CardContent>
-      </Card>
+          </p>
+        </div>
+        <KpiGrid
+          items={[
+            { label: "Sessions", value: formatNumber(summary.sessions) },
+            { label: "Page views", value: formatNumber(summary.page_views) },
+            { label: "Units ordered", value: formatNumber(summary.units_ordered) },
+            { label: "Sales", value: formatInr(summary.ordered_product_sales) },
+            { label: "Conversion", value: formatPercent(summary.conversion) },
+            { label: "Buy Box %", value: formatPercent(summary.buy_box_percentage) },
+          ]}
+        />
+      </Panel>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Product Performance</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ProductTable rows={result.tables.products} />
-        </CardContent>
-      </Card>
+      <Panel className="overflow-hidden p-5">
+        <h2 className="mb-4 text-[0.95rem] font-semibold">Product performance</h2>
+        <ProductTable rows={result.tables.products} />
+      </Panel>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Performance Findings</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <Findings findings={result.findings} />
-        </CardContent>
-      </Card>
+      <Panel className="p-5">
+        <h2 className="mb-4 text-[0.95rem] font-semibold">Performance findings</h2>
+        <Findings findings={result.findings} />
+      </Panel>
     </div>
   );
 }
@@ -421,29 +400,29 @@ function WastedTable({ rows }: { rows: WastedSpendRow[] }) {
   }
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[40rem] text-left text-sm">
-        <thead className="text-xs uppercase text-muted-foreground">
+      <table className="data-table min-w-[40rem]">
+        <thead>
           <tr>
-            <th className="pb-2 pr-3">Search Term</th>
-            <th className="pb-2 pr-3">Spend</th>
-            <th className="pb-2 pr-3">Clicks</th>
-            <th className="pb-2 pr-3">Orders</th>
-            <th className="pb-2 pr-3">Sales</th>
-            <th className="pb-2 pr-3">Reason</th>
-            <th className="pb-2">Severity</th>
+            <th>Search term</th>
+            <th className="num">Spend</th>
+            <th className="num">Clicks</th>
+            <th className="num">Orders</th>
+            <th className="num">Sales</th>
+            <th>Reason</th>
+            <th>Severity</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={`${row.search_term}-${row.reason_code}`} className="border-t border-border">
-              <td className="py-2 pr-3">{row.search_term}</td>
-              <td className="py-2 pr-3 tabular-nums">{formatInr(row.spend)}</td>
-              <td className="py-2 pr-3 tabular-nums">{formatNumber(row.clicks)}</td>
-              <td className="py-2 pr-3 tabular-nums">{formatNumber(row.orders)}</td>
-              <td className="py-2 pr-3 tabular-nums">{formatInr(row.sales)}</td>
-              <td className="py-2 pr-3">{row.reason}</td>
-              <td className="py-2">
-                <Badge className={cn("uppercase", SEVERITY_STYLES[row.severity])}>{row.severity}</Badge>
+            <tr key={`${row.search_term}-${row.reason_code}`}>
+              <td>{row.search_term}</td>
+              <td className="num">{formatInr(row.spend)}</td>
+              <td className="num">{formatNumber(row.clicks)}</td>
+              <td className="num">{formatNumber(row.orders)}</td>
+              <td className="num">{formatInr(row.sales)}</td>
+              <td>{row.reason}</td>
+              <td>
+                <SeverityLabel severity={row.severity} />
               </td>
             </tr>
           ))}
@@ -515,7 +494,7 @@ function SortablePpcTable<T extends SearchTermSummary | CampaignSummary>({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[52rem] text-left text-sm">
+      <table className="data-table min-w-[52rem]">
         <thead className="text-xs uppercase text-muted-foreground">
           <tr>
             {headers.map(([key, label]) => (
@@ -581,7 +560,7 @@ function ProductTable({ rows }: { rows: ProductPerformanceRow[] }) {
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[48rem] text-left text-sm">
+      <table className="data-table min-w-[48rem]">
         <thead className="text-xs uppercase text-muted-foreground">
           <tr>
             {[

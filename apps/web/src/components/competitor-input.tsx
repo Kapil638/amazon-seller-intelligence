@@ -4,9 +4,9 @@ import { useState, type FormEvent } from "react";
 import { Loader2, Plus, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Panel, Section } from "@/components/ui/layout";
 import { isValidAsin, normalizeAsin } from "@/lib/asin";
 
 const MAX_COMPETITORS = 3;
@@ -58,28 +58,25 @@ export function CompetitorInput({
   }
 
   return (
-    <Card>
-      <CardHeader className="space-y-2">
-        <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
-          Competitor Intelligence
-        </p>
-        <CardTitle className="text-2xl">Compare Competitors</CardTitle>
-      </CardHeader>
-      <CardContent>
+    <Section
+      title="Compare known competitors"
+      description="Enter competitor ASINs directly if you already know them."
+    >
+      <Panel className="p-5">
         <form onSubmit={onSubmit} className="space-y-4">
-          <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
-            <p className="text-xs uppercase tracking-[0.16em] text-muted-foreground">Your Product</p>
-            <p className="mt-1 font-mono tracking-wide">{targetAsin}</p>
+          <div className="flex items-baseline justify-between gap-3 rounded-md bg-surface-subtle px-3 py-2 text-sm">
+            <span className="text-xs text-muted-foreground">Your product</span>
+            <span className="font-mono tracking-wide">{targetAsin}</span>
           </div>
 
           {asins.map((asin, index) => (
-            <div key={index} className="space-y-2">
+            <div key={index} className="space-y-1.5">
               <div className="flex items-center justify-between gap-2">
                 <Label htmlFor={`competitor-asin-${index}`}>Competitor ASIN {index + 1}</Label>
                 {asins.length > 1 ? (
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground transition-colors duration-200 hover:text-foreground"
                     onClick={() => setAsins((current) => current.filter((_, i) => i !== index))}
                     disabled={loading}
                   >
@@ -104,7 +101,7 @@ export function CompetitorInput({
           {asins.length < MAX_COMPETITORS ? (
             <button
               type="button"
-              className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+              className="inline-flex items-center gap-1 text-sm text-muted-foreground transition-colors duration-200 hover:text-foreground"
               onClick={() => setAsins((current) => [...current, ""])}
               disabled={loading}
             >
@@ -115,18 +112,18 @@ export function CompetitorInput({
 
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
-          <Button type="submit" size="lg" disabled={loading} className="w-full sm:w-auto">
+          <Button type="submit" variant="outline" disabled={loading}>
             {loading ? (
               <>
                 <Loader2 className="animate-spin" />
-                Fetching competitor data...
+                Fetching competitor data…
               </>
             ) : (
-              "Analyze Competitors"
+              "Analyze competitors"
             )}
           </Button>
         </form>
-      </CardContent>
-    </Card>
+      </Panel>
+    </Section>
   );
 }

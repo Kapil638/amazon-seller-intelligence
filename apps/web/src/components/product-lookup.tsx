@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { Loader2 } from "lucide-react";
+import { ArrowRight, Loader2 } from "lucide-react";
 
 import { AICompetitiveIntelligenceView } from "@/components/ai-competitive-intelligence";
 import { AIListingIntelligenceView } from "@/components/ai-listing-intelligence";
@@ -13,7 +13,7 @@ import { ManualProductForm } from "@/components/manual-product-form";
 import { ProductResult } from "@/components/product-result";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/layout";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -27,7 +27,6 @@ import {
   ProductLookupError,
 } from "@/lib/api";
 import { isValidAsin, normalizeAsin } from "@/lib/asin";
-import { cn } from "@/lib/utils";
 import type {
   AICompetitiveIntelligenceResponse,
   AIListingIntelligenceResponse,
@@ -37,14 +36,9 @@ import type {
   ProductResponse,
 } from "@/lib/types";
 
-const SAMPLE_ASINS = ["B0TEST0001", "B0TEST0002", "B0TEST0003"] as const;
-
-type Mode = "live" | "demo" | "manual";
-
 export function ProductLookup() {
-  const [mode, setMode] = useState<Mode>("live");
   const [liveAsin, setLiveAsin] = useState("");
-  const [demoAsin, setDemoAsin] = useState("B0TEST0001");
+  const [showManual, setShowManual] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ProductResponse | null>(null);
@@ -68,18 +62,7 @@ export function ProductLookup() {
   const [discovery, setDiscovery] = useState<CompetitorDiscoveryResult | null>(null);
   const [selectedCandidateAsins, setSelectedCandidateAsins] = useState<string[]>([]);
 
-  async function analyze(nextAsin: string) {
-    const normalized = normalizeAsin(nextAsin);
-
-    if (!isValidAsin(normalized)) {
-      setResult(null);
-      setAnalysis(null);
-      setError("Enter a valid 10-character ASIN using letters and numbers only.");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
+  function resetDownstream() {
     setAnalysisError(null);
     setAnalysis(null);
     setAiError(null);
@@ -93,6 +76,21 @@ export function ProductLookup() {
     setDiscoveryError(null);
     setDiscovery(null);
     setSelectedCandidateAsins([]);
+  }
+
+  async function analyze(nextAsin: string) {
+    const normalized = normalizeAsin(nextAsin);
+
+    if (!isValidAsin(normalized)) {
+      setResult(null);
+      setAnalysis(null);
+      setError("Enter a valid 10-character ASIN using letters and numbers only.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    resetDownstream();
 
     try {
       const next = await fetchProduct(normalized, "amazon.in");
@@ -102,7 +100,7 @@ export function ProductLookup() {
       if (err instanceof ProductLookupError) {
         setError(err.message);
       } else {
-        setError("Something went wrong. Please try again.");
+        setError("The listing could not be retrieved right now.");
       }
     } finally {
       setLoading(false);
@@ -114,200 +112,124 @@ export function ProductLookup() {
     void analyze(liveAsin);
   }
 
-  function onDemoSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void analyze(demoAsin);
-  }
+  const idle = !result;
 
   return (
-    <div className="mx-auto w-full max-w-3xl space-y-8">
-      <header className="space-y-3">
-        <p className="text-xs font-medium uppercase tracking-[0.22em] text-muted-foreground">
-          Milestone 8
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
-          Amazon Seller Intelligence
-        </h1>
-        <p className="max-w-xl text-base text-muted-foreground">
-          Analyze any Amazon product, then discover and compare competitor listings.
-        </p>
+    <div className={idle ? "flex min-h-[calc(100dvh-7.5rem)] flex-col items-center justify-center" : "space-y-10"}>
+      <div className={idle ? "w-full max-w-2xl space-y-6 text-center" : "space-y-5"}>
+      <header className="space-y-5">
+        <div className="space-y-2">
+          <h1 className="text-[2rem] font-semibold leading-tight tracking-tight">
+            Amazon Product Intelligence
+          </h1>
+          <p className="text-[0.9375rem] leading-relaxed text-muted-foreground">
+            Research a product, evaluate its listing quality, and benchmark it against competing
+            Amazon listings.
+          </p>
+        </div>
+
+        <form onSubmit={onLiveSubmit} className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <span className="inline-flex h-11 shrink-0 items-center justify-center rounded-md border border-border bg-surface px-3 text-sm text-muted-foreground">
+            Amazon.in
+          </span>
+          <Label htmlFor="live-asin" className="sr-only">
+            ASIN
+          </Label>
+          <Input
+            id="live-asin"
+            name="asin"
+            value={liveAsin}
+            onChange={(event) => setLiveAsin(event.target.value.toUpperCase())}
+            placeholder="Enter ASIN"
+            autoComplete="off"
+            spellCheck={false}
+            className="h-11 bg-surface font-mono text-[0.9375rem] tracking-wide"
+          />
+          <Button type="submit" size="lg" disabled={loading} className="h-11 shrink-0">
+            {loading ? (
+              <>
+                <Loader2 className="animate-spin" />
+                Retrieving Amazon listing…
+              </>
+            ) : (
+              <>
+                Analyze
+                <ArrowRight />
+              </>
+            )}
+          </Button>
+        </form>
+        <div className={`flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground ${idle ? "justify-center" : ""}`}>
+          <span>
+            Example: <span className="font-mono">B0XXXXXXXX</span>
+          </span>
+          <button
+            type="button"
+            className="text-xs text-muted-foreground underline-offset-4 transition-colors duration-200 hover:text-foreground hover:underline"
+            onClick={() => setShowManual((value) => !value)}
+          >
+            {showManual ? "Hide manual entry" : "Enter product manually"}
+          </button>
+        </div>
       </header>
 
-      <div className="grid grid-cols-3 rounded-lg border border-border bg-card p-1">
-        {(
-          [
-            ["live", "Analyze ASIN"],
-            ["demo", "Quick Demo"],
-            ["manual", "Manual Product"],
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            className={cn(
-              "rounded-md px-2 py-2 text-xs font-medium transition-colors sm:text-sm",
-              mode === id
-                ? "bg-primary text-primary-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-            onClick={() => setMode(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {mode === "live" ? (
-        <Card>
-          <CardContent className="p-6">
-            <p className="mb-4 text-sm text-muted-foreground">
-              Enter a real Amazon.in ASIN. The backend retrieves listing details
-              through the configured catalog provider.
-            </p>
-            <form onSubmit={onLiveSubmit} className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="live-asin">ASIN</Label>
-                <Input
-                  id="live-asin"
-                  name="asin"
-                  value={liveAsin}
-                  onChange={(event) => setLiveAsin(event.target.value.toUpperCase())}
-                  placeholder="B0XXXXXXXX"
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="font-mono tracking-wide"
-                />
-              </div>
-              <Button type="submit" size="lg" disabled={loading} className="w-full sm:w-auto">
-                {loading ? (
-                  <>
-                    <Loader2 className="animate-spin" />
-                    Analyzing…
-                  </>
-                ) : (
-                  "Analyze Product"
-                )}
-              </Button>
-            </form>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {mode === "demo" ? (
-        <Card>
-          <CardContent className="p-6">
-            <p className="mb-4 text-sm text-muted-foreground">
-              Enter one of the mock ASINs to see sample product data. No Amazon
-              connection is used.
-            </p>
-            <form onSubmit={onDemoSubmit} className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="asin">ASIN</Label>
-                <Input
-                  id="asin"
-                  name="asin"
-                  value={demoAsin}
-                  onChange={(event) => setDemoAsin(event.target.value.toUpperCase())}
-                  placeholder="B0TEST0001"
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="font-mono tracking-wide"
-                />
-              </div>
-              <Button type="submit" size="lg" disabled={loading} className="w-full sm:w-auto">
-                {loading ? (
-                  <>
-                    <Loader2 className="animate-spin" />
-                    Analyzing…
-                  </>
-                ) : (
-                  "Analyze Product"
-                )}
-              </Button>
-            </form>
-
-            <div className="mt-5 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-              <span>Try</span>
-              {SAMPLE_ASINS.map((sample) => (
-                <button
-                  key={sample}
-                  type="button"
-                  className="rounded-md border border-border bg-background px-2 py-1 font-mono text-xs text-foreground hover:bg-accent"
-                  onClick={() => {
-                    setDemoAsin(sample);
-                    void analyze(sample);
-                  }}
-                >
-                  {sample}
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {mode === "manual" ? (
-        <Card>
-          <CardContent className="p-6">
-            <p className="mb-6 text-sm text-muted-foreground">
-              Fallback for draft listings or when live lookup is unavailable. Enter
-              publicly visible details by hand. Data stays local and is not saved.
-            </p>
-            <ManualProductForm
-              loading={loading}
-              onLoadingChange={setLoading}
-              onSuccess={(next) => {
-                setResult(next);
-                setAnalysis(null);
-                setAnalysisError(null);
-                setAiResult(null);
-                setAiError(null);
-                setComparison(null);
-                setCompetitorError(null);
-                setCompetitiveAi(null);
-                setCompetitiveAiError(null);
-                setDiscoveryOpen(false);
-                setDiscoveryQuery("");
-                setDiscoveryError(null);
-                setDiscovery(null);
-                setSelectedCandidateAsins([]);
-                setError(null);
-              }}
-              onError={(message) => {
-                setError(message);
-                if (message) {
-                  setResult(null);
-                  setAnalysis(null);
-                  setAiResult(null);
-                  setAiError(null);
-                  setComparison(null);
-                  setCompetitorError(null);
-                  setCompetitiveAi(null);
-                  setCompetitiveAiError(null);
-                  setDiscoveryOpen(false);
-                  setDiscovery(null);
-                  setSelectedCandidateAsins([]);
-                }
-              }}
-            />
-          </CardContent>
-        </Card>
+      {showManual ? (
+        <div className="rounded-lg border border-border bg-surface p-5 text-left shadow-[var(--shadow-sm)]">
+          <p className="mb-4 text-sm text-muted-foreground">
+            Use this when automatic retrieval is unavailable. Details stay in this session and are
+            not saved.
+          </p>
+          <ManualProductForm
+            loading={loading}
+            onLoadingChange={setLoading}
+            onSuccess={(next) => {
+              setResult(next);
+              resetDownstream();
+              setError(null);
+              setShowManual(false);
+            }}
+            onError={(message) => {
+              setError(message);
+              if (message) {
+                setResult(null);
+                resetDownstream();
+              }
+            }}
+          />
+        </div>
       ) : null}
 
       {error ? (
-        <Alert variant="destructive">
-          <AlertTitle>Couldn’t load product</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
+        <Alert variant="destructive" className="text-left">
+          <AlertTitle>Product could not be retrieved</AlertTitle>
+          <AlertDescription className="space-y-3">
+            <p>{error}</p>
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" size="sm" variant="outline" onClick={() => void analyze(liveAsin)}>
+                Try again
+              </Button>
+              <Button type="button" size="sm" variant="ghost" onClick={() => setShowManual(true)}>
+                Enter product manually
+              </Button>
+            </div>
+          </AlertDescription>
         </Alert>
       ) : null}
+
+      {!result && !error && !loading && !showManual ? (
+        <EmptyState
+          title="No product analyzed yet"
+          description="Enter an Amazon.in ASIN above to begin product intelligence."
+        />
+      ) : null}
+      </div>
 
       {result ? (
         <>
           <ProductResult product={result.product} source={result.meta.source} />
-          <div className="flex flex-wrap gap-3">
+          <div className="flex flex-wrap gap-2">
             <Button
               type="button"
-              size="lg"
               disabled={analysisLoading}
               onClick={async () => {
                 setAnalysisLoading(true);
@@ -324,7 +246,7 @@ export function ProductLookup() {
                   if (err instanceof ProductLookupError) {
                     setAnalysisError(err.message);
                   } else {
-                    setAnalysisError("Something went wrong while analyzing this listing.");
+                    setAnalysisError("Listing quality could not be analyzed right now.");
                   }
                 } finally {
                   setAnalysisLoading(false);
@@ -334,15 +256,14 @@ export function ProductLookup() {
               {analysisLoading ? (
                 <>
                   <Loader2 className="animate-spin" />
-                  Analyzing listing…
+                  Analyzing listing quality…
                 </>
               ) : (
-                "Analyze Listing"
+                "Analyze listing quality"
               )}
             </Button>
             <Button
               type="button"
-              size="lg"
               variant="outline"
               disabled={discoveryQueryLoading}
               onClick={async () => {
@@ -358,7 +279,7 @@ export function ProductLookup() {
                   if (err instanceof ProductLookupError) {
                     setDiscoveryError(err.message);
                   } else {
-                    setDiscoveryError("Something went wrong while generating a search query.");
+                    setDiscoveryError("A competitor search query could not be generated.");
                   }
                 } finally {
                   setDiscoveryQueryLoading(false);
@@ -368,10 +289,10 @@ export function ProductLookup() {
               {discoveryQueryLoading ? (
                 <>
                   <Loader2 className="animate-spin" />
-                  Preparing search...
+                  Preparing search…
                 </>
               ) : (
-                "Discover Competitors"
+                "Discover competitors"
               )}
             </Button>
           </div>
@@ -380,7 +301,7 @@ export function ProductLookup() {
 
       {analysisError ? (
         <Alert variant="destructive">
-          <AlertTitle>Couldn’t analyze listing</AlertTitle>
+          <AlertTitle>Listing analysis unavailable</AlertTitle>
           <AlertDescription>{analysisError}</AlertDescription>
         </Alert>
       ) : null}
@@ -391,7 +312,6 @@ export function ProductLookup() {
           <div>
             <Button
               type="button"
-              size="lg"
               disabled={aiLoading}
               onClick={async () => {
                 setAiLoading(true);
@@ -408,7 +328,7 @@ export function ProductLookup() {
                   if (err instanceof ProductLookupError) {
                     setAiError(err.message);
                   } else {
-                    setAiError("Something went wrong while generating AI recommendations.");
+                    setAiError("AI recommendations could not be generated right now.");
                   }
                 } finally {
                   setAiLoading(false);
@@ -418,10 +338,10 @@ export function ProductLookup() {
               {aiLoading ? (
                 <>
                   <Loader2 className="animate-spin" />
-                  Analyzing listing strategy...
+                  Generating AI recommendations…
                 </>
               ) : (
-                "Generate AI Recommendations"
+                "Generate AI recommendations"
               )}
             </Button>
           </div>
@@ -430,7 +350,7 @@ export function ProductLookup() {
 
       {aiError ? (
         <Alert variant="destructive">
-          <AlertTitle>Couldn’t generate AI recommendations</AlertTitle>
+          <AlertTitle>AI recommendations unavailable</AlertTitle>
           <AlertDescription>{aiError}</AlertDescription>
         </Alert>
       ) : null}
@@ -439,7 +359,7 @@ export function ProductLookup() {
 
       {discoveryError ? (
         <Alert variant="destructive">
-          <AlertTitle>Couldn’t discover competitors</AlertTitle>
+          <AlertTitle>Competitor discovery unavailable</AlertTitle>
           <AlertDescription>{discoveryError}</AlertDescription>
         </Alert>
       ) : null}
@@ -463,7 +383,7 @@ export function ProductLookup() {
               if (err instanceof ProductLookupError) {
                 setDiscoveryError(err.message);
               } else {
-                setDiscoveryError("Something went wrong while discovering competitors.");
+                setDiscoveryError("Amazon search could not be completed right now.");
               }
             } finally {
               setDiscoveryLoading(false);
@@ -498,7 +418,7 @@ export function ProductLookup() {
               if (err instanceof ProductLookupError) {
                 setCompetitorError(err.message);
               } else {
-                setCompetitorError("Something went wrong while comparing competitors.");
+                setCompetitorError("Selected competitors could not be compared.");
               }
             } finally {
               setCompetitorLoading(false);
@@ -526,7 +446,7 @@ export function ProductLookup() {
               if (err instanceof ProductLookupError) {
                 setCompetitorError(err.message);
               } else {
-                setCompetitorError("Something went wrong while comparing competitors.");
+                setCompetitorError("Selected competitors could not be compared.");
               }
             } finally {
               setCompetitorLoading(false);
@@ -537,7 +457,7 @@ export function ProductLookup() {
 
       {competitorError ? (
         <Alert variant="destructive">
-          <AlertTitle>Couldn’t compare competitors</AlertTitle>
+          <AlertTitle>Competitor comparison unavailable</AlertTitle>
           <AlertDescription>{competitorError}</AlertDescription>
         </Alert>
       ) : null}
@@ -548,7 +468,6 @@ export function ProductLookup() {
           <div>
             <Button
               type="button"
-              size="lg"
               disabled={competitiveAiLoading}
               onClick={async () => {
                 setCompetitiveAiLoading(true);
@@ -561,7 +480,7 @@ export function ProductLookup() {
                   if (err instanceof ProductLookupError) {
                     setCompetitiveAiError(err.message);
                   } else {
-                    setCompetitiveAiError("Something went wrong while generating competitive insights.");
+                    setCompetitiveAiError("Competitive insights could not be generated.");
                   }
                 } finally {
                   setCompetitiveAiLoading(false);
@@ -571,10 +490,10 @@ export function ProductLookup() {
               {competitiveAiLoading ? (
                 <>
                   <Loader2 className="animate-spin" />
-                  Analyzing competitive position...
+                  Analyzing competitive position…
                 </>
               ) : (
-                "Generate AI Competitive Insights"
+                "Generate AI competitive insights"
               )}
             </Button>
           </div>
@@ -583,7 +502,7 @@ export function ProductLookup() {
 
       {competitiveAiError ? (
         <Alert variant="destructive">
-          <AlertTitle>Couldn’t generate competitive insights</AlertTitle>
+          <AlertTitle>Competitive insights unavailable</AlertTitle>
           <AlertDescription>{competitiveAiError}</AlertDescription>
         </Alert>
       ) : null}

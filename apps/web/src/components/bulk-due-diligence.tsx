@@ -4,9 +4,9 @@ import { useEffect, useMemo, useState, type ChangeEvent, type DragEvent } from "
 import { Loader2 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Kpi, PageHeader, Panel } from "@/components/ui/layout";
+import { SeverityLabel } from "@/components/ui/score";
 import {
   downloadBulkReport,
   fetchBulkJob,
@@ -88,30 +88,29 @@ export function BulkDueDiligence() {
   }
 
   const done = job && (job.status === "completed" || job.status === "completed_with_errors");
+  const idle = !job;
 
   return (
-    <div className="mx-auto w-full max-w-6xl space-y-6">
-      <div>
-        <p className="text-sm font-medium text-muted-foreground">Amazon Seller Intelligence</p>
-        <h1 className="mt-1 text-3xl font-semibold tracking-tight">Bulk ASIN Due Diligence</h1>
-        <p className="mt-2 max-w-3xl text-sm text-muted-foreground">
-          Upload a CSV or Excel file of ASINs. This milestone runs against mock catalog fixtures
-          only — it does not call Rainforest or OpenAI.
-        </p>
-      </div>
+    <div className={idle ? "flex min-h-[calc(100dvh-7.5rem)] flex-col items-center justify-center" : "space-y-8"}>
+      <div className={idle ? "w-full max-w-2xl space-y-6" : "space-y-8"}>
+      <PageHeader
+        align={idle ? "center" : "start"}
+        title="Bulk product intelligence"
+        description="Upload an Excel or CSV containing Amazon ASINs. Current configuration uses mock catalog and mock AI only — live Rainforest and OpenAI are not called."
+      />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Upload CSV / XLSX</CardTitle>
-          <CardDescription>
+      <Panel className="p-5">
+        <div className={cn("mb-4 space-y-1", idle && "text-center")}>
+          <h2 className="text-[0.95rem] font-semibold">Upload file</h2>
+          <p className="text-sm text-muted-foreground">
             Recognized columns: ASIN, asin, Amazon ASIN, Product ASIN, Amazon_ASIN.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+          </p>
+        </div>
+        <div className="space-y-4">
           <label
             className={cn(
-              "flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed px-6 py-8 text-center text-sm",
-              dragging ? "border-primary bg-muted/60" : "border-border bg-muted/30",
+              "flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed px-6 py-10 text-center text-sm transition-colors duration-200",
+              dragging ? "border-primary bg-surface-subtle" : "border-border bg-surface-subtle/50",
             )}
             onDragOver={(event: DragEvent) => {
               event.preventDefault();
@@ -137,29 +136,32 @@ export function BulkDueDiligence() {
             <span className="mt-1 text-muted-foreground">CSV or XLSX, up to 25 MB, 100 unique ASINs</span>
           </label>
 
-          <div className="space-y-2">
-            <p className="text-sm font-medium">Analysis Mode</p>
-            <label className="flex items-center gap-2 text-sm">
+          <fieldset className={cn("space-y-2", idle && "text-center")}>
+            <legend className="text-sm font-medium">Analysis mode</legend>
+            <label className={cn("flex items-center gap-2 text-sm", idle && "justify-center")}>
               <input
                 type="radio"
                 name="mode"
                 checked={mode === "standard"}
                 onChange={() => setMode("standard")}
               />
-              Standard Due Diligence
+              Standard due diligence
             </label>
-            <label className="flex items-center gap-2 text-sm">
+            <label className={cn("flex items-center gap-2 text-sm", idle && "justify-center")}>
               <input
                 type="radio"
                 name="mode"
                 checked={mode === "deep_ai"}
                 onChange={() => setMode("deep_ai")}
               />
-              Deep AI Due Diligence (mock AI only)
+              Deep AI due diligence (mock AI only)
             </label>
             {mode === "deep_ai" ? (
               <select
-                className="mt-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                className={cn(
+                  "mt-1 rounded-md border border-input bg-surface px-3 py-2 text-sm",
+                  idle && "mx-auto block",
+                )}
                 value={selection}
                 onChange={(event) => setSelection(event.target.value as BulkAISelection)}
               >
@@ -168,16 +170,15 @@ export function BulkDueDiligence() {
                 <option value="all">All ASINs</option>
               </select>
             ) : null}
-          </div>
+          </fieldset>
 
           {preview ? (
-            <div className="rounded-lg border border-border bg-background px-4 py-3 text-sm">
-              <p className="font-medium">{preview.filename}</p>
-              <p className="mt-1 text-muted-foreground">
-                {preview.input_rows} rows found · {preview.valid_rows} valid · {preview.invalid_rows}{" "}
-                invalid · {preview.duplicate_rows_removed} duplicates removed · {preview.unique_asins}{" "}
-                unique ASINs
-              </p>
+            <div className="grid gap-4 rounded-md bg-surface-subtle px-4 py-3 sm:grid-cols-5">
+              <Kpi label="Rows" value={preview.input_rows} />
+              <Kpi label="Valid" value={preview.valid_rows} />
+              <Kpi label="Invalid" value={preview.invalid_rows} />
+              <Kpi label="Duplicates removed" value={preview.duplicate_rows_removed} />
+              <Kpi label="Unique ASINs" value={preview.unique_asins} />
             </div>
           ) : null}
 
@@ -188,12 +189,15 @@ export function BulkDueDiligence() {
             </Alert>
           ) : null}
 
-          <Button onClick={() => void start()} disabled={!file || busy}>
-            {busy ? <Loader2 className="animate-spin" /> : null}
-            Start Analysis
-          </Button>
-        </CardContent>
-      </Card>
+          <div className={idle ? "flex justify-center" : undefined}>
+            <Button onClick={() => void start()} disabled={!file || busy}>
+              {busy ? <Loader2 className="animate-spin" /> : null}
+              Start analysis
+            </Button>
+          </div>
+        </div>
+      </Panel>
+      </div>
 
       {job && !done && job.status !== "failed" ? <ProgressCard job={job} /> : null}
       {job?.status === "failed" ? (
@@ -210,23 +214,22 @@ export function BulkDueDiligence() {
 function ProgressCard({ job }: { job: BulkJobResponse }) {
   const pct = job.progress.total ? Math.round((job.progress.processed / job.progress.total) * 100) : 0;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Analyzing portfolio</CardTitle>
-        <CardDescription>Testing with mock provider — no API credits consumed</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <p className="text-sm">
-          {job.progress.processed} / {job.progress.total} processed
-        </p>
-        <p className="text-xs text-muted-foreground">
-          Cache hits: {job.progress.cache_hits} · Provider calls: {job.progress.provider_calls}
-        </p>
-        <div className="h-2 overflow-hidden rounded-full bg-muted">
-          <div className="h-full bg-primary transition-[width]" style={{ width: `${pct}%` }} />
-        </div>
-      </CardContent>
-    </Card>
+    <Panel className="p-5">
+      <h2 className="text-[0.95rem] font-semibold">Analyzing portfolio</h2>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Testing with mock provider — no API credits consumed
+      </p>
+      <div className="mt-5 grid gap-4 sm:grid-cols-4">
+        <Kpi label="Processed" value={`${job.progress.processed} / ${job.progress.total}`} />
+        <Kpi label="Cached" value={job.progress.cache_hits} />
+        <Kpi label="Provider calls" value={job.progress.provider_calls} />
+        <Kpi label="Failed" value={job.progress.failed} />
+      </div>
+      <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-surface-subtle">
+        <div className="h-full bg-primary transition-[width] duration-200" style={{ width: `${pct}%` }} />
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">{pct}% complete</p>
+    </Panel>
   );
 }
 
@@ -236,93 +239,67 @@ function ReportView({ job }: { job: BulkJobResponse }) {
 
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Bulk analysis complete</CardTitle>
-          <CardDescription>
-            {summary?.products_submitted ?? job.ingest.unique_asins} submitted ·{" "}
-            {summary?.products_analyzed ?? 0} analyzed · {summary?.products_failed ?? 0} failed
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          <Button onClick={() => void downloadBulkReport(job.job_id)}>Download Excel</Button>
-          <p className="w-full text-xs text-muted-foreground">{job.usage.note}</p>
-        </CardContent>
-      </Card>
+      <Panel className="p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-[0.95rem] font-semibold">Bulk analysis complete</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{job.usage.note}</p>
+          </div>
+          <Button variant="outline" onClick={() => void downloadBulkReport(job.job_id)}>
+            Download Excel
+          </Button>
+        </div>
+        <div className="mt-5 grid gap-4 sm:grid-cols-3 lg:grid-cols-6">
+          <Kpi label="Submitted" value={summary?.products_submitted ?? job.ingest.unique_asins} />
+          <Kpi label="Analyzed" value={summary?.products_analyzed ?? 0} />
+          <Kpi label="Failed" value={summary?.products_failed ?? 0} />
+          <Kpi label="Average score" value={summary?.average_listing_score ?? "—"} />
+          <Kpi label="High priority" value={summary?.high_priority_count ?? 0} />
+          <Kpi
+            label="Med / Low"
+            value={summary ? `${summary.medium_priority_count} / ${summary.low_priority_count}` : "—"}
+          />
+        </div>
+      </Panel>
 
-      <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        <SummaryTile label="Submitted" value={summary?.products_submitted} />
-        <SummaryTile label="Analyzed" value={summary?.products_analyzed} />
-        <SummaryTile label="Failed" value={summary?.products_failed} />
-        <SummaryTile label="Average score" value={summary?.average_listing_score} />
-        <SummaryTile label="High priority" value={summary?.high_priority_count} />
-        <SummaryTile
-          label="Med / Low"
-          value={
-            summary
-              ? `${summary.medium_priority_count} / ${summary.low_priority_count}`
-              : null
-          }
-        />
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Portfolio table</CardTitle>
-          <CardDescription>Sorted by priority, then lowest overall score.</CardDescription>
-        </CardHeader>
-        <CardContent className="overflow-x-auto">
-          <ResultsTable rows={rows} />
-        </CardContent>
-      </Card>
+      <Panel className="overflow-hidden p-5">
+        <h2 className="mb-1 text-[0.95rem] font-semibold">Portfolio</h2>
+        <p className="mb-4 text-sm text-muted-foreground">Sorted by priority, then lowest overall score.</p>
+        <ResultsTable rows={rows} />
+      </Panel>
 
       {job.attention.length > 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Products Requiring Attention</CardTitle>
-          </CardHeader>
-          <CardContent className="overflow-x-auto">
-            <ResultsTable rows={job.attention} compact />
-          </CardContent>
-        </Card>
+        <Panel className="overflow-hidden p-5">
+          <h2 className="mb-4 text-[0.95rem] font-semibold">Products requiring attention</h2>
+          <ResultsTable rows={job.attention} compact />
+        </Panel>
       ) : null}
 
       {job.failures.length > 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Failed / Invalid ASINs</CardTitle>
-          </CardHeader>
-          <CardContent className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
+        <Panel className="overflow-hidden p-5">
+          <h2 className="mb-4 text-[0.95rem] font-semibold">Failed / invalid ASINs</h2>
+          <div className="overflow-x-auto">
+            <table className="data-table">
               <thead>
-                <tr className="border-b text-xs text-muted-foreground">
-                  <th className="py-2 pr-3">Row</th>
-                  <th className="py-2 pr-3">Input ASIN</th>
-                  <th className="py-2">Reason</th>
+                <tr>
+                  <th className="num">Row</th>
+                  <th>Input ASIN</th>
+                  <th>Reason</th>
                 </tr>
               </thead>
               <tbody>
                 {job.failures.map((item, index) => (
-                  <tr key={`${item.input_asin}-${index}`} className="border-b border-border/70">
-                    <td className="py-2 pr-3 tabular-nums">{item.row ?? "—"}</td>
-                    <td className="py-2 pr-3 font-mono text-xs">{item.input_asin || "—"}</td>
-                    <td className="py-2">{item.reason}</td>
+                  <tr key={`${item.input_asin}-${index}`}>
+                    <td className="num">{item.row ?? "—"}</td>
+                    <td className="font-mono text-xs">{item.input_asin || "—"}</td>
+                    <td>{item.reason}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </CardContent>
-        </Card>
+          </div>
+        </Panel>
       ) : null}
-    </div>
-  );
-}
-
-function SummaryTile({ label, value }: { label: string; value: number | string | null | undefined }) {
-  return (
-    <div className="rounded-lg border border-border bg-card px-3 py-3">
-      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className="mt-1 text-lg font-semibold tabular-nums">{value ?? "—"}</p>
     </div>
   );
 }
@@ -335,73 +312,61 @@ function ResultsTable({
   compact?: boolean;
 }) {
   return (
-    <table className="w-full min-w-[720px] text-left text-sm">
-      <thead>
-        <tr className="border-b text-xs text-muted-foreground">
-          <th className="py-2 pr-3">ASIN</th>
-          <th className="py-2 pr-3">Title</th>
-          <th className="py-2 pr-3">Score</th>
-          <th className="py-2 pr-3">Priority</th>
-          {!compact ? (
-            <>
-              <th className="py-2 pr-3">Rating</th>
-              <th className="py-2 pr-3">Reviews</th>
-              <th className="py-2 pr-3">Images</th>
-              <th className="py-2 pr-3">Title</th>
-              <th className="py-2 pr-3">Bullets</th>
-              <th className="py-2 pr-3">Desc</th>
-              <th className="py-2 pr-3">Complete</th>
-            </>
-          ) : null}
-          <th className="py-2 pr-3">Top issues</th>
-          <th className="py-2">AI</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((item) => (
-          <tr key={item.asin} className="border-b border-border/70 align-top">
-            <td className="py-2 pr-3 font-mono text-xs">{item.asin}</td>
-            <td className="max-w-[220px] py-2 pr-3">{item.product.title}</td>
-            <td className="py-2 pr-3 tabular-nums">{item.listing_analysis.overall_score}</td>
-            <td className="py-2 pr-3">
-              <PriorityBadge priority={item.priority} />
-            </td>
+    <div className="overflow-x-auto">
+      <table className="data-table min-w-[720px]">
+        <thead>
+          <tr>
+            <th>ASIN</th>
+            <th>Title</th>
+            <th className="num">Score</th>
+            <th>Priority</th>
             {!compact ? (
               <>
-                <td className="py-2 pr-3 tabular-nums">{item.product.rating ?? "—"}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.product.review_count ?? "—"}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.product.images.length}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.listing_analysis.sections.title.score}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.listing_analysis.sections.bullets.score}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.listing_analysis.sections.description.score}</td>
-                <td className="py-2 pr-3 tabular-nums">{item.listing_analysis.sections.completeness.score}</td>
+                <th className="num">Rating</th>
+                <th className="num">Reviews</th>
+                <th className="num">Images</th>
+                <th className="num">Title</th>
+                <th className="num">Bullets</th>
+                <th className="num">Desc</th>
+                <th className="num">Complete</th>
               </>
             ) : null}
-            <td className="max-w-[240px] py-2 pr-3 text-xs text-muted-foreground">
-              {item.listing_analysis.findings
-                .slice(0, 2)
-                .map((finding) => finding.code)
-                .join(", ") || "—"}
-            </td>
-            <td className="py-2 text-xs">{aiLabel(item.ai_status)}</td>
+            <th>Top issues</th>
+            <th>AI</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function PriorityBadge({ priority }: { priority: "high" | "medium" | "low" }) {
-  return (
-    <Badge
-      className={cn(
-        priority === "high" && "border-transparent bg-destructive text-destructive-foreground",
-        priority === "medium" && "border-transparent bg-amber-100 text-amber-900",
-        priority === "low" && "border-transparent bg-secondary text-secondary-foreground",
-      )}
-    >
-      {priority}
-    </Badge>
+        </thead>
+        <tbody>
+          {rows.map((item) => (
+            <tr key={item.asin}>
+              <td className="font-mono text-xs">{item.asin}</td>
+              <td className="max-w-[220px]">{item.product.title}</td>
+              <td className="num">{item.listing_analysis.overall_score}</td>
+              <td>
+                <SeverityLabel severity={item.priority} />
+              </td>
+              {!compact ? (
+                <>
+                  <td className="num">{item.product.rating ?? "—"}</td>
+                  <td className="num">{item.product.review_count ?? "—"}</td>
+                  <td className="num">{item.product.images.length}</td>
+                  <td className="num">{item.listing_analysis.sections.title.score}</td>
+                  <td className="num">{item.listing_analysis.sections.bullets.score}</td>
+                  <td className="num">{item.listing_analysis.sections.description.score}</td>
+                  <td className="num">{item.listing_analysis.sections.completeness.score}</td>
+                </>
+              ) : null}
+              <td className="max-w-[240px] text-muted-foreground">
+                {item.listing_analysis.findings
+                  .slice(0, 2)
+                  .map((finding) => finding.code)
+                  .join(", ") || "—"}
+              </td>
+              <td>{aiLabel(item.ai_status)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
