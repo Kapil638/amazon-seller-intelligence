@@ -1,0 +1,5 @@
+Date,Campaign Name,Ad Group Name,Targeting,Match Type,Customer Search Term,Impressions,Clicks,Spend,7 Day Total Sales,7 Day Total Orders (#),7 Day Total Units (#)
+2026-01-05,Protein Brand Exact,Whey,Exact,EXACT,whey protein powder,1000,50,₹100.00,₹500.00,10,10
+2026-01-05,Protein Brand Exact,Whey,Broad,BROAD,cheap protein,400,20,₹600.00,₹0.00,0,0
+2026-01-05,Protein Brand Exact,Whey,Broad,BROAD,buy protein online,200,12,₹80.00,₹40.00,1,1
+2026-01-06,Mass Gainer,Gainer,Phrase,PHRASE,mass gainer 1kg,800,40,₹200.00,₹200.00,4,4

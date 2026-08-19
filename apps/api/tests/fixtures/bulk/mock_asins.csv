@@ -1,0 +1,15 @@
+ASIN,Notes
+B0BLKSTR01,strong listing
+B0BLKSTR01,duplicate
+B0BLKTTL02,weak title
+B0BLKDES03,missing description
+B0BLKIMG04,low image count
+B0BLKBLT05,weak bullets
+B0BLKRAT06,low rating
+B0BLKREV07,low review count
+B0BLKINC08,incomplete
+B0BLKHGH09,high severity
+B0BLKMID10,medium quality
+B0TEST0001,existing mock catalog
+NOTVALID1,invalid ASIN
+B0UNKNOWN1,unknown fixture

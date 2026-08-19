@@ -1,0 +1,14 @@
+{
+  "request_info": {
+    "success": true
+  },
+  "request_parameters": {
+    "amazon_domain": "amazon.in",
+    "asin": "B0MISSING1",
+    "type": "product"
+  },
+  "product": {
+    "title": "Example listing with only a title",
+    "asin": "B0MISSING1"
+  }
+}

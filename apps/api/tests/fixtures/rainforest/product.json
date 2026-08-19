@@ -1,0 +1,108 @@
+{
+  "request_info": {
+    "success": true,
+    "credits_used": 1,
+    "credits_remaining": 100
+  },
+  "request_parameters": {
+    "amazon_domain": "amazon.in",
+    "asin": "B07J4TNYV8",
+    "type": "product"
+  },
+  "product": {
+    "title": "AKASO V50 Elite 4K60fps Touch Screen WiFi Action Camera Voice Control EIS 131 feet Waterproof Camera 8X Zoom Remote Control Standard",
+    "search_alias": {
+      "title": "Electronics",
+      "value": "electronics"
+    },
+    "asin": "B07J4TNYV8",
+    "brand": "AKASO",
+    "variants": [
+      {
+        "is_current_product": false,
+        "title": "With 128GB MicroSD Card",
+        "dimensions": [
+          {
+            "name": "Style",
+            "value": "With 128GB MicroSD Card"
+          }
+        ],
+        "asin": "B0DQD4ZKVC"
+      },
+      {
+        "is_current_product": true,
+        "title": "Standard",
+        "dimensions": [
+          {
+            "name": "Style",
+            "value": "Standard"
+          }
+        ],
+        "asin": "B07J4TNYV8"
+      }
+    ],
+    "categories": [
+      {
+        "name": "Electronics",
+        "category_id": "172282"
+      },
+      {
+        "name": "Camera & Photo",
+        "category_id": "502394"
+      }
+    ],
+    "categories_flat": "Electronics > Camera & Photo > Video > Sports & Action Video Cameras",
+    "rating": 4.4,
+    "ratings_total": 5080,
+    "reviews_total": 5080,
+    "main_image": {
+      "link": "https://m.media-amazon.com/images/I/71kM3BRnDaL.jpg"
+    },
+    "images": [
+      {
+        "link": "https://m.media-amazon.com/images/I/71kM3BRnDaL._AC_SL1500_.jpg",
+        "variant": "MAIN"
+      },
+      {
+        "link": "https://m.media-amazon.com/images/I/71secondimage.jpg",
+        "variant": "PT01"
+      }
+    ],
+    "feature_bullets": [
+      "UPGRADED SERIES OF AKASO V50: Records 4K/60fps, 4K/30fps, 2.7K/60fps, 2.7K/30fps, 1080P/120fps, 720P/240fps video and 20MP image, you can capture high-quality full HD footages.",
+      "VOICE CONTROL: You can control your AKASO V50 Elite action camera hands free with voice commands Like “Action Start Video” and “Action Photo”.",
+      "WATERPROOF CAMERA UP TO 131FT: Equipped the improved waterproof case, this underwater camera can deep dive up to 131 feet."
+    ],
+    "description": "The text from the main product description block.",
+    "buybox_winner": {
+      "availability": {
+        "type": "in_stock",
+        "raw": "In Stock"
+      },
+      "fulfillment": {
+        "is_sold_by_amazon": false,
+        "is_fulfilled_by_amazon": true,
+        "third_party_seller": {
+          "name": "AKASO OUTDOOR",
+          "id": "A2SITDWYE2UYD"
+        }
+      },
+      "price": {
+        "symbol": "₹",
+        "value": 139.99,
+        "currency": "INR",
+        "raw": "₹139.99"
+      }
+    },
+    "bestsellers_rank": [
+      {
+        "category": "Electronics",
+        "rank": 32614
+      },
+      {
+        "category": "Sports & Action Video Cameras",
+        "rank": 161
+      }
+    ]
+  }
+}

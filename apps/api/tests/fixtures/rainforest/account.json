@@ -1,0 +1,16 @@
+{
+  "account_info": {
+    "name": "Example Seller",
+    "email": "seller@example.com",
+    "plan": "prod_xxx",
+    "api_key": "super-secret-rainforest-account-key",
+    "credits_used": 21,
+    "credits_limit": 100,
+    "credits_remaining": 79,
+    "credits_reset_at": "2026-09-19T00:00:00.000Z",
+    "usage_history": [
+      { "date": "2026-08-17", "credits_used": 4 },
+      { "date": "2026-08-18", "credits_used": 17 }
+    ]
+  }
+}

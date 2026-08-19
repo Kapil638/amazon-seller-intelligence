@@ -1,0 +1,70 @@
+{
+  "request_info": {
+    "success": true,
+    "credits_used": 1,
+    "credits_remaining": 100
+  },
+  "request_parameters": {
+    "type": "search",
+    "amazon_domain": "amazon.in",
+    "search_term": "whey protein powder chocolate"
+  },
+  "search_results": [
+    {
+      "position": 1,
+      "title": "MuscleFuel Whey Protein Powder Chocolate 1kg",
+      "asin": "B0CAND0001",
+      "image": "https://m.media-amazon.com/images/I/example1.jpg",
+      "rating": 4.5,
+      "ratings_total": 5430,
+      "sponsored": true,
+      "price": {
+        "value": 799,
+        "currency": "INR"
+      },
+      "categories": [
+        { "name": "Health & Personal Care", "id": "hpc" }
+      ]
+    },
+    {
+      "position": 2,
+      "title": "Brand X Whey Protein Powder Chocolate 1kg",
+      "asin": "B0TARGET01",
+      "rating": 4.2,
+      "ratings_total": 842,
+      "sponsored": false,
+      "price": {
+        "value": 899,
+        "currency": "INR"
+      }
+    },
+    {
+      "position": 3,
+      "title": "MuscleFuel Whey Protein Powder Chocolate 1kg",
+      "asin": "B0CAND0001",
+      "rating": 4.5,
+      "ratings_total": 5430,
+      "sponsored": false
+    },
+    {
+      "position": 4,
+      "title": "PeakPulse Whey Isolate Powder Chocolate",
+      "asin": "B0CAND0002",
+      "image": "https://m.media-amazon.com/images/I/example2.jpg",
+      "rating": 4.3,
+      "ratings_total": 1320,
+      "sponsored": false,
+      "price": {
+        "value": 949,
+        "currency": "INR"
+      },
+      "brand": "PeakPulse"
+    },
+    {
+      "position": 5,
+      "title": "USB charging cable 1m",
+      "asin": "B0IRREL001",
+      "sponsored": false
+    }
+  ]
+}

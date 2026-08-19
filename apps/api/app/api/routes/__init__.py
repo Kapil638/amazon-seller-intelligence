@@ -1,0 +1,16 @@
+from fastapi import APIRouter
+
+from app.api.routes.analysis import router as analysis_router
+from app.api.routes.competitors import router as competitors_router
+from app.api.routes.products import router as products_router
+from app.api.routes.reports import router as reports_router
+from app.api.routes.usage import router as usage_router
+from app.api.routes.bulk import router as bulk_router
+
+api_router = APIRouter()
+api_router.include_router(products_router)
+api_router.include_router(analysis_router)
+api_router.include_router(competitors_router)
+api_router.include_router(reports_router)
+api_router.include_router(usage_router)
+api_router.include_router(bulk_router)

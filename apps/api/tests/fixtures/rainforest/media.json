@@ -1,0 +1,37 @@
+{
+  "product": {
+    "title": "Demo listing for media mapping",
+    "asin": "B0MEDIA001",
+    "main_image": {
+      "link": "https://m.media-amazon.com/images/I/71MAINIMAGE.jpg"
+    },
+    "images": [
+      {
+        "link": "https://m.media-amazon.com/images/I/71MAINIMAGE._SX38_SY50_CR,0,0,38,50_.jpg",
+        "variant": "MAIN"
+      },
+      {
+        "link": "https://m.media-amazon.com/images/I/81SECONDIMG._SX38_SY50_CR,0,0,38,50_.jpg",
+        "variant": "PT01"
+      },
+      {
+        "link": "https://m.media-amazon.com/images/I/81SECONDIMG._SL1500_.jpg",
+        "variant": "PT01"
+      },
+      {
+        "link": "https://m.media-amazon.com/images/I/51VIDTHUMB.SX38_SY50_CR,0,0,38,50_BG85,85,85_BR-120_PKdp-play-icon-overlay__.jpg",
+        "variant": "PT02"
+      }
+    ],
+    "images_flat": "https://m.media-amazon.com/images/I/81SECONDIMG._SL1500_.jpg,https://m.media-amazon.com/images/I/71MAINIMAGE._SL1500_.jpg",
+    "videos": [
+      {
+        "title": "Product overview",
+        "duration_seconds": 16,
+        "thumbnail": "https://m.media-amazon.com/images/I/71VIDPOSTER.jpg",
+        "group_type": "videos_for_this_product",
+        "link": "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/demo/videopreview.mp4"
+      }
+    ]
+  }
+}
