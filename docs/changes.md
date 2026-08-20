@@ -1,10 +1,26 @@
 # Amazon Seller Intelligence — Change Summary
 
 **Date:** 20 August 2026  
-**Scope:** Milestone 8C AI Content & SEO Intelligence V2  
-**Status:** Milestone 8C complete. Image vision (8D), Reviews API, and Offers API were not started.
+**Scope:** Milestone 8D Image & Media Intelligence V1  
+**Status:** Milestone 8D complete. Image generation, Reviews API, and Offers API were not started.
 
 This document records what was built and updated. It is a change log, not a product spec.
+
+---
+
+## Milestone 8D — Image & Media Intelligence V1 (20 August 2026)
+
+Added optional multimodal visual intelligence as a **separate report**. Listing Score V1/V2 and AI listing V1/V2 are unchanged.
+
+- Endpoint: `POST /api/v1/analysis/listing/v2/images/ai`
+- Prompt: `image-intelligence-v1`
+- Explicit **Analyze Images & Media** click only
+- Deterministic HTTPS/allowlist URL validation and max-8 image selection
+- Same `OpenAIProvider`; new `generate_multimodal_structured` (does not change 8C text calls)
+- Cache + usage ledger workflow `image_intelligence_v1`
+- 0 extra Rainforest calls; videos not analyzed as frames; no image generation; no numeric visual score
+
+See [image-media-intelligence.md](image-media-intelligence.md).
 
 ---
 
@@ -60,10 +76,12 @@ A user can:
 3. Enter listing details by hand (Manual Product fallback).
 4. Run **Listing Intelligence V2** on that product (deterministic listing quality, market signals, data coverage).
 5. Generate **AI Strategy V2** (OpenAI, explicit click). V2 scores stay unchanged. V1 AI remains a legacy path.
-6. Compare **1–3 seller-entered competitor ASINs**, then optionally generate AI competitive insights.
-7. **Discover candidate competitors** with Rainforest Amazon search, then let the seller select up to three for the existing comparison.
-8. Upload a **Search Term Report** or **Business Report** and view deterministic PPC / business analytics.
-9. See compact **API Budget** cards (Rainforest account credits vs this app’s calls; OpenAI provider spend vs app-estimated cost).
+6. Optionally **Analyze Images & Media** (OpenAI multimodal, explicit click). Separate visual report; listing scores unchanged.
+7. Compare **1–3 seller-entered competitor ASINs**, then optionally generate AI competitive insights.
+8. **Discover candidate competitors** with Rainforest Amazon search, then let the seller select up to three for the existing comparison.
+9. Upload a **Search Term Report** or **Business Report** and view deterministic PPC / business analytics.
+10. See compact **API Budget** cards (Rainforest account credits vs this app’s calls; OpenAI provider spend vs app-estimated cost).
+11. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI by default; Excel report after the job completes).
 
 No SP-API, Claude, database, or authentication is required.
 
@@ -71,67 +89,63 @@ The Amazon.in public HTML lookup remains available but is experimental. Rainfore
 
 ---
 
-## Architecture (unchanged principle)
+## Architecture (current primary path)
 
 The rest of the application does not depend on a specific catalog vendor. Product data is fetched through `ProductDataProvider`.
 
+Current single-ASIN user path:
+
 ```text
 Analyze ASIN
-  ASIN
-    → GET /api/v1/products/{asin}
-      → ProductService
-        → RainforestProductDataProvider
-          → Rainforest Product Data API
-          → map_rainforest_product()
-            → Product
+    ↓
+GET /api/v1/products/{asin}
+    ↓
+ProductService
+    ↓
+RainforestProductDataProvider   (mock catalog still intercepts B0TEST*)
+    ↓
+Normalized Product
+    ↓
+ListingAnalysisV2Service
+    ↓
+Listing Intelligence V2
+       ├── Listing Quality
+       ├── Market Signals
+       └── Data Coverage
+             ↓
+       Generate AI Strategy   [explicit click]
+             ↓
+AIListingIntelligenceV2Service
+             ↓
+OpenAIProvider
 
-Quick Demo
-  B0TEST0001–0003
-    → GET /api/v1/products/{asin}
-      → ProductService
-        → MockProductDataProvider
-          → Product
+Optional visual path [explicit Analyze Images & Media click]:
 
-Manual Product
-  listing fields
-    → POST /api/v1/products/manual
-      → ProductService.create_from_manual()
-        → Product
+Normalized Product + ListingAnalysisV2
+       ↓
+AIImageIntelligenceService
+       ↓
+OpenAIProvider.generate_multimodal_structured
+       ↓
+Image & Media Intelligence
+```
 
-Listing Intelligence
-  Product
-    → ListingAnalysisService
-      → ListingAnalysis
+V1 listing analysis and V1 listing AI remain available as legacy/backward-compatible endpoints and a collapsed UI panel.
 
-AI Listing Intelligence
-  Product + ListingAnalysis
-    → AIListingIntelligenceService
-      → AIProvider
-        → OpenAIProvider
-          → AIListingIntelligence
+Provider inventory:
 
-Competitor Intelligence
-  competitor ASINs (seller-entered)
-    → ProductService
-      → RainforestProductDataProvider
-        → Product
-  Products + ListingAnalysis
-    → CompetitorComparisonService
-      → CompetitorComparison
-  CompetitorComparison
-    → AICompetitiveIntelligenceService
-      → AIProvider
-        → OpenAIProvider
-          → AICompetitiveIntelligence
+```text
+ProductDataProvider
+        │
+        ├── MockProductDataProvider              implemented (demo ASINs; bulk default)
+        ├── RainforestProductDataProvider        implemented (Analyze ASIN default)
+        ├── AmazonPublicProductDataProvider      experimental
+        └── AmazonOfficialProductDataProvider    future
 
-Competitor Discovery
-  Target Product
-    → CompetitorSearchQueryService
-    → AmazonSearchProvider
-      → RainforestAmazonSearchProvider
-        → candidate snippets
-    → seller selects up to 3 ASINs
-      → existing CompetitorComparisonService
+AIProvider
+        │
+        ├── OpenAIProvider                       implemented
+        └── ClaudeProvider                       future
 ```
 
 Both endpoints return an HTTP envelope. Provenance is metadata, not a field on `Product`:
@@ -144,20 +158,6 @@ Both endpoints return an HTTP envelope. Provenance is metadata, not a field on `
 ```
 
 `meta.source` is `"mock"`, `"manual"`, `"rainforest"`, or `"amazon_public"`.
-
-```text
-ProductDataProvider
-        │
-        ├── MockProductDataProvider              implemented
-        ├── RainforestProductDataProvider        implemented (V1 default)
-        ├── AmazonPublicProductDataProvider      experimental
-        └── AmazonOfficialProductDataProvider    future
-
-AIProvider
-        │
-        ├── OpenAIProvider                       implemented (V1 default)
-        └── ClaudeProvider                       future
-```
 
 Marketplace identifiers use Amazon **domain** form. V1 supports `amazon.in` only.
 
@@ -603,7 +603,7 @@ CompetitorComparison
 
 ### Evidence rules
 
-Review count is visible review volume, not sales. Rating differences are observed ratings. Price differences are observed prices. AI must not invent sales, conversion, ads, or product claims. Automatic competitor discovery is not implemented.
+Review count is visible review volume, not sales. Rating differences are observed ratings. Price differences are observed prices. AI must not invent sales, conversion, ads, or product claims. At the time Milestone 7 shipped, automatic competitor discovery was not implemented. Candidate search was added later; see [competitor-discovery.md](competitor-discovery.md).
 
 ### Live smoke test
 
@@ -702,9 +702,15 @@ Details: [rainforest-provider.md](rainforest-provider.md).
 
 ## Tests
 
+Current complete backend suite (20 August 2026 checkpoint):
+
 ```text
-143 passed
+309 passed
 ```
+
+Earlier milestone subsections below this heading recorded smaller counts at the time those milestones shipped. Do not add those historical numbers together.
+
+Frontend production build (`npm run build`) succeeded. `npm run lint` reports 2 pre-existing `react-hooks/set-state-in-effect` errors in `theme-toggle.tsx` and `usage-panel.tsx` (not introduced by 8A–8D). There is no separate `typecheck` script; TypeScript runs as part of `next build`.
 
 - Milestone 0/1: 7 product/health tests
 - Milestone 2: 7 manual product tests
@@ -775,17 +781,21 @@ These remain out of scope:
 - Database / Supabase
 - Authentication
 - Redis / Celery
-- Keyword tools, review scraping, PDF/Excel export
-- OpenAI report interpretation
+- Keyword tools, review scraping, full Reviews API intelligence, Offers API
+- Image generation / image editing
+- PDF export (Bulk **Excel** export is implemented)
+- OpenAI seller-report interpretation
 - MCP / agents
+- Autonomous Amazon actions
 
 ---
 
 ## Git
 
-Git is initialized at the repository root. **Nothing has been committed.**
+Remote: `origin` → `https://github.com/Kapil638/amazon-seller-intelligence.git`  
+Branch: `main`
 
-The existing file `Amazon Seller Co-Pilot.pdf` was left untouched and was not used as a spec.
+Local `.env` files are gitignored. The existing file `Amazon Seller Co-Pilot.pdf` was left untouched and was not used as a spec.
 
 ---
 

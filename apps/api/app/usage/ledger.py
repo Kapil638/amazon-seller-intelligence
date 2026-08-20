@@ -12,6 +12,7 @@ RainforestCallKind = Literal["product", "search"]
 AIWorkflow = Literal[
     "listing_intelligence",
     "listing_intelligence_v2",
+    "image_intelligence_v1",
     "competitive_intelligence",
     "bulk_listing_intelligence",
     "portfolio_summary",

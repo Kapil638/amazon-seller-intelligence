@@ -12,6 +12,7 @@ from app.core.exceptions import (
     AIStructuredOutputError,
     CompetitorValidationError,
     NoCompetitorsRetrievedError,
+    NoValidMediaError,
     ProviderConfigurationError,
 )
 from app.models.ai_competitive_intelligence import (
@@ -23,6 +24,11 @@ from app.models.ai_listing_intelligence import (
     AIListingIntelligenceMeta,
     AIListingIntelligenceRequest,
     AIListingIntelligenceResponse,
+)
+from app.models.ai_image_intelligence import (
+    AIImageIntelligenceMeta,
+    AIImageIntelligenceRequest,
+    AIImageIntelligenceResponse,
 )
 from app.models.ai_listing_intelligence_v2 import (
     AIListingIntelligenceV2Meta,
@@ -40,10 +46,12 @@ from app.models.listing_analysis import (
 )
 from app.models.listing_analysis_v2 import ListingAnalysisV2Meta, ListingAnalysisV2Response
 from app.prompts.competitive_intelligence import PROMPT_VERSION as COMPETITIVE_PROMPT_VERSION
+from app.prompts.image_intelligence import PROMPT_VERSION as IMAGE_PROMPT_VERSION
 from app.prompts.listing_intelligence import PROMPT_VERSION
 from app.prompts.listing_intelligence_v2 import PROMPT_VERSION as PROMPT_VERSION_V2
 from app.providers.factory import get_product_provider
 from app.services.ai_competitive_intelligence_service import AICompetitiveIntelligenceService
+from app.services.ai_image_intelligence_service import AIImageIntelligenceService
 from app.services.ai_listing_intelligence_service import AIListingIntelligenceService
 from app.services.ai_listing_intelligence_v2_service import AIListingIntelligenceV2Service
 from app.services.competitor_comparison_service import CompetitorComparisonService
@@ -70,6 +78,10 @@ def get_ai_listing_intelligence_v2_service() -> AIListingIntelligenceV2Service:
     return AIListingIntelligenceV2Service(provider=get_ai_provider())
 
 
+def get_ai_image_intelligence_service() -> AIImageIntelligenceService:
+    return AIImageIntelligenceService(provider=get_ai_provider())
+
+
 def get_competitor_comparison_service() -> CompetitorComparisonService:
     return CompetitorComparisonService(
         products=ProductService(provider=get_product_provider()),
@@ -89,6 +101,8 @@ def _ai_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, AIRateLimitedError):
         return HTTPException(status_code=503, detail=str(exc))
     if isinstance(exc, AISafetyRefusalError):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, NoValidMediaError):
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, (AIRequestFailedError, AIStructuredOutputError)):
         return HTTPException(status_code=502, detail=str(exc))
@@ -189,6 +203,45 @@ async def analyze_listing_v2_ai(
             source=payload.source,
             usage=result.usage,
             latency_ms=result.latency_ms,
+        ),
+    )
+
+
+@router.post("/listing/v2/images/ai", response_model=AIImageIntelligenceResponse)
+async def analyze_listing_images_ai(
+    payload: AIImageIntelligenceRequest,
+    service: AIImageIntelligenceService = Depends(get_ai_image_intelligence_service),
+) -> AIImageIntelligenceResponse:
+    try:
+        result, selection = await service.generate(payload.product, payload.analysis)
+    except (
+        AIConfigurationError,
+        AIAuthenticationError,
+        AIRateLimitedError,
+        AIRequestFailedError,
+        AIStructuredOutputError,
+        AISafetyRefusalError,
+        NoValidMediaError,
+    ) as exc:
+        raise _ai_http_error(exc) from exc
+    return AIImageIntelligenceResponse(
+        product=payload.product,
+        analysis=payload.analysis,
+        image_intelligence=result.payload,
+        meta=AIImageIntelligenceMeta(
+            engine="multimodal_ai",
+            provider=result.provider,
+            model=result.model,
+            prompt_version=result.prompt_version or IMAGE_PROMPT_VERSION,
+            source=payload.source,
+            images_available=selection.images_available,
+            images_selected=selection.images_selected,
+            images_skipped=selection.images_skipped,
+            selection_reason=selection.selection_reason,
+            warnings=selection.warnings,
+            usage=result.usage,
+            latency_ms=result.latency_ms,
+            media=selection,
         ),
     )
 

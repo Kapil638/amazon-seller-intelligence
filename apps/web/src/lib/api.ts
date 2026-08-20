@@ -1,5 +1,6 @@
 import type {
   AICompetitiveIntelligenceResponse,
+  AIImageIntelligenceResponse,
   AIListingIntelligenceResponse,
   AIListingIntelligenceV2Response,
   ApiErrorBody,
@@ -309,6 +310,54 @@ export async function generateAIListingIntelligenceV2(
   }
   throw new ProductLookupError(
     detail || "Something went wrong while generating AI strategy.",
+    "unknown",
+  );
+}
+
+export async function generateImageIntelligence(
+  product: Product,
+  analysis: ListingAnalysisV2,
+  source?: ProductSource,
+): Promise<AIImageIntelligenceResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/images/ai`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product, analysis, source: source ?? null }),
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+
+  if (response.ok) {
+    return (await response.json()) as AIImageIntelligenceResponse;
+  }
+
+  const detail = await readError(response);
+  if (response.status === 400 || response.status === 422) {
+    throw new ProductLookupError(
+      detail || "No valid listing images were available for visual analysis.",
+      "invalid",
+    );
+  }
+  if (response.status === 503) {
+    throw new ProductLookupError(
+      detail || "AI analysis is not configured.",
+      "unavailable",
+    );
+  }
+  if (response.status === 502) {
+    throw new ProductLookupError(
+      detail || "Image analysis could not be completed. Try again later.",
+      "unavailable",
+    );
+  }
+  throw new ProductLookupError(
+    detail || "Something went wrong while analyzing listing images.",
     "unknown",
   );
 }

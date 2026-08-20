@@ -247,3 +247,69 @@ async def test_competitive_schema_retries_at_most_once() -> None:
             prompt_version="competitive-intelligence-v1",
         )
     assert len(client.responses.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_multimodal_structured_sends_image_urls_and_uses_vision_model() -> None:
+    from app.models.ai_image_intelligence import AIImageIntelligence
+    from app.models.media_evidence import MediaEvidenceItem, MediaSourceType
+    from tests.test_ai_image_intelligence import sample_image_intelligence
+
+    payload = sample_image_intelligence()
+    client = FakeClient(
+        [SimpleNamespace(output_parsed=payload, usage=_usage(), incomplete_details=None)]
+    )
+    provider = OpenAIProvider(
+        api_key="test-openai-key",
+        model="gpt-5.4",
+        vision_model="gpt-5.4-vision-test",
+        client=client,
+    )
+    images = [
+        MediaEvidenceItem(
+            id="img-main-1",
+            source_type=MediaSourceType.MAIN_IMAGE,
+            url="https://m.media-amazon.com/images/I/71kM3BRnDaL.jpg",
+            position=0,
+        )
+    ]
+    result = await provider.generate_multimodal_structured(
+        schema=AIImageIntelligence,
+        system_prompt="sys",
+        user_prompt="user",
+        repair_prompt="repair",
+        prompt_version="image-intelligence-v1",
+        images=images,
+    )
+    call = client.responses.calls[0]
+    assert call["model"] == "gpt-5.4-vision-test"
+    content = call["input"][1]["content"]
+    assert content[0]["type"] == "input_text"
+    assert any(part.get("type") == "input_image" for part in content)
+    assert any(
+        part.get("image_url") == "https://m.media-amazon.com/images/I/71kM3BRnDaL.jpg" for part in content
+    )
+    assert result.model == "gpt-5.4-vision-test"
+    assert result.payload.executive_assessment == payload.executive_assessment
+
+
+@pytest.mark.asyncio
+async def test_text_structured_still_uses_openai_model_not_vision_override() -> None:
+    client = FakeClient(
+        [SimpleNamespace(output_parsed=sample_intelligence(), usage=_usage(), incomplete_details=None)]
+    )
+    provider = OpenAIProvider(
+        api_key="test-openai-key",
+        model="gpt-5.4",
+        vision_model="gpt-5.4-vision-test",
+        client=client,
+    )
+    await provider.generate_structured(
+        schema=AIListingIntelligence,
+        system_prompt="sys",
+        user_prompt="user",
+        repair_prompt="repair",
+        prompt_version=PROMPT_VERSION,
+    )
+    assert client.responses.calls[0]["model"] == "gpt-5.4"
+    assert isinstance(client.responses.calls[0]["input"][1]["content"], str)

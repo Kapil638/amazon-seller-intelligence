@@ -439,6 +439,105 @@ export type AIListingIntelligenceV2Response = {
   meta: AIListingIntelligenceMeta;
 };
 
+export type VisualRole =
+  | "product_only"
+  | "feature"
+  | "benefit"
+  | "lifestyle"
+  | "dimensions"
+  | "how_to_use"
+  | "packaging"
+  | "comparison"
+  | "detail_closeup"
+  | "other";
+
+export type ImageFinding = {
+  severity: FindingSeverity;
+  image_ids: string[];
+  evidence_type: string;
+  observation: string;
+  recommendation: string;
+};
+
+export type ImageAreaAnalysis = {
+  assessment: string;
+  strengths: string[];
+  concerns: string[];
+  image_ids: string[];
+  product_visibility?: string | null;
+  background_characteristics?: string | null;
+  embedded_text_notes?: string | null;
+};
+
+export type GalleryVisualAnalysis = {
+  assessment: string;
+  observed_roles: VisualRole[];
+  coverage_opportunities: string[];
+  image_ids: string[];
+};
+
+export type APlusVisualAnalysis = {
+  evidence_state: EvidenceState;
+  assessment: string;
+  strengths: string[];
+  gaps: string[];
+  image_ids: string[];
+};
+
+export type BrandStoryVisualAnalysis = APlusVisualAnalysis;
+
+export type MediaRoleCoverage = {
+  observed: VisualRole[];
+  not_observed: VisualRole[];
+  notes: string[];
+};
+
+export type RecommendedImagePlanStep = {
+  step: number;
+  slot: string;
+  purpose: string;
+  grounded_in: string;
+};
+
+export type PriorityVisualImprovement = {
+  priority: ActionPriority;
+  issue: string;
+  why_it_matters: string;
+  recommended_action: string;
+  image_ids: string[];
+};
+
+export type AIImageIntelligence = {
+  executive_assessment: string;
+  visual_strengths: string[];
+  priority_improvements: PriorityVisualImprovement[];
+  main_image_analysis: ImageAreaAnalysis;
+  gallery_analysis: GalleryVisualAnalysis;
+  a_plus_visual_analysis: APlusVisualAnalysis;
+  brand_story_analysis: BrandStoryVisualAnalysis;
+  media_role_coverage: MediaRoleCoverage;
+  redundancy_analysis: string[];
+  image_findings: ImageFinding[];
+  recommended_image_plan: RecommendedImagePlanStep[];
+  confidence_notes: string[];
+};
+
+export type AIImageIntelligenceMeta = AIListingIntelligenceMeta & {
+  engine: string;
+  images_available: number;
+  images_selected: number;
+  images_skipped: number;
+  selection_reason: string | null;
+  warnings: string[];
+};
+
+export type AIImageIntelligenceResponse = {
+  product: Product;
+  analysis: ListingAnalysisV2;
+  image_intelligence: AIImageIntelligence;
+  meta: AIImageIntelligenceMeta;
+};
+
 export type GapSeverity = "high" | "medium" | "low";
 
 export type GapDirection = "below" | "above" | "missing";

@@ -179,4 +179,4 @@ V2 analyzes the Product already in the request body. **0 additional Rainforest c
 
 Analyze listing quality loads V2 as the primary view and still loads V1 in a collapsed legacy panel. Primary **Generate AI strategy** uses V2. V1 AI remains a legacy path.
 
-See [ai-listing-intelligence-v2.md](ai-listing-intelligence-v2.md).
+See [ai-listing-intelligence-v2.md](ai-listing-intelligence-v2.md). Image vision is a separate optional step: [image-media-intelligence.md](image-media-intelligence.md).

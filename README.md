@@ -2,7 +2,7 @@
 
 AI-powered Amazon seller intelligence platform.
 
-This repository currently contains **Milestone 0–9 plus API Budget, Bulk ASIN Due Diligence, Listing Intelligence V2, and AI Content & SEO Intelligence V2**: a local monorepo with mock lookup, manual product input, deterministic listing intelligence (v1 and v2), Rainforest real-ASIN lookup, AI listing strategy (V2 primary, V1 unchanged), competitor discovery and comparison, Seller Central report analytics, API usage, and **mock-only bulk ASIN due diligence**.
+This repository currently contains **Milestone 0–9 plus API Budget, Bulk ASIN Due Diligence, Listing Intelligence V2, AI Content & SEO Intelligence V2, and Image & Media Intelligence V1**: a local monorepo with mock lookup, manual product input, deterministic listing intelligence (v1 and v2), Rainforest real-ASIN lookup, AI listing strategy (V2 primary, V1 unchanged), optional image/media vision, competitor discovery and comparison, Seller Central report analytics, API usage, and **mock-only bulk ASIN due diligence**.
 
 ## What this project is
 
@@ -11,15 +11,16 @@ Later milestones will add Amazon SP-API, Ads API, AI report interpretation, and 
 Right now the app does these things:
 
 1. Look up a **real Amazon.in ASIN** via Rainforest (primary workflow).
-2. Look up a product against **mock data** (Quick Demo).
+2. Look up a product against **mock data** by entering catalog ASINs `B0TEST0001`–`B0TEST0003` (no dedicated Quick Demo tab).
 3. Enter a listing by hand (Manual Product fallback).
 4. Run **Listing Intelligence V2** — listing quality (not sales), plus separate market signals and data coverage. V1 remains available as legacy.
 5. Generate **AI Strategy V2** — semantic content/SEO interpretation of V2 evidence. OpenAI, explicit click only. V1 AI remains a legacy path.
-6. **Discover candidate competitors** via Rainforest Amazon search. The seller still chooses up to three.
-7. Compare selected or manually entered competitor ASINs — deterministic comparison, then optional AI competitive insights.
-8. Upload a **Sponsored Products Search Term Report** or **Business Report** and run deterministic PPC / business analytics. No AI. No database.
-9. See **API Budget** at the top of the app — Rainforest account credits and OpenAI spend (provider vs this app).
-10. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI only in this milestone).
+6. Optionally **Analyze Images & Media** — multimodal visual intelligence. Separate from listing-quality scores. Explicit click only.
+7. **Discover candidate competitors** via Rainforest Amazon search. The seller still chooses up to three.
+8. Compare selected or manually entered competitor ASINs — deterministic comparison, then optional AI competitive insights.
+9. Upload a **Sponsored Products Search Term Report** or **Business Report** and run deterministic PPC / business analytics. No AI. No database.
+10. See **API Budget** at the top of the app — Rainforest account credits and OpenAI spend (provider vs this app).
+11. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI only in this milestone).
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -36,6 +37,7 @@ POST /api/v1/analysis/listing         → ListingAnalysisService.analyze() → L
 POST /api/v1/analysis/listing/v2      → ListingAnalysisV2Service.analyze() → ListingAnalysisV2
 POST /api/v1/analysis/listing/ai      → AIListingIntelligenceService.generate() → AIListingIntelligence (v1)
 POST /api/v1/analysis/listing/v2/ai   → AIListingIntelligenceV2Service.generate() → AIListingIntelligenceV2
+POST /api/v1/analysis/listing/v2/images/ai → AIImageIntelligenceService.generate() → AIImageIntelligence
 POST /api/v1/analysis/competitors     → CompetitorComparisonService.compare() → CompetitorComparison
 POST /api/v1/analysis/competitors/ai  → AICompetitiveIntelligenceService.generate() → AICompetitiveIntelligence
 POST /api/v1/competitors/query        → CompetitorSearchQueryService.generate() → search query
@@ -73,7 +75,7 @@ The rest of the application — API responses and the frontend — uses only the
 AmazonSearchProvider
         │
         ├── RainforestAmazonSearchProvider       [implemented, V1]
-        ├── MockAmazonSearchProvider             [implemented, Quick Demo]
+        ├── MockAmazonSearchProvider             [implemented, demo ASINs / tests]
         └── AmazonOfficialSearchProvider         [future]
 ```
 
@@ -93,13 +95,30 @@ ReportParser
         └── BusinessReportParser                 [implemented]
 ```
 
-Listing Intelligence sits on top of `Product`. V1 scoring lives in `app/analytics/listing_rules.py`. V2 scoring lives in `app/analytics/listing_rules_v2.py`. Primary AI strategy sits on `ListingAnalysisV2` through `AIListingIntelligenceV2Service` and `AIProvider`. V1 AI remains on `ListingAnalysis` through `AIListingIntelligenceService`. Competitor comparison sits on top of `Product` + `ListingAnalysis` through `CompetitorComparisonService`. Competitive AI sits on that comparison through `AICompetitiveIntelligenceService` and the same `AIProvider`. Amazon search discovery sits on `AmazonSearchProvider` (Rainforest `type=search`) and never calls OpenAI. Seller report analytics sit on normalized report rows through `PPCAnalyticsService` and `BusinessAnalyticsService` and never call OpenAI. OpenAI-specific code stays in `OpenAIProvider`. The API Budget strip reads Rainforest Account API credits and optional OpenAI organization costs on the backend only; see [docs/api-usage-dashboard.md](docs/api-usage-dashboard.md). Bulk due diligence is a separate job workflow that currently uses mock product and mock AI providers; see [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md). See also [docs/listing-intelligence-v2.md](docs/listing-intelligence-v2.md), [docs/ai-listing-intelligence-v2.md](docs/ai-listing-intelligence-v2.md), [docs/ai-listing-intelligence.md](docs/ai-listing-intelligence.md), [docs/competitor-intelligence.md](docs/competitor-intelligence.md), [docs/competitor-discovery.md](docs/competitor-discovery.md), and [docs/seller-report-analytics.md](docs/seller-report-analytics.md).
+Listing Intelligence sits on top of `Product`. V1 scoring lives in `app/analytics/listing_rules.py`. V2 scoring lives in `app/analytics/listing_rules_v2.py`. Primary AI strategy sits on `ListingAnalysisV2` through `AIListingIntelligenceV2Service` and `AIProvider`. Optional image/media vision sits on `AIImageIntelligenceService` and `AIProvider.generate_multimodal_structured`. V1 AI remains on `ListingAnalysis` through `AIListingIntelligenceService`. Competitor comparison sits on top of `Product` + `ListingAnalysis` through `CompetitorComparisonService`. Competitive AI sits on that comparison through `AICompetitiveIntelligenceService` and the same `AIProvider`. Amazon search discovery sits on `AmazonSearchProvider` (Rainforest `type=search`) and never calls OpenAI. Seller report analytics sit on normalized report rows through `PPCAnalyticsService` and `BusinessAnalyticsService` and never call OpenAI. OpenAI-specific code stays in `OpenAIProvider`. The API Budget strip reads Rainforest Account API credits and optional OpenAI organization costs on the backend only; see [docs/api-usage-dashboard.md](docs/api-usage-dashboard.md). Bulk due diligence is a separate job workflow that currently uses mock product and mock AI providers; see [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md). See also [docs/listing-intelligence-v2.md](docs/listing-intelligence-v2.md), [docs/ai-listing-intelligence-v2.md](docs/ai-listing-intelligence-v2.md), [docs/image-media-intelligence.md](docs/image-media-intelligence.md), [docs/ai-listing-intelligence.md](docs/ai-listing-intelligence.md), [docs/competitor-intelligence.md](docs/competitor-intelligence.md), [docs/competitor-discovery.md](docs/competitor-discovery.md), and [docs/seller-report-analytics.md](docs/seller-report-analytics.md).
 
 Marketplace identifiers use Amazon **domain** form. V1 supports `amazon.in` only. See [docs/marketplace.md](docs/marketplace.md).
 
 ## Listing Intelligence
 
-After a product is loaded, the UI can call:
+The current primary path after a product is loaded is **Listing Intelligence V2**:
+
+```text
+POST /api/v1/analysis/listing/v2
+```
+
+Optional explicit-click AI:
+
+```text
+POST /api/v1/analysis/listing/v2/ai
+POST /api/v1/analysis/listing/v2/images/ai
+```
+
+V1 (`POST /api/v1/analysis/listing` and `/listing/ai`) remains as a legacy/backward-compatible path. See [docs/listing-intelligence-v2.md](docs/listing-intelligence-v2.md).
+
+### Legacy V1 scoring (still available)
+
+After a product is loaded, the UI can still call:
 
 ```text
 POST /api/v1/analysis/listing
@@ -251,11 +270,17 @@ Use these fictional catalog IDs against the mock provider:
 | POST | `/api/v1/analysis/listing/v2` | Deterministic listing quality V2 for a `Product`. |
 | POST | `/api/v1/analysis/listing/ai` | V1 AI listing recommendations on top of `ListingAnalysis`. |
 | POST | `/api/v1/analysis/listing/v2/ai` | V2 AI content/SEO strategy on top of `ListingAnalysisV2`. |
+| POST | `/api/v1/analysis/listing/v2/images/ai` | Optional multimodal image/media intelligence. |
 | POST | `/api/v1/analysis/competitors` | Deterministic comparison of a target `Product` against 1–3 competitor ASINs. |
 | POST | `/api/v1/analysis/competitors/ai` | AI competitive insights on a completed comparison. |
 | POST | `/api/v1/competitors/query` | Generate a deterministic Amazon search query from a target `Product`. |
 | POST | `/api/v1/competitors/discover` | Rainforest Amazon.in search → ranked candidate listings. |
 | POST | `/api/v1/reports/analyze` | Multipart CSV/XLSX upload → Search Term or Business Report analytics. |
+| GET | `/api/v1/usage/dashboard` | Provider-account usage plus this app’s Rainforest/OpenAI ledger. |
+| POST | `/api/v1/bulk/preview` | Preview unique ASINs from a CSV/XLSX upload. |
+| POST | `/api/v1/bulk/jobs` | Start a bulk due-diligence job (mock providers by default). |
+| GET | `/api/v1/bulk/jobs/{job_id}` | Job status / results. |
+| GET | `/api/v1/bulk/jobs/{job_id}/report.xlsx` | Excel report after the job completes. |
 
 Optional query parameter on GET: `marketplace` (default `amazon.in`).
 
@@ -282,22 +307,22 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 
 ## Current limitations
 
-- Quick Demo uses **mock** product data (`B0TEST0001`–`B0TEST0003`).
+- There is no dedicated Quick Demo tab. Mock catalog ASINs `B0TEST0001`–`B0TEST0003` still resolve from the in-process mock catalog when entered in Analyze.
 - Real ASIN lookup uses **Rainforest**. The API key stays on the backend.
 - Amazon.in public lookup remains available as `PRODUCT_PROVIDER=amazon_public`. It is experimental and often blocked.
-- Manual input is **not persisted**. Refreshing the page clears it.
-- Listing Intelligence scores are **deterministic**. AI strategy is a separate, optional step and does not change scores.
+- Manual input is a fallback (`Enter product manually`). It is **not persisted**.
+- Listing Intelligence V2 scores are **deterministic**. AI strategy and image intelligence are separate, optional clicks and do not change scores.
+- Listing V2 media coverage counts images/videos; it does not judge pixels. Optional Image & Media Intelligence analyzes selected listing images after an explicit click.
 - Competitor ASINs may be **entered by the seller** or **selected from search candidates**. Discovery does not auto-compare.
-- Competitor comparison scores use the **same listing engine**. AI competitive insights are a separate, optional step.
+- Competitor comparison scores use the **V1 listing engine**. AI competitive insights are a separate, optional step.
 - Seller reports are **ephemeral**. Uploads are analyzed in memory and discarded.
-- Report analytics are **deterministic**. AI interpretation is not in this milestone.
-- Image analysis counts URLs only. It does not download images or judge visual quality.
+- Report analytics are **deterministic**. AI interpretation is not implemented.
 - Scoring thresholds are heuristics, not Amazon policy.
 - No SP-API or Ads API yet.
 - No Claude provider yet. OpenAI is the current AI provider.
 - No database or Redis yet. Catalog and AI lookups use a small in-memory TTL cache only. API usage ledgers are process-lifetime memory.
 - Rainforest **account credits** come from the Account API. This app’s call counts are a separate ledger. See [docs/api-usage-dashboard.md](docs/api-usage-dashboard.md).
-- OpenAI **provider spend** needs an Admin API key (`OPENAI_ADMIN_API_KEY`). App-estimated cost is calculated from response token usage.
-- Bulk due diligence currently uses **mock product and mock AI providers**. Live Rainforest/OpenAI bulk is guarded off. See [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md).
+- OpenAI **provider spend** needs an Admin API key (`OPENAI_ADMIN_API_KEY`). App-estimated cost is calculated from response token usage and is not authoritative provider billing.
+- Bulk due diligence currently uses **mock product and mock AI providers**. Live Rainforest/OpenAI bulk is guarded off. Bulk **Excel** export is implemented; PDF export is not. See [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md).
 - No authentication yet.
 - India marketplace (`amazon.in`) only. Report money is treated as INR.

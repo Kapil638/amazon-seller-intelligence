@@ -6,6 +6,7 @@ import { ArrowRight, Loader2 } from "lucide-react";
 import { AICompetitiveIntelligenceView } from "@/components/ai-competitive-intelligence";
 import { AIListingIntelligenceView } from "@/components/ai-listing-intelligence";
 import { AIListingIntelligenceV2View } from "@/components/ai-listing-intelligence-v2";
+import { ImageMediaIntelligenceView } from "@/components/image-media-intelligence";
 import { CompetitorComparisonView } from "@/components/competitor-comparison";
 import { CompetitorDiscovery } from "@/components/competitor-discovery";
 import { CompetitorInput } from "@/components/competitor-input";
@@ -27,12 +28,14 @@ import {
   generateAICompetitiveIntelligence,
   generateAIListingIntelligence,
   generateAIListingIntelligenceV2,
+  generateImageIntelligence,
   generateCompetitorSearchQuery,
   ProductLookupError,
 } from "@/lib/api";
 import { isValidAsin, normalizeAsin } from "@/lib/asin";
 import type {
   AICompetitiveIntelligenceResponse,
+  AIImageIntelligenceResponse,
   AIListingIntelligenceResponse,
   AIListingIntelligenceV2Response,
   CompetitorComparisonResponse,
@@ -58,6 +61,9 @@ export function ProductLookup() {
   const [legacyAiLoading, setLegacyAiLoading] = useState(false);
   const [legacyAiError, setLegacyAiError] = useState<string | null>(null);
   const [legacyAiResult, setLegacyAiResult] = useState<AIListingIntelligenceResponse | null>(null);
+  const [imageAiLoading, setImageAiLoading] = useState(false);
+  const [imageAiError, setImageAiError] = useState<string | null>(null);
+  const [imageAiResult, setImageAiResult] = useState<AIImageIntelligenceResponse | null>(null);
   const [competitorLoading, setCompetitorLoading] = useState(false);
   const [competitorError, setCompetitorError] = useState<string | null>(null);
   const [comparison, setComparison] = useState<CompetitorComparisonResponse | null>(null);
@@ -80,6 +86,8 @@ export function ProductLookup() {
     setAiResult(null);
     setLegacyAiError(null);
     setLegacyAiResult(null);
+    setImageAiError(null);
+    setImageAiResult(null);
     setCompetitorError(null);
     setComparison(null);
     setCompetitiveAiError(null);
@@ -258,6 +266,8 @@ export function ProductLookup() {
                   setAiError(null);
                   setLegacyAiResult(null);
                   setLegacyAiError(null);
+                  setImageAiResult(null);
+                  setImageAiError(null);
                 } catch (err) {
                   setAnalysis(null);
                   setAnalysisV2(null);
@@ -265,6 +275,8 @@ export function ProductLookup() {
                   setAiError(null);
                   setLegacyAiResult(null);
                   setLegacyAiError(null);
+                  setImageAiResult(null);
+                  setImageAiError(null);
                   if (err instanceof ProductLookupError) {
                     setAnalysisError(err.message);
                   } else {
@@ -377,6 +389,67 @@ export function ProductLookup() {
       ) : null}
 
       {aiResult ? <AIListingIntelligenceV2View intelligence={aiResult.ai_intelligence} /> : null}
+
+      {analysisV2 ? (
+        <div className="space-y-3 rounded-lg border border-border bg-card p-5">
+          <div>
+            <h2 className="text-[0.95rem] font-semibold">Image & media intelligence</h2>
+            <p className="mt-1 text-sm leading-6 text-muted-foreground">
+              Optional AI analysis of your listing images and A+ media. Uses OpenAI multimodal
+              analysis. Cached results are reused. This does not change listing-quality scores.
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={imageAiLoading}
+            onClick={async () => {
+              setImageAiLoading(true);
+              setImageAiError(null);
+              try {
+                const next = await generateImageIntelligence(
+                  analysisV2.product,
+                  analysisV2.analysis,
+                  analysisV2.meta.source ?? undefined,
+                );
+                setImageAiResult(next);
+              } catch (err) {
+                setImageAiResult(null);
+                if (err instanceof ProductLookupError) {
+                  setImageAiError(err.message);
+                } else {
+                  setImageAiError("Image analysis could not be generated right now.");
+                }
+              } finally {
+                setImageAiLoading(false);
+              }
+            }}
+          >
+            {imageAiLoading ? (
+              <>
+                <Loader2 className="animate-spin" />
+                Analyzing images & media…
+              </>
+            ) : (
+              "Analyze Images & Media"
+            )}
+          </Button>
+        </div>
+      ) : null}
+
+      {imageAiError ? (
+        <Alert variant="destructive">
+          <AlertTitle>Image analysis unavailable</AlertTitle>
+          <AlertDescription>{imageAiError}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {imageAiResult ? (
+        <ImageMediaIntelligenceView
+          intelligence={imageAiResult.image_intelligence}
+          meta={imageAiResult.meta}
+        />
+      ) : null}
 
       {analysis ? (
         <details className="rounded-lg border border-border bg-card">

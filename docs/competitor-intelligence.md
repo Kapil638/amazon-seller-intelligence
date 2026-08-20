@@ -1,6 +1,6 @@
 # Competitor Intelligence (comparison version v1)
 
-This analysis is **deterministic comparison plus optional AI interpretation**. The seller supplies competitor ASINs. The system does not discover competitors automatically.
+This analysis is **deterministic comparison plus optional AI interpretation**. The comparison endpoint still requires seller-selected competitor ASINs (typed or chosen from discovery candidates). Discovery is a separate feature; see [competitor-discovery.md](competitor-discovery.md).
 
 Prompt version for the AI layer: **`competitive-intelligence-v1`**.
 
@@ -42,9 +42,9 @@ Validation:
 
 This keeps business evidence traceable: every compared listing was chosen by the seller.
 
-## Why automatic competitor discovery is not implemented
+## Why Milestone 7 did not include automatic discovery
 
-Automatic discovery would require Amazon search, similar-item APIs, or model-invented ASINs. Those sources are not yet in V1, and they would mix inferred competitors with observed catalog facts. Milestone 7 only compares seller-supplied ASINs.
+At the time Milestone 7 shipped, automatic discovery was not implemented. It would have required Amazon search, similar-item APIs, or model-invented ASINs. Milestone 7 only compares seller-supplied ASINs. Candidate Amazon.in search was added later as a separate seller-confirmed flow.
 
 ## Comparison metrics
 

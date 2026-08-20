@@ -6,7 +6,7 @@ Prompt version: **`listing-intelligence-v2`**.
 
 This layer answers: *What specifically should the seller improve in this listing, and why?*
 
-It does **not** change deterministic V2 listing-quality scores. It does not invent Amazon keyword volume, rank, conversion, sales, CTR, PPC, or profitability. Image vision is out of scope (Milestone 8D).
+It does **not** change deterministic V2 listing-quality scores. It does not invent Amazon keyword volume, rank, conversion, sales, CTR, PPC, or profitability. Optional image/media vision is a separate explicit action: [image-media-intelligence.md](image-media-intelligence.md).
 
 ## Purpose
 

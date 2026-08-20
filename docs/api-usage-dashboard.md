@@ -115,7 +115,7 @@ Every successful Responses call already returns `usage`. The backend records:
 - `output_tokens`
 - `total_tokens`
 - `model`
-- `workflow` (`listing_intelligence`, `competitive_intelligence`, and later `bulk_listing_intelligence` / `portfolio_summary`)
+- `workflow` (`listing_intelligence`, `listing_intelligence_v2`, `image_intelligence_v1`, `competitive_intelligence`, `bulk_listing_intelligence`, `portfolio_summary`)
 
 Estimated USD is calculated from a single table:
 
@@ -135,7 +135,7 @@ Local TTL caches avoid provider calls:
 | --- | --- |
 | Rainforest product (`MemoryTtlCache`) | One product Account/Product API call avoided |
 | Rainforest search | One `type=search` call avoided |
-| Listing / competitive AI | One OpenAI Responses call avoided |
+| Listing / competitive / image AI | One OpenAI Responses call avoided |
 
 `calls_saved` equals those local cache hits. OpenAI prompt-cache tokens (`cached_input_tokens`) are a different mechanism and only affect estimated cost.
 

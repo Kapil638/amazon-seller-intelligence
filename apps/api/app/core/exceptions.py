@@ -72,6 +72,14 @@ class AISafetyRefusalError(Exception):
         super().__init__(message)
 
 
+class NoValidMediaError(Exception):
+    def __init__(
+        self,
+        message: str = "No valid listing images were available for visual analysis.",
+    ) -> None:
+        super().__init__(message)
+
+
 class CompetitorValidationError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)

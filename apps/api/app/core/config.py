@@ -37,6 +37,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("OPENAI_ADMIN_API_KEY", "OPENAI_ADMIN_KEY"),
     )
     openai_model: str = "gpt-5.4"
+    openai_vision_model: str = ""
+    openai_vision_max_images: int = 8
+    openai_vision_allowed_hosts: str = ""
     openai_timeout_seconds: float = 60
     openai_max_output_tokens: int = 2500
     openai_budget_usd: float = 100.0
