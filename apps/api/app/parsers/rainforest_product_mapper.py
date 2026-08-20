@@ -10,7 +10,24 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.exceptions import ProductParseFailedError
-from app.models.product import BSR, Image, Price, Product, ProductVideo, Seller, Variation
+from app.models.product import (
+    APlusContent,
+    APlusImage,
+    BrandStory,
+    BSR,
+    CategoryNode,
+    FeaturedReview,
+    Image,
+    Price,
+    Product,
+    ProductAttributes,
+    ProductSpecification,
+    ProductVideo,
+    RatingBand,
+    RatingBreakdown,
+    Seller,
+    Variation,
+)
 from app.parsers.amazon_media import (
     amazon_image_id,
     choose_best_image_url,
@@ -47,6 +64,18 @@ def map_rainforest_product(payload: dict[str, Any], asin: str, marketplace: str)
         seller=_seller(product),
         variations=_variations(product.get("variants")),
         last_fetched_at=datetime.now(UTC),
+        bsr_ranks=_bsr_ranks(product.get("bestsellers_rank")),
+        category_path=_category_path(product.get("categories")),
+        is_sold_by_amazon=_is_sold_by_amazon(product),
+        availability_type=_availability_type(product),
+        videos_count=_videos_count(product.get("videos_count")),
+        a_plus=_a_plus(product.get("a_plus_content")),
+        specifications=_named_pairs(product.get("specifications")),
+        specifications_flat=_as_str(product.get("specifications_flat")),
+        attributes=_attributes(product),
+        rating_breakdown=_rating_breakdown(product.get("rating_breakdown")),
+        featured_reviews=_featured_reviews(product.get("top_reviews")),
+        recent_sales_text=_as_str(product.get("recent_sales")),
     )
 
 
@@ -82,6 +111,50 @@ def _as_int(value: Any) -> int | None:
     if number is None:
         return None
     return int(number)
+
+
+def _as_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _as_id(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return _as_str(value)
+
+
+def _positive_int(value: Any) -> int | None:
+    number = _as_int(value)
+    if number is None or number < 1:
+        return None
+    return number
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = _as_str(item)
+        if text:
+            items.append(text)
+    return items
+
+
+def _named_pairs(value: Any) -> list[ProductSpecification]:
+    if not isinstance(value, list):
+        return []
+    pairs: list[ProductSpecification] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = _as_str(item.get("name"))
+        pair_value = _as_str(item.get("value"))
+        if name and pair_value:
+            pairs.append(ProductSpecification(name=name, value=pair_value))
+    return pairs
 
 
 def _price(product: dict[str, Any]) -> Price | None:
@@ -133,9 +206,10 @@ def _images(product: dict[str, Any]) -> list[Image]:
     grouped: dict[str, list[str]] = {}
     order: list[str] = []
     variants: dict[str, str] = {}
+    dimensions: dict[str, tuple[int | None, int | None]] = {}
     video_ids = _video_thumbnail_ids(product)
 
-    def consider(url: str | None, variant: str | None = None) -> None:
+    def consider(url: str | None, variant: str | None = None, width: Any = None, height: Any = None) -> None:
         if not url:
             return
         if is_video_thumbnail_url(url):
@@ -150,10 +224,15 @@ def _images(product: dict[str, Any]) -> list[Image]:
             order.append(image_id)
         if variant and image_id not in variants:
             variants[image_id] = variant
+        if url not in dimensions:
+            dimensions[url] = (_positive_int(width), _positive_int(height))
 
     main = product.get("main_image")
     main_url = _as_str(main.get("link")) if isinstance(main, dict) else None
-    consider(main_url, "MAIN")
+    if isinstance(main, dict):
+        consider(main_url, "MAIN", main.get("width"), main.get("height"))
+    else:
+        consider(main_url, "MAIN")
     main_id = amazon_image_id(main_url) if main_url else None
 
     raw_images = product.get("images")
@@ -161,7 +240,12 @@ def _images(product: dict[str, Any]) -> list[Image]:
         for item in raw_images:
             if not isinstance(item, dict):
                 continue
-            consider(_as_str(item.get("link")), _as_str(item.get("variant")))
+            consider(
+                _as_str(item.get("link")),
+                _as_str(item.get("variant")),
+                item.get("width"),
+                item.get("height"),
+            )
 
     flat = _as_str(product.get("images_flat"))
     if flat:
@@ -181,7 +265,8 @@ def _images(product: dict[str, Any]) -> list[Image]:
         seen_urls.add(best)
         variant = variants.get(image_id)
         is_main = image_id == main_id or (variant or "").upper() == "MAIN"
-        images.append(Image(url=best, variant=variant, is_main=is_main))
+        width, height = dimensions.get(best, (None, None))
+        images.append(Image(url=best, variant=variant, is_main=is_main, width=width, height=height))
     return images
 
 
@@ -209,6 +294,10 @@ def _videos(product: dict[str, Any]) -> list[ProductVideo]:
                     thumbnail_url=poster,
                     video_url=video_url,
                     duration_seconds=duration if duration is not None and duration >= 0 else None,
+                    group_type=_as_str(item.get("group_type")),
+                    group_id=_as_str(item.get("group_id")),
+                    width=_positive_int(item.get("width")),
+                    height=_positive_int(item.get("height")),
                 )
             )
 
@@ -244,6 +333,13 @@ def _video_thumbnail_ids(product: dict[str, Any]) -> set[str]:
     return ids
 
 
+def _videos_count(value: Any) -> int | None:
+    count = _as_int(value)
+    if count is None or count < 0:
+        return None
+    return count
+
+
 def _category(product: dict[str, Any]) -> str | None:
     flat = _as_str(product.get("categories_flat"))
     if flat:
@@ -262,22 +358,55 @@ def _category(product: dict[str, Any]) -> str | None:
     return None
 
 
-def _bsr(value: Any) -> BSR | None:
-    if not isinstance(value, list) or not value:
+def _category_path(value: Any) -> list[CategoryNode]:
+    if not isinstance(value, list):
+        return []
+    nodes: list[CategoryNode] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = _as_str(item.get("name"))
+        if not name:
+            continue
+        nodes.append(CategoryNode(name=name, category_id=_as_id(item.get("category_id"))))
+    return nodes
+
+
+def _bsr_entry(item: Any) -> BSR | None:
+    if not isinstance(item, dict):
         return None
-    first = value[0]
-    if not isinstance(first, dict):
-        return None
-    rank = _as_int(first.get("rank"))
-    category = _as_str(first.get("category"))
+    rank = _as_int(item.get("rank"))
+    category = _as_str(item.get("category"))
     if rank is None or rank < 1 or not category:
         return None
     return BSR(rank=rank, category=category)
 
 
-def _availability(product: dict[str, Any]) -> str | None:
+def _bsr(value: Any) -> BSR | None:
+    if not isinstance(value, list) or not value:
+        return None
+    return _bsr_entry(value[0])
+
+
+def _bsr_ranks(value: Any) -> list[BSR]:
+    if not isinstance(value, list):
+        return []
+    ranks: list[BSR] = []
+    for item in value:
+        parsed = _bsr_entry(item)
+        if parsed is not None:
+            ranks.append(parsed)
+    return ranks
+
+
+def _buybox(product: dict[str, Any]) -> dict[str, Any] | None:
     buybox = product.get("buybox_winner")
-    if not isinstance(buybox, dict):
+    return buybox if isinstance(buybox, dict) else None
+
+
+def _availability(product: dict[str, Any]) -> str | None:
+    buybox = _buybox(product)
+    if buybox is None:
         return None
     availability = buybox.get("availability")
     if not isinstance(availability, dict):
@@ -285,12 +414,34 @@ def _availability(product: dict[str, Any]) -> str | None:
     return _as_str(availability.get("raw"))
 
 
-def _seller(product: dict[str, Any]) -> Seller | None:
-    buybox = product.get("buybox_winner")
-    if not isinstance(buybox, dict):
+def _availability_type(product: dict[str, Any]) -> str | None:
+    buybox = _buybox(product)
+    if buybox is None:
+        return None
+    availability = buybox.get("availability")
+    if not isinstance(availability, dict):
+        return None
+    return _as_str(availability.get("type"))
+
+
+def _fulfillment(product: dict[str, Any]) -> dict[str, Any] | None:
+    buybox = _buybox(product)
+    if buybox is None:
         return None
     fulfillment = buybox.get("fulfillment")
-    if not isinstance(fulfillment, dict):
+    return fulfillment if isinstance(fulfillment, dict) else None
+
+
+def _is_sold_by_amazon(product: dict[str, Any]) -> bool | None:
+    fulfillment = _fulfillment(product)
+    if fulfillment is None:
+        return None
+    return _as_bool(fulfillment.get("is_sold_by_amazon"))
+
+
+def _seller(product: dict[str, Any]) -> Seller | None:
+    fulfillment = _fulfillment(product)
+    if fulfillment is None:
         return None
     third_party = fulfillment.get("third_party_seller")
     if not isinstance(third_party, dict):
@@ -328,5 +479,139 @@ def _variations(value: Any) -> list[Variation]:
                 if name and dim_value:
                     attributes[name] = dim_value
         label = _as_str(item.get("title")) or (" / ".join(attributes.values()) if attributes else asin)
-        variations.append(Variation(asin=asin, label=label, attributes=attributes))
+        variations.append(
+            Variation(
+                asin=asin,
+                label=label,
+                attributes=attributes,
+                is_current_product=_as_bool(item.get("is_current_product")),
+            )
+        )
     return variations
+
+
+def _attributes(product: dict[str, Any]) -> ProductAttributes | None:
+    manufacturer = _as_str(product.get("manufacturer"))
+    ingredients = _string_list(product.get("ingredients"))
+    diet_type = _string_list(product.get("diet_type"))
+    listed = _named_pairs(product.get("attributes"))
+    if not manufacturer and not ingredients and not diet_type and not listed:
+        return None
+    return ProductAttributes(
+        manufacturer=manufacturer,
+        ingredients=ingredients,
+        diet_type=diet_type,
+        listed=listed,
+    )
+
+
+def _a_plus(value: Any) -> APlusContent | None:
+    if not isinstance(value, dict):
+        return None
+    brand_story = _brand_story(value.get("brand_story"))
+    images: list[APlusImage] = []
+    raw_images = value.get("all_images")
+    if isinstance(raw_images, list):
+        for item in raw_images:
+            if not isinstance(item, dict):
+                continue
+            url = _as_str(item.get("link"))
+            if not url:
+                continue
+            images.append(APlusImage(url=url, alt=_as_str(item.get("name"))))
+    return APlusContent(
+        has_a_plus_content=_as_bool(value.get("has_a_plus_content")),
+        has_brand_story=_as_bool(value.get("has_brand_story")),
+        third_party=_as_bool(value.get("third_party")),
+        company_logo=_as_str(value.get("company_logo")),
+        company_description=_as_str(value.get("company_description_text")),
+        body_text=_as_str(value.get("body_text")),
+        images=images,
+        brand_story=brand_story,
+    )
+
+
+def _brand_story(value: Any) -> BrandStory | None:
+    if not isinstance(value, dict):
+        return None
+    images = _string_list(value.get("images"))
+    story = BrandStory(
+        hero_image=_as_str(value.get("hero_image")),
+        brand_logo=_as_str(value.get("brand_logo")),
+        description=_as_str(value.get("description")),
+        images=images,
+    )
+    if (
+        story.hero_image is None
+        and story.brand_logo is None
+        and story.description is None
+        and not story.images
+    ):
+        return None
+    return story
+
+
+def _rating_band(value: Any) -> RatingBand | None:
+    if not isinstance(value, dict):
+        return None
+    percentage = _as_int(value.get("percentage"))
+    count = _as_int(value.get("count"))
+    if percentage is not None and (percentage < 0 or percentage > 100):
+        percentage = None
+    if count is not None and count < 0:
+        count = None
+    if percentage is None and count is None:
+        return None
+    return RatingBand(percentage=percentage, count=count)
+
+
+def _rating_breakdown(value: Any) -> RatingBreakdown | None:
+    if not isinstance(value, dict):
+        return None
+    breakdown = RatingBreakdown(
+        five_star=_rating_band(value.get("five_star")),
+        four_star=_rating_band(value.get("four_star")),
+        three_star=_rating_band(value.get("three_star")),
+        two_star=_rating_band(value.get("two_star")),
+        one_star=_rating_band(value.get("one_star")),
+    )
+    if all(
+        getattr(breakdown, name) is None
+        for name in ("five_star", "four_star", "three_star", "two_star", "one_star")
+    ):
+        return None
+    return breakdown
+
+
+def _featured_reviews(value: Any) -> list[FeaturedReview]:
+    if not isinstance(value, list):
+        return []
+    reviews: list[FeaturedReview] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        date = item.get("date") if isinstance(item.get("date"), dict) else {}
+        profile = item.get("profile") if isinstance(item.get("profile"), dict) else {}
+        rating = _rating(item.get("rating"))
+        review = FeaturedReview(
+            id=_as_str(item.get("id")),
+            title=_as_str(item.get("title")),
+            body=_as_str(item.get("body")),
+            rating=rating,
+            profile_name=_as_str(profile.get("name")) if isinstance(profile, dict) else None,
+            verified_purchase=_as_bool(item.get("verified_purchase")),
+            date_raw=_as_str(date.get("raw")) if isinstance(date, dict) else None,
+            date_utc=_as_str(date.get("utc")) if isinstance(date, dict) else None,
+        )
+        if not any(
+            (
+                review.id,
+                review.title,
+                review.body,
+                review.rating is not None,
+                review.profile_name,
+            )
+        ):
+            continue
+        reviews.append(review)
+    return reviews

@@ -4,6 +4,8 @@ This analysis is **deterministic and does not currently use AI**.
 
 Scoring is implemented in `apps/api/app/analytics/listing_rules.py` and called through `ListingAnalysisService`. The same function can be used by future jobs or MCP tools.
 
+Milestone 8A added richer optional `Product` fields. Milestone 8B added Listing Intelligence V2 (`POST /api/v1/analysis/listing/v2`). **V1 weights, thresholds, and findings in this document are unchanged.** See [listing-intelligence-v2.md](listing-intelligence-v2.md) and [listing-intelligence-v2-data-foundation.md](listing-intelligence-v2-data-foundation.md).
+
 Thresholds below are **internal heuristics**. They are not Amazon policy requirements.
 
 ## Weights

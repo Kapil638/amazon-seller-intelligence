@@ -47,13 +47,30 @@ def test_mapper_maps_documented_product_fields() -> None:
     assert product.bsr is not None
     assert product.bsr.rank == 32614
     assert product.bsr.category == "Electronics"
+    assert [item.model_dump() for item in product.bsr_ranks] == [
+        {"rank": 32614, "category": "Electronics"},
+        {"rank": 161, "category": "Sports & Action Video Cameras"},
+    ]
+    assert [node.model_dump() for node in product.category_path] == [
+        {"name": "Electronics", "category_id": "172282"},
+        {"name": "Camera & Photo", "category_id": "502394"},
+    ]
     assert product.availability == "In Stock"
+    assert product.availability_type == "in_stock"
+    assert product.is_sold_by_amazon is False
     assert product.seller is not None
     assert product.seller.name == "AKASO OUTDOOR"
     assert product.seller.id == "A2SITDWYE2UYD"
     assert product.seller.is_fba is True
     assert len(product.variations) == 2
     assert product.variations[0].attributes["Style"] == "With 128GB MicroSD Card"
+    assert product.variations[0].is_current_product is False
+    assert product.variations[1].is_current_product is True
+    assert product.a_plus is None
+    assert product.specifications == []
+    assert product.featured_reviews == []
+    assert product.videos_count is None
+    assert product.recent_sales_text is None
 
 
 def test_mapper_leaves_missing_fields_null_or_empty() -> None:
@@ -68,10 +85,21 @@ def test_mapper_leaves_missing_fields_null_or_empty() -> None:
     assert product.videos == []
     assert product.description is None
     assert product.bsr is None
+    assert product.bsr_ranks == []
     assert product.seller is None
+    assert product.is_sold_by_amazon is None
     assert product.variations == []
     assert product.availability is None
+    assert product.availability_type is None
     assert product.category is None
+    assert product.category_path == []
+    assert product.a_plus is None
+    assert product.specifications == []
+    assert product.attributes is None
+    assert product.rating_breakdown is None
+    assert product.featured_reviews == []
+    assert product.videos_count is None
+    assert product.recent_sales_text is None
 
 
 def test_mapper_does_not_invent_price_without_buybox() -> None:
@@ -99,6 +127,10 @@ def test_media_mapping_prefers_main_and_highest_quality() -> None:
     assert playable.title == "Product overview"
     assert playable.duration_seconds == 16
     assert playable.video_url and playable.video_url.endswith(".mp4")
+    assert playable.group_type == "videos_for_this_product"
+    assert playable.group_id == "IB_G1"
+    assert playable.width == 1920
+    assert playable.height == 1080
     overlay = next(item for item in product.videos if item.video_url is None)
     assert overlay.thumbnail_url
     assert "play-icon-overlay" not in overlay.thumbnail_url
@@ -133,8 +165,12 @@ def test_listing_intelligence_counts_still_images_not_videos() -> None:
 @pytest.mark.asyncio
 async def test_provider_uses_httpx_params_and_normalizes_response() -> None:
     captured: dict[str, str] = {}
+    captured_keys: list[str] = []
+    calls = {"count": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        captured_keys.extend(request.url.params.keys())
         captured["api_key"] = request.url.params.get("api_key", "")
         captured["type"] = request.url.params.get("type", "")
         captured["amazon_domain"] = request.url.params.get("amazon_domain", "")
@@ -150,12 +186,17 @@ async def test_provider_uses_httpx_params_and_normalizes_response() -> None:
     assert product is not None
     assert product.title.startswith("AKASO")
     assert provider.name == "rainforest"
+    assert calls["count"] == 1
+    assert set(captured_keys) == {"api_key", "type", "amazon_domain", "asin"}
     assert captured == {
         "api_key": TEST_KEY,
         "type": "product",
         "amazon_domain": "amazon.in",
         "asin": "B07J4TNYV8",
     }
+    cached = await provider.get_product("B07J4TNYV8", "amazon.in")
+    assert cached is not None
+    assert calls["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -248,7 +289,11 @@ def test_lookup_source_metadata_for_rainforest_provider(client: TestClient) -> N
     body = response.json()
     assert body["meta"]["source"] == "rainforest"
     assert body["product"]["title"]
+    assert body["product"]["asin"] == "B07J4TNYV8"
+    assert body["product"]["bsr"] == {"rank": 32614, "category": "Electronics"}
+    assert body["product"]["bsr_ranks"][1]["rank"] == 161
     assert "api_key" not in json.dumps(body)
+    assert "include_a_plus_body" not in json.dumps(body)
 
 
 def test_demo_asin_stays_mock_even_with_rainforest_provider(client: TestClient) -> None:
@@ -303,3 +348,11 @@ def test_factory_selects_rainforest(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         get_settings.cache_clear()
         get_product_provider.cache_clear()
+
+
+def test_rainforest_capabilities_do_not_claim_review_corpus() -> None:
+    provider = RainforestProductDataProvider(api_key=TEST_KEY)
+    assert provider.capabilities.ratings is True
+    assert provider.capabilities.reviews is False
+    assert provider.capabilities.product_details is True
+    assert provider.capabilities.variations is True

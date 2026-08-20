@@ -11,6 +11,7 @@ from app.usage.openai_pricing import estimate_openai_cost_usd
 RainforestCallKind = Literal["product", "search"]
 AIWorkflow = Literal[
     "listing_intelligence",
+    "listing_intelligence_v2",
     "competitive_intelligence",
     "bulk_listing_intelligence",
     "portfolio_summary",

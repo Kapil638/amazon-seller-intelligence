@@ -1,0 +1,132 @@
+{
+  "_fixture_notes": {
+    "evidence": "SUPPORTED BY RAINFOREST DOCUMENTATION BUT NOT YET OBSERVED LOCALLY",
+    "purpose": "Fictional default type=product payload covering optional fields documented by Rainforest (A+, specifications, rating_breakdown, top_reviews, recent_sales, videos_count without videos[], image width/height). This is not evidence that amazon.in always returns these keys."
+  },
+  "request_info": {
+    "success": true,
+    "credits_used": 1,
+    "credits_remaining": 100
+  },
+  "request_parameters": {
+    "amazon_domain": "amazon.in",
+    "asin": "B0DOCSENR1",
+    "type": "product"
+  },
+  "product": {
+    "title": "Documentation-only enrichment listing",
+    "asin": "B0DOCSENR1",
+    "brand": "Northlane",
+    "manufacturer": "Northlane Labs",
+    "recent_sales": "50+ bought in past month",
+    "videos_count": 2,
+    "ingredients": [
+      "Whey protein isolate",
+      "Cocoa powder"
+    ],
+    "diet_type": [
+      "Vegetarian"
+    ],
+    "attributes": [
+      {
+        "name": "Capacity",
+        "value": "1 kg"
+      }
+    ],
+    "specifications": [
+      {
+        "name": "Brand Name",
+        "value": "Northlane"
+      },
+      {
+        "name": "Item Weight",
+        "value": "1.1 kg"
+      },
+      {
+        "name": "Color Name",
+        "value": "Black"
+      }
+    ],
+    "specifications_flat": "Brand Name: Northlane. Item Weight: 1.1 kg. Color Name: Black.",
+    "main_image": {
+      "link": "https://example.test/images/main.jpg",
+      "width": 2000,
+      "height": 2000
+    },
+    "images": [
+      {
+        "link": "https://example.test/images/main.jpg",
+        "variant": "MAIN",
+        "width": 2000,
+        "height": 2000
+      },
+      {
+        "link": "https://example.test/images/side.jpg",
+        "variant": "PT01",
+        "width": 1500,
+        "height": 1500
+      }
+    ],
+    "a_plus_content": {
+      "has_a_plus_content": true,
+      "has_brand_story": true,
+      "third_party": false,
+      "company_logo": "https://example.test/brand/logo.png",
+      "company_description_text": "Northlane makes outdoor electronics.",
+      "body_text": "From the manufacturer: weather-sealed housing and a two-year warranty.",
+      "all_images": [
+        {
+          "link": "https://example.test/aplus/module-1.jpg",
+          "name": "Weather-sealed housing"
+        }
+      ],
+      "brand_story": {
+        "hero_image": "https://example.test/brand/hero.jpg",
+        "brand_logo": "https://example.test/brand/logo.png",
+        "description": "Built for long trips.",
+        "images": [
+          "https://example.test/brand/hero.jpg",
+          "https://example.test/brand/card.png"
+        ]
+      }
+    },
+    "rating_breakdown": {
+      "five_star": {
+        "percentage": 70,
+        "count": 350
+      },
+      "four_star": {
+        "percentage": 16,
+        "count": 80
+      },
+      "three_star": {
+        "percentage": 5,
+        "count": 25
+      },
+      "two_star": {
+        "percentage": 3,
+        "count": 15
+      },
+      "one_star": {
+        "percentage": 6,
+        "count": 30
+      }
+    },
+    "top_reviews": [
+      {
+        "id": "RTESTFEATURE1",
+        "title": "Works as described",
+        "body": "Used it on a weekend hike. Battery lasted the trip.",
+        "rating": 5,
+        "verified_purchase": true,
+        "date": {
+          "raw": "Reviewed in India on 1 January 2026",
+          "utc": "2026-01-01T00:00:00.000Z"
+        },
+        "profile": {
+          "name": "Demo Reviewer"
+        }
+      }
+    ]
+  }
+}

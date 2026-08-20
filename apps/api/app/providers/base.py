@@ -6,7 +6,13 @@ from app.models.product import Product
 
 
 class ProviderCapabilities(BaseModel):
-    """Declares which product fields a provider can reasonably supply."""
+    """Declares which product fields a provider can reasonably supply.
+
+    `ratings` covers star rating and/or review *count* on a product payload.
+    `reviews` means a review *corpus* (individual review bodies from a reviews
+    API). Featured/top reviews that happen to appear on a product page payload
+    do not set `reviews=True`.
+    """
 
     product_details: bool = False
     pricing: bool = False

@@ -5,10 +5,12 @@ import { ArrowRight, Loader2 } from "lucide-react";
 
 import { AICompetitiveIntelligenceView } from "@/components/ai-competitive-intelligence";
 import { AIListingIntelligenceView } from "@/components/ai-listing-intelligence";
+import { AIListingIntelligenceV2View } from "@/components/ai-listing-intelligence-v2";
 import { CompetitorComparisonView } from "@/components/competitor-comparison";
 import { CompetitorDiscovery } from "@/components/competitor-discovery";
 import { CompetitorInput } from "@/components/competitor-input";
 import { ListingIntelligence } from "@/components/listing-intelligence";
+import { ListingIntelligenceV2 } from "@/components/listing-intelligence-v2";
 import { ManualProductForm } from "@/components/manual-product-form";
 import { ProductResult } from "@/components/product-result";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -19,10 +21,12 @@ import { Label } from "@/components/ui/label";
 import {
   analyzeCompetitors,
   analyzeListing,
+  analyzeListingV2,
   discoverCompetitors,
   fetchProduct,
   generateAICompetitiveIntelligence,
   generateAIListingIntelligence,
+  generateAIListingIntelligenceV2,
   generateCompetitorSearchQuery,
   ProductLookupError,
 } from "@/lib/api";
@@ -30,9 +34,11 @@ import { isValidAsin, normalizeAsin } from "@/lib/asin";
 import type {
   AICompetitiveIntelligenceResponse,
   AIListingIntelligenceResponse,
+  AIListingIntelligenceV2Response,
   CompetitorComparisonResponse,
   CompetitorDiscoveryResult,
   ListingAnalysisResponse,
+  ListingAnalysisV2Response,
   ProductResponse,
 } from "@/lib/types";
 
@@ -45,9 +51,13 @@ export function ProductLookup() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<ListingAnalysisResponse | null>(null);
+  const [analysisV2, setAnalysisV2] = useState<ListingAnalysisV2Response | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
-  const [aiResult, setAiResult] = useState<AIListingIntelligenceResponse | null>(null);
+  const [aiResult, setAiResult] = useState<AIListingIntelligenceV2Response | null>(null);
+  const [legacyAiLoading, setLegacyAiLoading] = useState(false);
+  const [legacyAiError, setLegacyAiError] = useState<string | null>(null);
+  const [legacyAiResult, setLegacyAiResult] = useState<AIListingIntelligenceResponse | null>(null);
   const [competitorLoading, setCompetitorLoading] = useState(false);
   const [competitorError, setCompetitorError] = useState<string | null>(null);
   const [comparison, setComparison] = useState<CompetitorComparisonResponse | null>(null);
@@ -65,8 +75,11 @@ export function ProductLookup() {
   function resetDownstream() {
     setAnalysisError(null);
     setAnalysis(null);
+    setAnalysisV2(null);
     setAiError(null);
     setAiResult(null);
+    setLegacyAiError(null);
+    setLegacyAiResult(null);
     setCompetitorError(null);
     setComparison(null);
     setCompetitiveAiError(null);
@@ -235,14 +248,23 @@ export function ProductLookup() {
                 setAnalysisLoading(true);
                 setAnalysisError(null);
                 try {
-                  const next = await analyzeListing(result.product, result.meta.source);
-                  setAnalysis(next);
+                  const [legacy, next] = await Promise.all([
+                    analyzeListing(result.product, result.meta.source),
+                    analyzeListingV2(result.product, result.meta.source),
+                  ]);
+                  setAnalysis(legacy);
+                  setAnalysisV2(next);
                   setAiResult(null);
                   setAiError(null);
+                  setLegacyAiResult(null);
+                  setLegacyAiError(null);
                 } catch (err) {
                   setAnalysis(null);
+                  setAnalysisV2(null);
                   setAiResult(null);
                   setAiError(null);
+                  setLegacyAiResult(null);
+                  setLegacyAiError(null);
                   if (err instanceof ProductLookupError) {
                     setAnalysisError(err.message);
                   } else {
@@ -306,56 +328,112 @@ export function ProductLookup() {
         </Alert>
       ) : null}
 
-      {analysis ? (
-        <>
-          <ListingIntelligence analysis={analysis.analysis} />
-          <div>
-            <Button
-              type="button"
-              disabled={aiLoading}
-              onClick={async () => {
-                setAiLoading(true);
-                setAiError(null);
-                try {
-                  const next = await generateAIListingIntelligence(
-                    analysis.product,
-                    analysis.analysis,
-                    analysis.meta.source ?? undefined,
-                  );
-                  setAiResult(next);
-                } catch (err) {
-                  setAiResult(null);
-                  if (err instanceof ProductLookupError) {
-                    setAiError(err.message);
-                  } else {
-                    setAiError("AI recommendations could not be generated right now.");
-                  }
-                } finally {
-                  setAiLoading(false);
+      {analysisV2 ? <ListingIntelligenceV2 analysis={analysisV2.analysis} /> : null}
+
+      {analysisV2 ? (
+        <div>
+          <Button
+            type="button"
+            disabled={aiLoading}
+            onClick={async () => {
+              setAiLoading(true);
+              setAiError(null);
+              try {
+                const next = await generateAIListingIntelligenceV2(
+                  analysisV2.product,
+                  analysisV2.analysis,
+                  analysisV2.meta.source ?? undefined,
+                );
+                setAiResult(next);
+              } catch (err) {
+                setAiResult(null);
+                if (err instanceof ProductLookupError) {
+                  setAiError(err.message);
+                } else {
+                  setAiError("AI strategy could not be generated right now.");
                 }
-              }}
-            >
-              {aiLoading ? (
-                <>
-                  <Loader2 className="animate-spin" />
-                  Generating AI recommendations…
-                </>
-              ) : (
-                "Generate AI recommendations"
-              )}
-            </Button>
-          </div>
-        </>
+              } finally {
+                setAiLoading(false);
+              }
+            }}
+          >
+            {aiLoading ? (
+              <>
+                <Loader2 className="animate-spin" />
+                Generating AI strategy…
+              </>
+            ) : (
+              "Generate AI strategy"
+            )}
+          </Button>
+        </div>
       ) : null}
 
       {aiError ? (
         <Alert variant="destructive">
-          <AlertTitle>AI recommendations unavailable</AlertTitle>
+          <AlertTitle>AI strategy unavailable</AlertTitle>
           <AlertDescription>{aiError}</AlertDescription>
         </Alert>
       ) : null}
 
-      {aiResult ? <AIListingIntelligenceView intelligence={aiResult.ai_intelligence} /> : null}
+      {aiResult ? <AIListingIntelligenceV2View intelligence={aiResult.ai_intelligence} /> : null}
+
+      {analysis ? (
+        <details className="rounded-lg border border-border bg-card">
+          <summary className="cursor-pointer px-5 py-3 text-sm font-medium">
+            Legacy listing-score-v1 and V1 AI
+          </summary>
+          <div className="space-y-4 border-t border-border px-1 pb-4">
+            <ListingIntelligence analysis={analysis.analysis} />
+            <div className="px-4">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={legacyAiLoading}
+                onClick={async () => {
+                  setLegacyAiLoading(true);
+                  setLegacyAiError(null);
+                  try {
+                    const next = await generateAIListingIntelligence(
+                      analysis.product,
+                      analysis.analysis,
+                      analysis.meta.source ?? undefined,
+                    );
+                    setLegacyAiResult(next);
+                  } catch (err) {
+                    setLegacyAiResult(null);
+                    if (err instanceof ProductLookupError) {
+                      setLegacyAiError(err.message);
+                    } else {
+                      setLegacyAiError("Legacy AI recommendations could not be generated right now.");
+                    }
+                  } finally {
+                    setLegacyAiLoading(false);
+                  }
+                }}
+              >
+                {legacyAiLoading ? (
+                  <>
+                    <Loader2 className="animate-spin" />
+                    Generating legacy AI…
+                  </>
+                ) : (
+                  "Generate legacy AI recommendations (v1)"
+                )}
+              </Button>
+            </div>
+            {legacyAiError ? (
+              <Alert variant="destructive" className="mx-4">
+                <AlertTitle>Legacy AI unavailable</AlertTitle>
+                <AlertDescription>{legacyAiError}</AlertDescription>
+              </Alert>
+            ) : null}
+            {legacyAiResult ? (
+              <AIListingIntelligenceView intelligence={legacyAiResult.ai_intelligence} />
+            ) : null}
+          </div>
+        </details>
+      ) : null}
 
       {discoveryError ? (
         <Alert variant="destructive">

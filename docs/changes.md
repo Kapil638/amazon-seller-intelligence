@@ -1,22 +1,65 @@
 # Amazon Seller Intelligence — Change Summary
 
-**Date:** 19 August 2026  
-**Scope:** Milestone 0 through Milestone 9, API Budget dashboard, and Bulk ASIN Due Diligence  
-**Status:** Complete through bulk due diligence (mock-only). Architecture documentation has not been started.
+**Date:** 20 August 2026  
+**Scope:** Milestone 8C AI Content & SEO Intelligence V2  
+**Status:** Milestone 8C complete. Image vision (8D), Reviews API, and Offers API were not started.
 
 This document records what was built and updated. It is a change log, not a product spec.
 
 ---
 
+## Milestone 8C — AI Content & SEO Intelligence V2 (20 August 2026)
+
+Added a parallel V2 AI flow on top of `Product` + `ListingAnalysisV2`. V1 AI (`POST /api/v1/analysis/listing/ai`, `listing-intelligence-v1`) is unchanged.
+
+- Endpoint: `POST /api/v1/analysis/listing/v2/ai`
+- Prompt: `listing-intelligence-v2`
+- One structured OpenAI call + existing repair retry; same `OpenAIProvider` and `OPENAI_MODEL`
+- Cache keyed on V2 context + analysis + model + prompt version + provider (`AI_CACHE_TTL_SECONDS`, default 2700s)
+- Usage ledger workflow: `listing_intelligence_v2`
+- Primary UI action is **Generate AI strategy**; V1 AI is legacy-only
+- No Rainforest request changes, no image vision, no Reviews/Offers APIs
+
+See [ai-listing-intelligence-v2.md](ai-listing-intelligence-v2.md).
+
+---
+
+## Milestone 8B — Listing Intelligence V2 deterministic engine (20 August 2026)
+
+Added `listing-score-v2` beside unchanged `listing-score-v1`.
+
+- Endpoint: `POST /api/v1/analysis/listing/v2` (V1 `POST /api/v1/analysis/listing` unchanged).
+- Listing quality weights: Title 20%, Bullet SEO readiness 25%, Description & A+ 20%, Media coverage 20%, Content structure 15%.
+- Market signals and data coverage are separate objects and are **not** mixed into listing quality.
+- When 8B shipped, AI listing recommendations still used V1 analysis.
+- No Rainforest parameter changes and no OpenAI prompt changes.
+
+See [listing-intelligence-v2.md](listing-intelligence-v2.md).
+
+---
+
+## Milestone 8A — Listing Intelligence V2 data foundation (20 August 2026)
+
+The Rainforest `type=product` request is unchanged (`api_key`, `type`, `amazon_domain`, `asin`). Cold Analyze ASIN is still one product credit.
+
+The normalized `Product` model now keeps additional optional fields from that same payload: all BSR rows, category path + IDs, Amazon-sold flag, availability type, variation `is_current_product`, richer video metadata, `videos_count`, optional image dimensions, optional A+, specifications, attributes, rating breakdown, featured/top reviews, and recent-sales **text**.
+
+V1 listing scores, AI prompts/context, and the frontend UI were not redesigned. New Product fields are unused by React. See [listing-intelligence-v2-data-foundation.md](listing-intelligence-v2-data-foundation.md).
+
+`ProviderCapabilities.reviews` now means a review corpus and is `false` for the product provider.
+
+---
+
 ## Current capability
+
 
 A user can:
 
 1. Fetch a **real Amazon.in ASIN** through Rainforest (Analyze ASIN).
 2. Look up a **mock** Amazon product by ASIN (Quick Demo).
 3. Enter listing details by hand (Manual Product fallback).
-4. Run **Listing Intelligence** on that product (deterministic scores and actions).
-5. Generate **AI Recommendations** (OpenAI, explicit click). Deterministic scores stay unchanged.
+4. Run **Listing Intelligence V2** on that product (deterministic listing quality, market signals, data coverage).
+5. Generate **AI Strategy V2** (OpenAI, explicit click). V2 scores stay unchanged. V1 AI remains a legacy path.
 6. Compare **1–3 seller-entered competitor ASINs**, then optionally generate AI competitive insights.
 7. **Discover candidate competitors** with Rainforest Amazon search, then let the seller select up to three for the existing comparison.
 8. Upload a **Search Term Report** or **Business Report** and view deterministic PPC / business analytics.

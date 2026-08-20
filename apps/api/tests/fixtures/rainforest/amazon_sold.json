@@ -1,0 +1,34 @@
+{
+  "_fixture_notes": {
+    "evidence": "OBSERVED IN OUR EXISTING FIXTURES / CODE PATH",
+    "purpose": "Amazon-sold buy box with no third_party_seller. is_sold_by_amazon is observed on product.json; this fixture isolates the Amazon-sold case."
+  },
+  "request_info": {
+    "success": true,
+    "credits_used": 1,
+    "credits_remaining": 100
+  },
+  "request_parameters": {
+    "amazon_domain": "amazon.in",
+    "asin": "B0AMZSOLD1",
+    "type": "product"
+  },
+  "product": {
+    "title": "Amazon-sold demo listing",
+    "asin": "B0AMZSOLD1",
+    "buybox_winner": {
+      "availability": {
+        "type": "in_stock",
+        "raw": "In Stock"
+      },
+      "fulfillment": {
+        "is_sold_by_amazon": true,
+        "is_fulfilled_by_amazon": true
+      },
+      "price": {
+        "value": 499.0,
+        "currency": "INR"
+      }
+    }
+  }
+}

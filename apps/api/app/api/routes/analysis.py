@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.ai.factory import get_ai_provider
 from app.analytics.listing_rules import SCORE_VERSION
+from app.analytics.listing_rules_v2 import SCORE_VERSION as SCORE_VERSION_V2
 from app.core.exceptions import (
     AIAuthenticationError,
     AIConfigurationError,
@@ -23,6 +24,11 @@ from app.models.ai_listing_intelligence import (
     AIListingIntelligenceRequest,
     AIListingIntelligenceResponse,
 )
+from app.models.ai_listing_intelligence_v2 import (
+    AIListingIntelligenceV2Meta,
+    AIListingIntelligenceV2Request,
+    AIListingIntelligenceV2Response,
+)
 from app.models.competitor_comparison import (
     CompetitorComparisonRequest,
     CompetitorComparisonResponse,
@@ -32,13 +38,17 @@ from app.models.listing_analysis import (
     ListingAnalysisRequest,
     ListingAnalysisResponse,
 )
+from app.models.listing_analysis_v2 import ListingAnalysisV2Meta, ListingAnalysisV2Response
 from app.prompts.competitive_intelligence import PROMPT_VERSION as COMPETITIVE_PROMPT_VERSION
 from app.prompts.listing_intelligence import PROMPT_VERSION
+from app.prompts.listing_intelligence_v2 import PROMPT_VERSION as PROMPT_VERSION_V2
 from app.providers.factory import get_product_provider
 from app.services.ai_competitive_intelligence_service import AICompetitiveIntelligenceService
 from app.services.ai_listing_intelligence_service import AIListingIntelligenceService
+from app.services.ai_listing_intelligence_v2_service import AIListingIntelligenceV2Service
 from app.services.competitor_comparison_service import CompetitorComparisonService
 from app.services.listing_analysis_service import ListingAnalysisService
+from app.services.listing_analysis_v2_service import ListingAnalysisV2Service
 from app.services.product_service import ProductService
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
@@ -48,8 +58,16 @@ def get_listing_analysis_service() -> ListingAnalysisService:
     return ListingAnalysisService()
 
 
+def get_listing_analysis_v2_service() -> ListingAnalysisV2Service:
+    return ListingAnalysisV2Service()
+
+
 def get_ai_listing_intelligence_service() -> AIListingIntelligenceService:
     return AIListingIntelligenceService(provider=get_ai_provider())
+
+
+def get_ai_listing_intelligence_v2_service() -> AIListingIntelligenceV2Service:
+    return AIListingIntelligenceV2Service(provider=get_ai_provider())
 
 
 def get_competitor_comparison_service() -> CompetitorComparisonService:
@@ -94,6 +112,23 @@ def analyze_listing(
     )
 
 
+@router.post("/listing/v2", response_model=ListingAnalysisV2Response)
+def analyze_listing_v2(
+    payload: ListingAnalysisRequest,
+    service: ListingAnalysisV2Service = Depends(get_listing_analysis_v2_service),
+) -> ListingAnalysisV2Response:
+    analysis = service.analyze(payload.product)
+    return ListingAnalysisV2Response(
+        product=payload.product,
+        analysis=analysis,
+        meta=ListingAnalysisV2Meta(
+            engine="deterministic",
+            score_version=SCORE_VERSION_V2,
+            source=payload.source,
+        ),
+    )
+
+
 @router.post("/listing/ai", response_model=AIListingIntelligenceResponse)
 async def analyze_listing_ai(
     payload: AIListingIntelligenceRequest,
@@ -119,6 +154,38 @@ async def analyze_listing_ai(
             provider=result.provider,
             model=result.model,
             prompt_version=result.prompt_version or PROMPT_VERSION,
+            source=payload.source,
+            usage=result.usage,
+            latency_ms=result.latency_ms,
+        ),
+    )
+
+
+@router.post("/listing/v2/ai", response_model=AIListingIntelligenceV2Response)
+async def analyze_listing_v2_ai(
+    payload: AIListingIntelligenceV2Request,
+    service: AIListingIntelligenceV2Service = Depends(get_ai_listing_intelligence_v2_service),
+) -> AIListingIntelligenceV2Response:
+    try:
+        result = await service.generate(payload.product, payload.analysis)
+    except (
+        AIConfigurationError,
+        AIAuthenticationError,
+        AIRateLimitedError,
+        AIRequestFailedError,
+        AIStructuredOutputError,
+        AISafetyRefusalError,
+    ) as exc:
+        raise _ai_http_error(exc) from exc
+    return AIListingIntelligenceV2Response(
+        product=payload.product,
+        analysis=payload.analysis,
+        ai_intelligence=result.payload,
+        meta=AIListingIntelligenceV2Meta(
+            engine="ai",
+            provider=result.provider,
+            model=result.model,
+            prompt_version=result.prompt_version or PROMPT_VERSION_V2,
             source=payload.source,
             usage=result.usage,
             latency_ms=result.latency_ms,

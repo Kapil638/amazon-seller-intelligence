@@ -10,7 +10,7 @@ settings = get_settings()
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.10.0",
+    version="0.12.0",
     description="Amazon Seller Intelligence API — listing, competitive, reports, usage, and bulk due diligence",
 )
 

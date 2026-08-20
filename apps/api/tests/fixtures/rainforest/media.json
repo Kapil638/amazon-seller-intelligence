@@ -28,7 +28,10 @@
       {
         "title": "Product overview",
         "duration_seconds": 16,
+        "width": 1920,
+        "height": 1080,
         "thumbnail": "https://m.media-amazon.com/images/I/71VIDPOSTER.jpg",
+        "group_id": "IB_G1",
         "group_type": "videos_for_this_product",
         "link": "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/demo/videopreview.mp4"
       }

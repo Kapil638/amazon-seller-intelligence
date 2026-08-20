@@ -8,6 +8,8 @@ export type ProductImage = {
   alt: string | null;
   variant?: string | null;
   is_main?: boolean;
+  width?: number | null;
+  height?: number | null;
 };
 
 export type ProductVideo = {
@@ -15,11 +17,20 @@ export type ProductVideo = {
   thumbnail_url: string | null;
   video_url: string | null;
   duration_seconds: number | null;
+  group_type?: string | null;
+  group_id?: string | null;
+  width?: number | null;
+  height?: number | null;
 };
 
 export type BSR = {
   rank: number;
   category: string;
+};
+
+export type CategoryNode = {
+  name: string;
+  category_id: string | null;
 };
 
 export type Seller = {
@@ -33,6 +44,66 @@ export type Variation = {
   asin: string;
   label: string;
   attributes: Record<string, string>;
+  is_current_product?: boolean | null;
+};
+
+export type ProductSpecification = {
+  name: string;
+  value: string;
+};
+
+export type ProductAttributes = {
+  manufacturer: string | null;
+  ingredients: string[];
+  diet_type: string[];
+  listed: ProductSpecification[];
+};
+
+export type APlusImage = {
+  url: string;
+  alt: string | null;
+};
+
+export type BrandStory = {
+  hero_image: string | null;
+  brand_logo: string | null;
+  description: string | null;
+  images: string[];
+};
+
+export type APlusContent = {
+  has_a_plus_content: boolean | null;
+  has_brand_story: boolean | null;
+  third_party: boolean | null;
+  company_logo: string | null;
+  company_description: string | null;
+  body_text: string | null;
+  images: APlusImage[];
+  brand_story: BrandStory | null;
+};
+
+export type RatingBand = {
+  percentage: number | null;
+  count: number | null;
+};
+
+export type RatingBreakdown = {
+  five_star: RatingBand | null;
+  four_star: RatingBand | null;
+  three_star: RatingBand | null;
+  two_star: RatingBand | null;
+  one_star: RatingBand | null;
+};
+
+export type FeaturedReview = {
+  id: string | null;
+  title: string | null;
+  body: string | null;
+  rating: number | null;
+  profile_name: string | null;
+  verified_purchase: boolean | null;
+  date_raw: string | null;
+  date_utc: string | null;
 };
 
 export type Product = {
@@ -53,6 +124,18 @@ export type Product = {
   seller: Seller | null;
   variations: Variation[];
   last_fetched_at: string;
+  bsr_ranks?: BSR[];
+  category_path?: CategoryNode[];
+  is_sold_by_amazon?: boolean | null;
+  availability_type?: string | null;
+  videos_count?: number | null;
+  a_plus?: APlusContent | null;
+  specifications?: ProductSpecification[];
+  specifications_flat?: string | null;
+  attributes?: ProductAttributes | null;
+  rating_breakdown?: RatingBreakdown | null;
+  featured_reviews?: FeaturedReview[];
+  recent_sales_text?: string | null;
 };
 
 export type ProductSource = "mock" | "manual" | "amazon_public" | "rainforest";
@@ -144,6 +227,80 @@ export type ListingAnalysisResponse = {
   meta: AnalysisMeta;
 };
 
+export type EvidenceState = "observed" | "reported_absent" | "unknown";
+
+export type CoverageField = {
+  name: string;
+  evidence_state: EvidenceState;
+  available: boolean;
+  note: string | null;
+};
+
+export type CoverageGroup = {
+  name: string;
+  available: number;
+  expected: number;
+  percentage: number;
+  status: SectionStatus;
+  fields: CoverageField[];
+  notes: string[];
+};
+
+export type DataCoverage = {
+  overall_percentage: number;
+  core_listing_content: CoverageGroup;
+  media: CoverageGroup;
+  enhanced_content: CoverageGroup;
+  category_context: CoverageGroup;
+  market_signals: CoverageGroup;
+};
+
+export type MarketSignals = {
+  rating: number | null;
+  review_count: number | null;
+  price: Price | null;
+  availability: string | null;
+  availability_type: string | null;
+  is_sold_by_amazon: boolean | null;
+  seller: Seller | null;
+  bsr_ranks: BSR[];
+  recent_sales_text: string | null;
+  rating_breakdown: RatingBreakdown | null;
+};
+
+export type ListingQualitySections = {
+  title: AnalysisSection;
+  bullets: AnalysisSection;
+  description_a_plus: AnalysisSection;
+  media_coverage: AnalysisSection;
+  content_structure: AnalysisSection;
+};
+
+export type V2Recommendation = {
+  code: string;
+  category: string;
+  priority: ActionPriority;
+  action: string;
+  finding_code: string;
+};
+
+export type ListingAnalysisV2 = {
+  listing_quality_score: number;
+  score_version: string;
+  status: SectionStatus;
+  sections: ListingQualitySections;
+  market_signals: MarketSignals;
+  data_coverage: DataCoverage;
+  findings: Finding[];
+  recommendations: V2Recommendation[];
+};
+
+export type ListingAnalysisV2Response = {
+  product: Product;
+  analysis: ListingAnalysisV2;
+  meta: AnalysisMeta;
+};
+
 export type ActionPriority = "high" | "medium" | "low";
 
 export type PriorityAction = {
@@ -204,6 +361,81 @@ export type AIListingIntelligenceResponse = {
   product: Product;
   analysis: ListingAnalysis;
   ai_intelligence: AIListingIntelligence;
+  meta: AIListingIntelligenceMeta;
+};
+
+export type PriorityActionV2 = {
+  priority: ActionPriority;
+  area: string;
+  issue: string;
+  why_it_matters: string;
+  recommended_action: string;
+  evidence_codes: string[];
+};
+
+export type TitleContentInsight = {
+  assessment: string;
+  strengths: string[];
+  gaps: string[];
+};
+
+export type BulletContentInsight = TitleContentInsight & {
+  seo_readiness_notes: string[];
+};
+
+export type DescriptionContentInsight = TitleContentInsight;
+
+export type APlusContentInsight = TitleContentInsight & {
+  evidence_state: EvidenceState;
+};
+
+export type StructureContentInsight = {
+  assessment: string;
+  redundancy_notes: string[];
+  coverage_gaps: string[];
+};
+
+export type ContentAnalysisV2 = {
+  title: TitleContentInsight;
+  bullets: BulletContentInsight;
+  description: DescriptionContentInsight;
+  a_plus: APlusContentInsight;
+  structure: StructureContentInsight;
+};
+
+export type SpecificationCoverage = {
+  represented: string[];
+  missing_from_customer_copy: string[];
+  not_recommended_for_copy: string[];
+};
+
+export type RewriteSuggestions = {
+  suggested_title: string;
+  suggested_bullets: string[];
+  optional_description_excerpt: string | null;
+};
+
+export type SellerActionStepV2 = {
+  step: number;
+  action: string;
+  priority: ActionPriority;
+  rationale: string;
+};
+
+export type AIListingIntelligenceV2 = {
+  executive_assessment: string;
+  priority_actions: PriorityActionV2[];
+  content_analysis: ContentAnalysisV2;
+  specification_coverage: SpecificationCoverage;
+  rewrite_suggestions: RewriteSuggestions;
+  seller_action_plan: SellerActionStepV2[];
+  confidence_notes: string[];
+};
+
+export type AIListingIntelligenceV2Response = {
+  product: Product;
+  analysis: ListingAnalysisV2;
+  ai_intelligence: AIListingIntelligenceV2;
   meta: AIListingIntelligenceMeta;
 };
 

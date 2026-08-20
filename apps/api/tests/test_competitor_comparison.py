@@ -153,6 +153,21 @@ def test_same_listing_analysis_service_and_unchanged_target_score() -> None:
     assert _metric(comparison, "listing_score").target_value == expected.overall_score
 
 
+def test_comparison_accepts_v2_foundation_fields_without_changing_v1_score() -> None:
+    from app.models.product import APlusContent, BSR
+
+    target = make_product(
+        asin="B0TARGET01",
+        bsr_ranks=[BSR(rank=10, category="Leaf")],
+        a_plus=APlusContent(has_a_plus_content=True),
+        recent_sales_text="50+ bought in past month",
+    )
+    competitor = make_product(asin="B0COMP0001", videos_count=2)
+    expected = ListingAnalysisService().analyze(target)
+    comparison = compare_listings(_row(target), [_row(competitor)])
+    assert comparison.summary.target_listing_score == expected.overall_score
+
+
 @pytest.mark.asyncio
 async def test_service_one_and_three_competitors() -> None:
     target = make_product(asin="B0TARGET01")

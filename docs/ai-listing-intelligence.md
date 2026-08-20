@@ -4,6 +4,10 @@ This analysis is **AI interpretation on top of deterministic Listing Intelligenc
 
 Prompt version: **`listing-intelligence-v1`**.
 
+This document is the V1 AI contract. V1 behavior is unchanged. Primary listing AI is now V2: [ai-listing-intelligence-v2.md](ai-listing-intelligence-v2.md) (`POST /api/v1/analysis/listing/v2/ai`, prompt `listing-intelligence-v2`).
+
+V1 behavior is unchanged. Primary listing AI is now V2: [ai-listing-intelligence-v2.md](ai-listing-intelligence-v2.md) (`POST /api/v1/analysis/listing/v2/ai`, prompt `listing-intelligence-v2`).
+
 ## Architecture
 
 ```text

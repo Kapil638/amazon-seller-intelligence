@@ -1,12 +1,15 @@
 import type {
   AICompetitiveIntelligenceResponse,
   AIListingIntelligenceResponse,
+  AIListingIntelligenceV2Response,
   ApiErrorBody,
   CompetitorComparisonResponse,
   CompetitorDiscoveryResult,
   CompetitorSearchQueryResponse,
   ListingAnalysis,
   ListingAnalysisResponse,
+  ListingAnalysisV2,
+  ListingAnalysisV2Response,
   ManualProductInput,
   Product,
   ProductResponse,
@@ -179,6 +182,41 @@ export async function analyzeListing(
   );
 }
 
+export async function analyzeListingV2(
+  product: Product,
+  source?: ProductSource,
+): Promise<ListingAnalysisV2Response> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product, source: source ?? null }),
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+
+  if (response.ok) {
+    return (await response.json()) as ListingAnalysisV2Response;
+  }
+
+  const detail = await readError(response);
+  if (response.status === 400) {
+    throw new ProductLookupError(
+      detail || "This product could not be analyzed.",
+      "invalid",
+    );
+  }
+  throw new ProductLookupError(
+    detail || "Something went wrong while analyzing this listing.",
+    "unknown",
+  );
+}
+
 export async function generateAIListingIntelligence(
   product: Product,
   analysis: ListingAnalysis,
@@ -223,6 +261,54 @@ export async function generateAIListingIntelligence(
   }
   throw new ProductLookupError(
     detail || "Something went wrong while generating AI recommendations.",
+    "unknown",
+  );
+}
+
+export async function generateAIListingIntelligenceV2(
+  product: Product,
+  analysis: ListingAnalysisV2,
+  source?: ProductSource,
+): Promise<AIListingIntelligenceV2Response> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/ai`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product, analysis, source: source ?? null }),
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+
+  if (response.ok) {
+    return (await response.json()) as AIListingIntelligenceV2Response;
+  }
+
+  const detail = await readError(response);
+  if (response.status === 400 || response.status === 422) {
+    throw new ProductLookupError(
+      detail || "This listing could not be analyzed by AI.",
+      "invalid",
+    );
+  }
+  if (response.status === 503) {
+    throw new ProductLookupError(
+      detail || "AI analysis is not configured.",
+      "unavailable",
+    );
+  }
+  if (response.status === 502) {
+    throw new ProductLookupError(
+      detail || "AI analysis could not be completed. Try again later.",
+      "unavailable",
+    );
+  }
+  throw new ProductLookupError(
+    detail || "Something went wrong while generating AI strategy.",
     "unknown",
   );
 }

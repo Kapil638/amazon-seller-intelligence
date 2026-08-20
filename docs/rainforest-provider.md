@@ -81,6 +81,31 @@ Mapped from documented Rainforest product fields when present:
 
 Missing values stay `null` or `[]`. Nothing is invented.
 
+Legacy fields above are unchanged. Milestone 8A also maps additional optional fields from the **same** `type=product` payload. See [listing-intelligence-v2-data-foundation.md](listing-intelligence-v2-data-foundation.md).
+
+| Product field | Rainforest source |
+|---------------|-------------------|
+| bsr_ranks | every valid `product.bestsellers_rank[]` row |
+| category_path | `product.categories[]` `{name, category_id}` in order |
+| is_sold_by_amazon | `product.buybox_winner.fulfillment.is_sold_by_amazon` |
+| availability_type | `product.buybox_winner.availability.type` |
+| variations[].is_current_product | `product.variants[].is_current_product` |
+| videos[].group_type / group_id / width / height | `product.videos[]` when present |
+| videos_count | `product.videos_count` only when provided (not inferred from `videos[]`) |
+| images[].width / height | explicit `width`/`height` on the chosen URL object only |
+| a_plus | `product.a_plus_content` when present |
+| specifications / specifications_flat | `product.specifications[]` / `product.specifications_flat` |
+| attributes | `manufacturer`, `ingredients`, `diet_type`, `product.attributes[]` |
+| rating_breakdown | `product.rating_breakdown` |
+| featured_reviews | `product.top_reviews` (product-page featured reviews, not `type=reviews`) |
+| recent_sales_text | `product.recent_sales` as descriptive text |
+
+The HTTP request is still only `type`, `amazon_domain`, `asin`, and `api_key`. Optional Rainforest flags such as `include_a_plus_body` and `include_image_block_videos` are **not** sent.
+
+`ProviderCapabilities.reviews` is **false**. That flag means a review corpus. Rating and review *count* are covered by `ratings=True`. Featured `top_reviews` on a product payload do not change this.
+
+The in-memory cache still stores the mapped `Product`, not raw Rainforest JSON. Extra fields that were not mapped at fetch time cannot be recovered without another request.
+
 ## Media mapping
 
 Rainforest documents:
@@ -115,7 +140,7 @@ The gallery uses a main viewer plus thumbnails (`object-contain`, muted backgrou
 ### Limitations
 
 - If Rainforest only returns a 38px thumb and the unsized sibling is missing, the UI shows that thumb at a contained size instead of stretching it.
-- A+ / brand-story images are not mapped into `Product.images`.
+- A+ / brand-story images are not mapped into `Product.images`. They may appear on `Product.a_plus` when Rainforest includes `a_plus_content`.
 - Related-product videos (`videos_additional`) are not mapped.
 
 ## Errors

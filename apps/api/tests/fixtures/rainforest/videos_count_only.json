@@ -1,0 +1,20 @@
+{
+  "_fixture_notes": {
+    "evidence": "SUPPORTED BY RAINFOREST DOCUMENTATION / noted in docs/rainforest-provider.md from a prior live amazon.in payload",
+    "purpose": "videos_count present without videos[]. Distinguishes reported video presence from detailed video objects. Do not send include_image_block_videos."
+  },
+  "request_info": {
+    "success": true,
+    "credits_used": 1
+  },
+  "request_parameters": {
+    "amazon_domain": "amazon.in",
+    "asin": "B0VIDCOUNT1",
+    "type": "product"
+  },
+  "product": {
+    "title": "Video count without video objects",
+    "asin": "B0VIDCOUNT1",
+    "videos_count": 3
+  }
+}
