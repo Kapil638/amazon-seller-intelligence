@@ -4,7 +4,7 @@ from app.core.config import get_settings
 from app.core.exceptions import ReportAmbiguousTypeError, ReportUnknownTypeError
 from app.reports.detection import ReportDetectionService
 from app.reports.file_loader import load_tabular_file
-from tests.report_helpers import fixture_bytes, make_xlsx
+from tests.report_helpers import fixture_bytes, make_xlsx, make_xlsx_with_stale_dimension
 
 import pytest
 
@@ -146,6 +146,27 @@ def test_unknown_report_is_400(client: TestClient) -> None:
     )
     assert response.status_code == 400
     assert "header" in response.json()["detail"].casefold() or "supported" in response.json()["detail"].casefold()
+
+
+def test_xlsx_with_stale_dimension_is_still_read() -> None:
+    payload = make_xlsx_with_stale_dimension(
+        [
+            "Start Date",
+            "Campaign Name",
+            "Match Type",
+            "Customer Search Term",
+            "Impressions",
+            "Clicks",
+            "Spend",
+            "7 Day Total Sales",
+            "7 Day Total Orders (#)",
+        ],
+        [["2025-11-02", "Demo Campaign", "EXACT", "pulse oximeter", 12, 1, 2.31, 0, 0]],
+    )
+    table = load_tabular_file("Sponsored_Products_Search_term_report.xlsx", payload)
+    assert "Customer Search Term" in table.headers
+    assert table.rows
+    assert table.rows[0][3] == "pulse oximeter"
 
 
 def test_password_protected_xlsx(monkeypatch: pytest.MonkeyPatch) -> None:

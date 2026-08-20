@@ -1,0 +1,583 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
+
+from sqlalchemy import Select, func, select
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.config import get_settings
+from app.persistence.hashing import product_content_hash, sha256_bytes
+from app.persistence.models import (
+    AIListingResult,
+    AnalysisRun,
+    BulkJob,
+    BulkJobItem,
+    GeneratedReport,
+    ImageIntelligenceResult,
+    ListingAnalysisResult,
+    ProductSnapshot,
+    ReportUpload,
+    ScoringProfile,
+    UsageEvent,
+)
+
+
+def ensure_organization_id(session: Session) -> UUID:
+    return get_settings().default_organization_id
+
+
+class ProductSnapshotRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        asin: str,
+        marketplace: str,
+        source: str | None,
+        product_payload: dict[str, Any],
+        fetched_at: datetime | None = None,
+    ) -> ProductSnapshot:
+        snapshot = ProductSnapshot(
+            organization_id=organization_id,
+            asin=asin,
+            marketplace=marketplace,
+            source=source,
+            normalized_product=product_payload,
+            content_hash=product_content_hash(product_payload),
+            fetched_at=fetched_at or datetime.now(UTC),
+        )
+        self.session.add(snapshot)
+        self.session.flush()
+        return snapshot
+
+    def list_for_asin(self, organization_id: UUID, asin: str) -> list[ProductSnapshot]:
+        statement: Select[tuple[ProductSnapshot]] = (
+            select(ProductSnapshot)
+            .where(
+                ProductSnapshot.organization_id == organization_id,
+                ProductSnapshot.asin == asin,
+            )
+            .order_by(ProductSnapshot.fetched_at.asc(), ProductSnapshot.created_at.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+
+class AnalysisRunRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        snapshot: ProductSnapshot,
+        status: str,
+        listing_score_version: str | None,
+        product_source: str | None,
+        display_name: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AnalysisRun:
+        now = datetime.now(UTC)
+        run = AnalysisRun(
+            organization_id=organization_id,
+            product_snapshot_id=snapshot.id,
+            asin=snapshot.asin,
+            marketplace=snapshot.marketplace,
+            status=status,
+            listing_score_version=listing_score_version,
+            product_source=product_source,
+            display_name=display_name,
+            extra_metadata=metadata,
+            started_at=now,
+            completed_at=now if status in {"complete", "partial"} else None,
+        )
+        self.session.add(run)
+        self.session.flush()
+        return run
+
+    def get(self, organization_id: UUID, run_id: UUID, *, include_deleted: bool = False) -> AnalysisRun | None:
+        filters = [AnalysisRun.organization_id == organization_id, AnalysisRun.id == run_id]
+        if not include_deleted:
+            filters.append(AnalysisRun.deleted_at.is_(None))
+        statement = (
+            select(AnalysisRun)
+            .options(
+                selectinload(AnalysisRun.snapshot),
+                selectinload(AnalysisRun.listing_result),
+                selectinload(AnalysisRun.ai_result),
+                selectinload(AnalysisRun.image_result),
+            )
+            .where(*filters)
+        )
+        return self.session.scalars(statement).first()
+
+    def latest_for_asin(self, organization_id: UUID, asin: str) -> AnalysisRun | None:
+        statement = (
+            select(AnalysisRun)
+            .options(
+                selectinload(AnalysisRun.snapshot),
+                selectinload(AnalysisRun.listing_result),
+                selectinload(AnalysisRun.ai_result),
+                selectinload(AnalysisRun.image_result),
+            )
+            .where(AnalysisRun.organization_id == organization_id, AnalysisRun.asin == asin)
+            .where(AnalysisRun.deleted_at.is_(None))
+            .order_by(AnalysisRun.created_at.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
+
+    def list_page(
+        self,
+        organization_id: UUID,
+        *,
+        asin: str | None = None,
+        marketplace: str | None = None,
+        status: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[AnalysisRun], int]:
+        filters = [AnalysisRun.organization_id == organization_id, AnalysisRun.deleted_at.is_(None)]
+        if asin:
+            filters.append(AnalysisRun.asin == asin.upper())
+        if marketplace:
+            filters.append(AnalysisRun.marketplace == marketplace)
+        if status:
+            filters.append(AnalysisRun.status == status)
+        if created_from is not None:
+            filters.append(AnalysisRun.created_at >= created_from)
+        if created_to is not None:
+            filters.append(AnalysisRun.created_at <= created_to)
+        count = self.session.scalar(select(func.count()).select_from(AnalysisRun).where(*filters)) or 0
+        statement = (
+            select(AnalysisRun)
+            .options(
+                selectinload(AnalysisRun.snapshot),
+                selectinload(AnalysisRun.listing_result),
+                selectinload(AnalysisRun.ai_result),
+                selectinload(AnalysisRun.image_result),
+            )
+            .where(*filters)
+            .order_by(AnalysisRun.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement).all()), int(count)
+
+    def soft_delete(self, run: AnalysisRun) -> AnalysisRun:
+        run.deleted_at = datetime.now(UTC)
+        self.session.flush()
+        return run
+
+    def save_listing_result(
+        self,
+        run: AnalysisRun,
+        *,
+        score_version: str,
+        listing_quality_score: int,
+        payload: dict[str, Any],
+        custom_listing_quality_score: int | None = None,
+        scoring_profile_snapshot: dict[str, Any] | None = None,
+    ) -> ListingAnalysisResult:
+        existing = run.listing_result or self.session.scalars(
+            select(ListingAnalysisResult).where(ListingAnalysisResult.analysis_run_id == run.id)
+        ).first()
+        if existing is not None:
+            existing.score_version = score_version
+            existing.listing_quality_score = listing_quality_score
+            existing.payload = payload
+            if custom_listing_quality_score is not None or scoring_profile_snapshot is not None:
+                existing.custom_listing_quality_score = custom_listing_quality_score
+                existing.scoring_profile_snapshot = scoring_profile_snapshot
+            run.listing_result = existing
+            run.listing_score_version = score_version
+            self.session.flush()
+            return existing
+        row = ListingAnalysisResult(
+            analysis_run_id=run.id,
+            score_version=score_version,
+            listing_quality_score=listing_quality_score,
+            custom_listing_quality_score=custom_listing_quality_score,
+            scoring_profile_snapshot=scoring_profile_snapshot,
+            payload=payload,
+        )
+        self.session.add(row)
+        run.listing_result = row
+        run.listing_score_version = score_version
+        self.session.flush()
+        return row
+
+    def save_custom_score(
+        self,
+        run: AnalysisRun,
+        *,
+        custom_listing_quality_score: int | None,
+        scoring_profile_snapshot: dict[str, Any] | None,
+    ) -> ListingAnalysisResult | None:
+        existing = run.listing_result
+        if existing is None:
+            return None
+        existing.custom_listing_quality_score = custom_listing_quality_score
+        existing.scoring_profile_snapshot = scoring_profile_snapshot
+        self.session.flush()
+        return existing
+
+    def save_ai_result(
+        self,
+        run: AnalysisRun,
+        *,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        payload: dict[str, Any],
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_tokens: int | None,
+        estimated_cost_usd: float | None,
+        latency_ms: int | None,
+    ) -> AIListingResult:
+        existing = run.ai_result or self.session.scalars(
+            select(AIListingResult).where(AIListingResult.analysis_run_id == run.id)
+        ).first()
+        if existing is not None:
+            existing.provider = provider
+            existing.model = model
+            existing.prompt_version = prompt_version
+            existing.payload = payload
+            existing.input_tokens = input_tokens
+            existing.output_tokens = output_tokens
+            existing.total_tokens = total_tokens
+            existing.estimated_cost_usd = estimated_cost_usd
+            existing.latency_ms = latency_ms
+            run.ai_result = existing
+            run.ai_prompt_version = prompt_version
+            self.session.flush()
+            return existing
+        row = AIListingResult(
+            analysis_run_id=run.id,
+            provider=provider,
+            model=model,
+            prompt_version=prompt_version,
+            payload=payload,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            latency_ms=latency_ms,
+        )
+        self.session.add(row)
+        run.ai_result = row
+        run.ai_prompt_version = prompt_version
+        self.session.flush()
+        return row
+
+    def save_image_result(
+        self,
+        run: AnalysisRun,
+        *,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        payload: dict[str, Any],
+        images_available: int,
+        images_selected: int,
+        images_skipped: int,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_tokens: int | None,
+        estimated_cost_usd: float | None,
+        latency_ms: int | None,
+    ) -> ImageIntelligenceResult:
+        existing = run.image_result or self.session.scalars(
+            select(ImageIntelligenceResult).where(ImageIntelligenceResult.analysis_run_id == run.id)
+        ).first()
+        if existing is not None:
+            existing.provider = provider
+            existing.model = model
+            existing.prompt_version = prompt_version
+            existing.payload = payload
+            existing.images_available = images_available
+            existing.images_selected = images_selected
+            existing.images_skipped = images_skipped
+            existing.input_tokens = input_tokens
+            existing.output_tokens = output_tokens
+            existing.total_tokens = total_tokens
+            existing.estimated_cost_usd = estimated_cost_usd
+            existing.latency_ms = latency_ms
+            run.image_result = existing
+            run.image_prompt_version = prompt_version
+            self.session.flush()
+            return existing
+        row = ImageIntelligenceResult(
+            analysis_run_id=run.id,
+            provider=provider,
+            model=model,
+            prompt_version=prompt_version,
+            payload=payload,
+            images_available=images_available,
+            images_selected=images_selected,
+            images_skipped=images_skipped,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            latency_ms=latency_ms,
+        )
+        self.session.add(row)
+        run.image_result = row
+        run.image_prompt_version = prompt_version
+        self.session.flush()
+        return row
+
+    def mark_partial(self, run: AnalysisRun, note: str) -> None:
+        run.status = "partial"
+        meta = dict(run.extra_metadata or {})
+        meta["last_optional_error"] = note
+        run.extra_metadata = meta
+        run.completed_at = datetime.now(UTC)
+        self.session.flush()
+
+    def mark_complete(self, run: AnalysisRun) -> None:
+        if run.status != "partial":
+            run.status = "complete"
+        run.completed_at = datetime.now(UTC)
+        self.session.flush()
+
+
+class ReportUploadRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def find_by_hash(self, organization_id: UUID, file_hash: str) -> ReportUpload | None:
+        statement = (
+            select(ReportUpload)
+            .where(
+                ReportUpload.organization_id == organization_id,
+                ReportUpload.file_hash == file_hash,
+            )
+            .order_by(ReportUpload.created_at.asc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
+
+    def create(self, **kwargs: Any) -> ReportUpload:
+        row = ReportUpload(**kwargs)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class BulkRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_job(
+        self,
+        *,
+        organization_id: UUID,
+        external_job_id: str,
+        status: str,
+        total_items: int,
+        processed_items: int,
+        successful_items: int,
+        failed_items: int,
+        settings: dict[str, Any] | None,
+        completed_at: datetime | None,
+        input_file_id: UUID | None = None,
+    ) -> BulkJob:
+        existing = self.session.scalars(
+            select(BulkJob).where(
+                BulkJob.organization_id == organization_id,
+                BulkJob.external_job_id == external_job_id,
+            )
+        ).first()
+        if existing is None:
+            existing = BulkJob(
+                organization_id=organization_id,
+                external_job_id=external_job_id,
+                status=status,
+                total_items=total_items,
+                processed_items=processed_items,
+                successful_items=successful_items,
+                failed_items=failed_items,
+                settings=settings,
+                completed_at=completed_at,
+                input_file_id=input_file_id,
+            )
+            self.session.add(existing)
+        else:
+            existing.status = status
+            existing.total_items = total_items
+            existing.processed_items = processed_items
+            existing.successful_items = successful_items
+            existing.failed_items = failed_items
+            existing.settings = settings
+            existing.completed_at = completed_at
+            if input_file_id is not None:
+                existing.input_file_id = input_file_id
+        self.session.flush()
+        return existing
+
+    def replace_items(self, job: BulkJob, items: list[dict[str, Any]]) -> None:
+        for existing in list(job.items):
+            self.session.delete(existing)
+        self.session.flush()
+        for item in items:
+            self.session.add(
+                BulkJobItem(
+                    bulk_job_id=job.id,
+                    asin=item["asin"],
+                    status=item["status"],
+                    product_snapshot_id=item.get("product_snapshot_id"),
+                    listing_analysis=item.get("listing_analysis"),
+                    error=item.get("error"),
+                )
+            )
+        self.session.flush()
+
+    def get_by_external_id(self, organization_id: UUID, external_job_id: str) -> BulkJob | None:
+        return self.session.scalars(
+            select(BulkJob).where(
+                BulkJob.organization_id == organization_id,
+                BulkJob.external_job_id == external_job_id,
+            )
+        ).first()
+
+
+class GeneratedReportRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, **kwargs: Any) -> GeneratedReport:
+        row = GeneratedReport(**kwargs)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get(self, organization_id: UUID, report_id: UUID) -> GeneratedReport | None:
+        return self.session.scalars(
+            select(GeneratedReport).where(
+                GeneratedReport.organization_id == organization_id,
+                GeneratedReport.id == report_id,
+            )
+        ).first()
+
+    def get_for_bulk_job(self, organization_id: UUID, bulk_job_id: UUID) -> GeneratedReport | None:
+        return self.session.scalars(
+            select(GeneratedReport)
+            .where(
+                GeneratedReport.organization_id == organization_id,
+                GeneratedReport.bulk_job_id == bulk_job_id,
+            )
+            .order_by(GeneratedReport.created_at.desc())
+        ).first()
+
+    def get_analysis_pdf(
+        self,
+        organization_id: UUID,
+        analysis_run_id: UUID,
+        *,
+        report_type: str,
+        template_version: str,
+    ) -> GeneratedReport | None:
+        return self.session.scalars(
+            select(GeneratedReport)
+            .where(
+                GeneratedReport.organization_id == organization_id,
+                GeneratedReport.analysis_run_id == analysis_run_id,
+                GeneratedReport.report_type == report_type,
+                GeneratedReport.template_version == template_version,
+            )
+            .order_by(GeneratedReport.created_at.desc())
+        ).first()
+
+
+class UsageEventRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, **kwargs: Any) -> UsageEvent:
+        row = UsageEvent(id=kwargs.pop("id", uuid4()), **kwargs)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_for_org(self, organization_id: UUID, limit: int = 50) -> list[UsageEvent]:
+        return list(
+            self.session.scalars(
+                select(UsageEvent)
+                .where(UsageEvent.organization_id == organization_id)
+                .order_by(UsageEvent.created_at.desc())
+                .limit(limit)
+            ).all()
+        )
+
+
+class ScoringProfileRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_for_org(self, organization_id: UUID, *, include_archived: bool = False) -> list[ScoringProfile]:
+        filters = [ScoringProfile.organization_id == organization_id]
+        if not include_archived:
+            filters.append(ScoringProfile.archived_at.is_(None))
+        statement = (
+            select(ScoringProfile)
+            .where(*filters)
+            .order_by(ScoringProfile.created_at.asc(), ScoringProfile.name.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def get(self, organization_id: UUID, profile_id: UUID) -> ScoringProfile | None:
+        return self.session.scalars(
+            select(ScoringProfile).where(
+                ScoringProfile.organization_id == organization_id,
+                ScoringProfile.id == profile_id,
+            )
+        ).first()
+
+    def get_default(self, organization_id: UUID) -> ScoringProfile | None:
+        return self.session.scalars(
+            select(ScoringProfile).where(
+                ScoringProfile.organization_id == organization_id,
+                ScoringProfile.is_default.is_(True),
+                ScoringProfile.archived_at.is_(None),
+            )
+        ).first()
+
+    def find_active_by_name(self, organization_id: UUID, name: str) -> ScoringProfile | None:
+        return self.session.scalars(
+            select(ScoringProfile).where(
+                ScoringProfile.organization_id == organization_id,
+                ScoringProfile.archived_at.is_(None),
+                func.lower(ScoringProfile.name) == name.strip().lower(),
+            )
+        ).first()
+
+    def create(self, row: ScoringProfile) -> ScoringProfile:
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def clear_defaults(self, organization_id: UUID, *, except_id: UUID | None = None) -> None:
+        rows = self.session.scalars(
+            select(ScoringProfile).where(
+                ScoringProfile.organization_id == organization_id,
+                ScoringProfile.is_default.is_(True),
+            )
+        ).all()
+        for row in rows:
+            if except_id is not None and row.id == except_id:
+                continue
+            row.is_default = False
+
+
+def file_sha256(data: bytes) -> str:
+    return sha256_bytes(data)

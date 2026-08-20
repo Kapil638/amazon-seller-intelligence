@@ -1,7 +1,7 @@
 [project]
 name = "amazon-seller-intelligence-api"
 version = "0.1.0"
-description = "FastAPI backend for Amazon Seller Intelligence (Milestone 9)"
+description = "FastAPI backend for Amazon Seller Intelligence"
 readme = "../../README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,11 +14,17 @@ dependencies = [
     "openai>=1.99.0",
     "python-multipart>=0.0.18",
     "openpyxl>=3.1.5",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "psycopg[binary]>=3.2.0",
+    "supabase>=2.10.0",
+    "reportlab>=5.0.0",
 ]
 
 [dependency-groups]
 dev = [
     "httpx>=0.28.0",
+    "pypdf>=6.16.1",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
 ]

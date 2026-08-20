@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 from app.models.listing_analysis import AnalysisSection, Finding, SectionStatus
 from app.models.product import BSR, Price, Product, ProductSource, RatingBreakdown, Seller
+from app.models.scoring_profile import CustomScoreResult, ScoringProfileSnapshot
 
 
 class EvidenceState(StrEnum):
@@ -90,9 +92,18 @@ class ListingAnalysisV2(BaseModel):
     recommendations: list[V2Recommendation] = Field(default_factory=list)
 
 
+class ListingAnalysisV2Request(BaseModel):
+    """Analyze a Product with Listing Intelligence V2. Optional custom weights."""
+
+    product: Product
+    source: ProductSource | None = None
+    scoring_profile_id: str | None = None
+
+
 class ListingAnalysisV2Response(BaseModel):
     product: Product
     analysis: ListingAnalysisV2
+    custom_score: CustomScoreResult | None = None
     meta: ListingAnalysisV2Meta
 
 
@@ -100,3 +111,22 @@ class ListingAnalysisV2Meta(BaseModel):
     engine: str = "deterministic"
     score_version: str
     source: ProductSource | None = None
+    report_id: str | None = None
+    persisted: bool = False
+    persistence_warning: str | None = None
+    scoring_profile: ScoringProfileSnapshot | None = None
+
+
+class ListingReweightRequest(BaseModel):
+    scoring_profile_id: str
+    report_id: UUID | None = None
+    analysis: ListingAnalysisV2 | None = None
+    persist: bool = False
+
+
+class ListingReweightResponse(BaseModel):
+    analysis: ListingAnalysisV2
+    standard_listing_quality_score: int
+    custom_score: CustomScoreResult | None = None
+    persisted: bool = False
+    preview: bool = True

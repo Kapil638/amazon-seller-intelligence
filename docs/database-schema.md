@@ -1,0 +1,231 @@
+# Database schema (Milestone 10 / 10B)
+
+PostgreSQL via SQLAlchemy 2.0. JSON payloads use JSONB on PostgreSQL and JSON on the SQLite test database. Tests do not use JSONB operators.
+
+Authentication is **not** implemented. Every business table is scoped by `organization_id` (directly or through a parent row). Local/dev uses `DEFAULT_ORGANIZATION_ID`.
+
+Standard V2 scoring weights are a **code constant** (`standard-v2`), not a `scoring_profiles` row. One active custom default per organization is enforced in the service layer (SQLite-friendly; no PostgreSQL partial unique index).
+
+## ER diagram
+
+```mermaid
+erDiagram
+  organizations ||--o{ product_snapshots : owns
+  organizations ||--o{ analysis_runs : owns
+  organizations ||--o{ scoring_profiles : owns
+  organizations ||--o{ report_uploads : owns
+  organizations ||--o{ bulk_jobs : owns
+  organizations ||--o{ generated_reports : owns
+  organizations ||--o{ usage_events : owns
+  product_snapshots ||--o{ analysis_runs : snapshot
+  analysis_runs ||--o| listing_analysis_results : listing_v2
+  analysis_runs ||--o| ai_listing_results : ai_v2
+  analysis_runs ||--o| image_intelligence_results : image
+  analysis_runs ||--o{ generated_reports : optional
+  report_uploads ||--o{ bulk_jobs : input
+  bulk_jobs ||--o{ bulk_job_items : items
+  bulk_jobs ||--o{ generated_reports : excel
+  product_snapshots ||--o{ bulk_job_items : optional
+
+  organizations {
+    uuid id PK
+    string name
+    datetime created_at
+    datetime updated_at
+  }
+
+  scoring_profiles {
+    uuid id PK
+    uuid organization_id FK
+    string name
+    string description
+    numeric title_weight
+    numeric bullets_weight
+    numeric description_a_plus_weight
+    numeric media_weight
+    numeric content_structure_weight
+    bool is_default
+    datetime archived_at
+    datetime created_at
+    datetime updated_at
+  }
+
+  product_snapshots {
+    uuid id PK
+    uuid organization_id FK
+    string asin
+    string marketplace
+    string source
+    jsonb normalized_product
+    string content_hash
+    datetime fetched_at
+    datetime created_at
+  }
+
+  analysis_runs {
+    uuid id PK
+    uuid organization_id FK
+    uuid product_snapshot_id FK
+    string asin
+    string marketplace
+    string status
+    string listing_score_version
+    string ai_prompt_version
+    string image_prompt_version
+    string product_source
+    string display_name
+    jsonb metadata
+    datetime started_at
+    datetime completed_at
+    datetime deleted_at
+    datetime created_at
+    datetime updated_at
+  }
+
+  listing_analysis_results {
+    uuid id PK
+    uuid analysis_run_id FK
+    string score_version
+    int listing_quality_score
+    int custom_listing_quality_score
+    jsonb scoring_profile_snapshot
+    jsonb payload
+    datetime created_at
+  }
+
+  ai_listing_results {
+    uuid id PK
+    uuid analysis_run_id FK
+    string provider
+    string model
+    string prompt_version
+    jsonb payload
+    int input_tokens
+    int output_tokens
+    int total_tokens
+    float estimated_cost_usd
+    int latency_ms
+    datetime created_at
+  }
+
+  image_intelligence_results {
+    uuid id PK
+    uuid analysis_run_id FK
+    string provider
+    string model
+    string prompt_version
+    jsonb payload
+    int images_available
+    int images_selected
+    int images_skipped
+    int input_tokens
+    int output_tokens
+    int total_tokens
+    float estimated_cost_usd
+    int latency_ms
+    datetime created_at
+  }
+
+  report_uploads {
+    uuid id PK
+    uuid organization_id FK
+    string report_type
+    string original_filename
+    string storage_bucket
+    string storage_path
+    string file_hash
+    string parser_version
+    int row_count
+    string status
+    uuid duplicate_of_id
+    jsonb analysis_payload
+    datetime uploaded_at
+    datetime created_at
+  }
+
+  bulk_jobs {
+    uuid id PK
+    uuid organization_id FK
+    string status
+    uuid input_file_id FK
+    string external_job_id
+    int total_items
+    int processed_items
+    int successful_items
+    int failed_items
+    jsonb settings
+    datetime created_at
+    datetime completed_at
+  }
+
+  bulk_job_items {
+    uuid id PK
+    uuid bulk_job_id FK
+    string asin
+    string status
+    uuid product_snapshot_id FK
+    jsonb listing_analysis
+    string error
+    datetime created_at
+  }
+
+  generated_reports {
+    uuid id PK
+    uuid organization_id FK
+    uuid analysis_run_id FK
+    uuid bulk_job_id FK
+    string report_type
+    string storage_bucket
+    string storage_path
+    string filename
+    string template_version
+    datetime created_at
+  }
+
+  usage_events {
+    uuid id PK
+    uuid organization_id FK
+    string provider
+    string workflow
+    string event_type
+    string model
+    int input_tokens
+    int output_tokens
+    int total_tokens
+    float estimated_cost_usd
+    bool cache_hit
+    int latency_ms
+    datetime created_at
+  }
+```
+
+`analysis_runs.id` is the public `report_id`.
+
+Product snapshots are **append-only**. The same ASIN can have many snapshots (20 Aug, 3 Sep, 20 Sep) so future listing-score history can compare them. Do not overwrite a single ASIN row.
+
+## Indexes (Milestone 10)
+
+- `product_snapshots (organization_id, asin, fetched_at)`
+- `analysis_runs (organization_id, asin, created_at)`
+- `analysis_runs (organization_id, created_at)`
+- `analysis_runs (organization_id, deleted_at)`
+- `scoring_profiles (organization_id)`
+- `usage_events (organization_id, created_at)`
+- `report_uploads (organization_id, file_hash)`
+- `generated_reports (analysis_run_id, report_type, template_version)`
+
+## Future tables (not created)
+
+- `users` / auth identity mapping
+- `organization_memberships`
+- RLS policies keyed on authenticated `organization_id`
+- Dedicated listing-score time-series table (snapshots + listing results are enough to start)
+
+## Storage buckets (not SQL)
+
+Private Supabase buckets:
+
+- `seller-report-uploads` — original CSV/XLSX
+- `generated-reports` — bulk Excel output and client analysis PDFs (`analysis_pdf` / `analysis-report-v1`)
+
+File bytes are not stored in PostgreSQL. SHA-256 is stored on `report_uploads.file_hash` for duplicate identification (duplicates are stored and flagged, not rejected).

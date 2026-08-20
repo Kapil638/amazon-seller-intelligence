@@ -71,12 +71,18 @@ async def get_bulk_job(job_id: str) -> BulkJobResponse:
 @router.get("/jobs/{job_id}/report.xlsx")
 async def download_bulk_report(job_id: str) -> Response:
     job = get_bulk_job_service().get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Bulk job was not found.")
-    if job.status not in {"completed", "completed_with_errors"}:
-        raise HTTPException(status_code=409, detail="The Excel report is available after the job completes.")
-    payload = build_bulk_workbook(job)
-    filename = f"bulk-due-diligence-{job.job_id[:8]}.xlsx"
+    if job is not None:
+        if job.status not in {"completed", "completed_with_errors"}:
+            raise HTTPException(status_code=409, detail="The Excel report is available after the job completes.")
+        payload = build_bulk_workbook(job)
+        filename = f"bulk-due-diligence-{job.job_id[:8]}.xlsx"
+    else:
+        from app.services.artifact_persistence_service import get_artifact_service
+
+        stored = get_artifact_service().load_generated_excel(job_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Bulk job was not found.")
+        payload, filename = stored
     return Response(
         content=payload,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -146,12 +146,58 @@ class BulkLimitExceededError(Exception):
 
 
 class BulkLiveProviderForbiddenError(Exception):
-    def __init__(
-        self,
-        message: str = (
-            "Live provider calls are disabled for bulk analysis. "
-            "This protects Rainforest and OpenAI credits. "
-            "Keep BULK_LIVE_PROVIDER_CALLS_ENABLED=false during mock testing."
-        ),
-    ) -> None:
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class PersistenceError(Exception):
+    def __init__(self, message: str = "The report could not be saved.") -> None:
+        super().__init__(message)
+
+
+class PersistenceNotConfiguredError(Exception):
+    def __init__(self, message: str = "Report history is not configured.") -> None:
+        super().__init__(message)
+
+
+class ReportNotFoundError(Exception):
+    def __init__(self, report_id: str) -> None:
+        self.report_id = report_id
+        super().__init__(f"Saved analysis {report_id} was not found.")
+
+
+class ScoringProfileValidationError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class ScoringProfileNotFoundError(Exception):
+    def __init__(self, profile_id: str) -> None:
+        self.profile_id = profile_id
+        super().__init__(f"Scoring profile {profile_id} was not found.")
+
+
+class ScoringProfileImmutableError(Exception):
+    def __init__(self, message: str = "The Standard V2 scoring profile cannot be changed.") -> None:
+        super().__init__(message)
+
+
+class ScoringProfileConflictError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class PdfGenerationError(Exception):
+    def __init__(self, message: str = "The PDF report could not be generated.") -> None:
+        super().__init__(message)
+
+
+class PdfNotGeneratedError(Exception):
+    def __init__(self, report_id: str) -> None:
+        self.report_id = report_id
+        super().__init__(f"A PDF has not been generated for report {report_id}.")
+
+
+class ArtifactStorageError(Exception):
+    def __init__(self, message: str = "The generated report could not be stored.") -> None:
         super().__init__(message)

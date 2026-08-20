@@ -90,7 +90,7 @@ def _read_xlsx(data: bytes) -> list[list[str]]:
     try:
         workbook = load_workbook(
             buffer,
-            read_only=True,
+            read_only=False,
             data_only=True,
             keep_links=False,
         )

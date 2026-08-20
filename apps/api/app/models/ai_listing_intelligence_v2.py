@@ -89,6 +89,7 @@ class AIListingIntelligenceV2Request(BaseModel):
     product: Product
     analysis: ListingAnalysisV2
     source: ProductSource | None = None
+    report_id: str | None = None
 
 
 class AIListingIntelligenceV2Meta(BaseModel):
@@ -99,6 +100,9 @@ class AIListingIntelligenceV2Meta(BaseModel):
     source: ProductSource | None = None
     usage: AITokenUsage | None = None
     latency_ms: int | None = None
+    report_id: str | None = None
+    persisted: bool = False
+    persistence_warning: str | None = None
 
 
 class AIListingIntelligenceV2Response(BaseModel):

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { ArrowRight, Loader2 } from "lucide-react";
 
 import { AICompetitiveIntelligenceView } from "@/components/ai-competitive-intelligence";
@@ -12,11 +12,12 @@ import { CompetitorDiscovery } from "@/components/competitor-discovery";
 import { CompetitorInput } from "@/components/competitor-input";
 import { ListingIntelligence } from "@/components/listing-intelligence";
 import { ListingIntelligenceV2 } from "@/components/listing-intelligence-v2";
+import { ScoringProfileControls } from "@/components/scoring-profile-controls";
 import { ManualProductForm } from "@/components/manual-product-form";
 import { ProductResult } from "@/components/product-result";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { EmptyState } from "@/components/ui/layout";
+import { EmptyState, Panel } from "@/components/ui/layout";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -30,7 +31,9 @@ import {
   generateAIListingIntelligenceV2,
   generateImageIntelligence,
   generateCompetitorSearchQuery,
+  listScoringProfiles,
   ProductLookupError,
+  reweightListingV2,
 } from "@/lib/api";
 import { isValidAsin, normalizeAsin } from "@/lib/asin";
 import type {
@@ -44,6 +47,7 @@ import type {
   ListingAnalysisV2Response,
   ProductResponse,
 } from "@/lib/types";
+import { STANDARD_SCORING_PROFILE_ID } from "@/lib/types";
 
 export function ProductLookup() {
   const [liveAsin, setLiveAsin] = useState("");
@@ -77,6 +81,20 @@ export function ProductLookup() {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<CompetitorDiscoveryResult | null>(null);
   const [selectedCandidateAsins, setSelectedCandidateAsins] = useState<string[]>([]);
+  const [selectedProfileId, setSelectedProfileId] = useState(STANDARD_SCORING_PROFILE_ID);
+
+  useEffect(() => {
+    void listScoringProfiles()
+      .then((data) => {
+        const orgDefault = data.items.find((item) => item.is_default && !item.is_system && !item.is_archived);
+        if (orgDefault) {
+          setSelectedProfileId(orgDefault.id);
+        }
+      })
+      .catch(() => {
+        /* selector still works with Standard V2 */
+      });
+  }, []);
 
   function resetDownstream() {
     setAnalysisError(null);
@@ -248,7 +266,48 @@ export function ProductLookup() {
       {result ? (
         <>
           <ProductResult product={result.product} source={result.meta.source} />
-          <div className="flex flex-wrap gap-2">
+          <Panel className="p-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium">Scoring Profile</p>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  Choose Standard V2 or a custom weight profile before analyzing. Custom scores do
+                  not replace Standard V2.
+                </p>
+              </div>
+              <ScoringProfileControls
+                selectedId={selectedProfileId}
+                onSelect={async (profileId) => {
+                  setSelectedProfileId(profileId);
+                  if (!analysisV2) {
+                    return;
+                  }
+                  try {
+                    const next = await reweightListingV2({
+                      scoring_profile_id: profileId,
+                      report_id: analysisV2.meta.report_id,
+                      analysis: analysisV2.analysis,
+                      persist: Boolean(analysisV2.meta.report_id),
+                    });
+                    setAnalysisV2({
+                      ...analysisV2,
+                      analysis: next.analysis,
+                      custom_score: next.custom_score,
+                      meta: {
+                        ...analysisV2.meta,
+                        scoring_profile: next.custom_score?.profile ?? null,
+                      },
+                    });
+                  } catch (err) {
+                    if (err instanceof ProductLookupError) {
+                      setAnalysisError(err.message);
+                    }
+                  }
+                }}
+              />
+            </div>
+          </Panel>
+          <div className="flex flex-wrap items-center gap-3">
             <Button
               type="button"
               disabled={analysisLoading}
@@ -258,7 +317,7 @@ export function ProductLookup() {
                 try {
                   const [legacy, next] = await Promise.all([
                     analyzeListing(result.product, result.meta.source),
-                    analyzeListingV2(result.product, result.meta.source),
+                    analyzeListingV2(result.product, result.meta.source, selectedProfileId),
                   ]);
                   setAnalysis(legacy);
                   setAnalysisV2(next);
@@ -340,7 +399,63 @@ export function ProductLookup() {
         </Alert>
       ) : null}
 
-      {analysisV2 ? <ListingIntelligenceV2 analysis={analysisV2.analysis} /> : null}
+      {analysisV2?.meta.persistence_warning ? (
+        <Alert>
+          <AlertTitle>Analysis succeeded but could not be saved</AlertTitle>
+          <AlertDescription>{analysisV2.meta.persistence_warning}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {analysisV2?.meta.persisted ? (
+        <p className="text-sm text-muted-foreground">
+          Saved to History. Reopening that report will not call Rainforest or OpenAI.
+        </p>
+      ) : null}
+
+      {aiResult?.meta.persistence_warning || imageAiResult?.meta.persistence_warning ? (
+        <Alert>
+          <AlertTitle>Optional analysis could not be saved</AlertTitle>
+          <AlertDescription>
+            {aiResult?.meta.persistence_warning || imageAiResult?.meta.persistence_warning}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {analysisV2 ? (
+        <ListingIntelligenceV2
+          analysis={analysisV2.analysis}
+          customScore={analysisV2.custom_score}
+          selector={
+            <ScoringProfileControls
+              selectedId={selectedProfileId}
+              onSelect={async (profileId) => {
+                setSelectedProfileId(profileId);
+                try {
+                  const next = await reweightListingV2({
+                    scoring_profile_id: profileId,
+                    report_id: analysisV2.meta.report_id,
+                    analysis: analysisV2.analysis,
+                    persist: Boolean(analysisV2.meta.report_id),
+                  });
+                  setAnalysisV2({
+                    ...analysisV2,
+                    analysis: next.analysis,
+                    custom_score: next.custom_score,
+                    meta: {
+                      ...analysisV2.meta,
+                      scoring_profile: next.custom_score?.profile ?? null,
+                    },
+                  });
+                } catch (err) {
+                  if (err instanceof ProductLookupError) {
+                    setAnalysisError(err.message);
+                  }
+                }
+              }}
+            />
+          }
+        />
+      ) : null}
 
       {analysisV2 ? (
         <div>
@@ -355,6 +470,7 @@ export function ProductLookup() {
                   analysisV2.product,
                   analysisV2.analysis,
                   analysisV2.meta.source ?? undefined,
+                  analysisV2.meta.report_id,
                 );
                 setAiResult(next);
               } catch (err) {
@@ -411,6 +527,7 @@ export function ProductLookup() {
                   analysisV2.product,
                   analysisV2.analysis,
                   analysisV2.meta.source ?? undefined,
+                  analysisV2.meta.report_id ?? aiResult?.meta.report_id,
                 );
                 setImageAiResult(next);
               } catch (err) {

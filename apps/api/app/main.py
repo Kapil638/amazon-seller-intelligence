@@ -10,15 +10,15 @@ settings = get_settings()
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.13.0",
-    description="Amazon Seller Intelligence API — listing, competitive, reports, usage, and bulk due diligence",
+    version="0.16.0",
+    description="Amazon Seller Intelligence API — listing, competitive, reports, usage, bulk, persistence, custom scoring, and client PDF export",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -40,4 +40,8 @@ async def validation_exception_handler(
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    payload = {"status": "ok"}
+    from app.persistence.database import persistence_enabled
+
+    payload["persistence"] = "configured" if persistence_enabled() else "disabled"
+    return payload

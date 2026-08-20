@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from app.bulk.excel import build_bulk_workbook
 from app.bulk.ingest import ingest_asin_file
 from app.bulk.processor import BulkProcessor, build_attention_and_summary
 from app.core.config import get_settings
@@ -87,6 +88,7 @@ class BulkJobService:
         self._store = store
         self._backend = backend
         self._processor_factory = processor_factory
+        self._inputs: dict[str, tuple[str, bytes]] = {}
 
     def preview(self, filename: str, data: bytes):
         return ingest_asin_file(filename, data)
@@ -114,6 +116,7 @@ class BulkJobService:
             live_providers_enabled=settings.bulk_live_provider_calls_enabled,
         )
         self._store.put(job)
+        self._inputs[job.job_id] = (filename, data)
         self._backend.submit(lambda: self._run(job.job_id, unique, ingest_failures, options))
         return self._store.get(job.job_id) or job
 
@@ -147,6 +150,7 @@ class BulkJobService:
             )
         except BulkLiveProviderForbiddenError as exc:
             self._store.update(job_id, status="failed", error=str(exc))
+            self._persist_job(job_id)
             return
         except Exception:
             self._store.update(
@@ -154,6 +158,7 @@ class BulkJobService:
                 status="failed",
                 error="Bulk analysis failed before a report could be produced.",
             )
+            self._persist_job(job_id)
             return
 
         attention, summary = build_attention_and_summary(unique, results, failures)
@@ -178,3 +183,16 @@ class BulkJobService:
             progress=progress,
             error=None,
         )
+        self._persist_job(job_id, with_excel=True)
+
+    def _persist_job(self, job_id: str, with_excel: bool = False) -> None:
+        finished = self._store.get(job_id)
+        if finished is None:
+            return
+        from app.services.artifact_persistence_service import get_artifact_service
+
+        artifacts = get_artifact_service()
+        upload = self._inputs.pop(job_id, None)
+        artifacts.save_bulk_job(finished, upload[1] if upload else None, upload[0] if upload else None)
+        if with_excel:
+            artifacts.save_generated_excel(finished, build_bulk_workbook(finished))

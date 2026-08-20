@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.ai.factory import get_ai_provider
@@ -13,7 +15,13 @@ from app.core.exceptions import (
     CompetitorValidationError,
     NoCompetitorsRetrievedError,
     NoValidMediaError,
+    PersistenceNotConfiguredError,
     ProviderConfigurationError,
+    ReportNotFoundError,
+    ScoringProfileConflictError,
+    ScoringProfileImmutableError,
+    ScoringProfileNotFoundError,
+    ScoringProfileValidationError,
 )
 from app.models.ai_competitive_intelligence import (
     AICompetitiveIntelligenceMeta,
@@ -44,12 +52,19 @@ from app.models.listing_analysis import (
     ListingAnalysisRequest,
     ListingAnalysisResponse,
 )
-from app.models.listing_analysis_v2 import ListingAnalysisV2Meta, ListingAnalysisV2Response
+from app.models.listing_analysis_v2 import (
+    ListingAnalysisV2Meta,
+    ListingAnalysisV2Request,
+    ListingAnalysisV2Response,
+    ListingReweightRequest,
+    ListingReweightResponse,
+)
 from app.prompts.competitive_intelligence import PROMPT_VERSION as COMPETITIVE_PROMPT_VERSION
 from app.prompts.image_intelligence import PROMPT_VERSION as IMAGE_PROMPT_VERSION
 from app.prompts.listing_intelligence import PROMPT_VERSION
 from app.prompts.listing_intelligence_v2 import PROMPT_VERSION as PROMPT_VERSION_V2
 from app.providers.factory import get_product_provider
+from app.services.analysis_history_service import AnalysisHistoryService, get_analysis_history_service
 from app.services.ai_competitive_intelligence_service import AICompetitiveIntelligenceService
 from app.services.ai_image_intelligence_service import AIImageIntelligenceService
 from app.services.ai_listing_intelligence_service import AIListingIntelligenceService
@@ -57,7 +72,9 @@ from app.services.ai_listing_intelligence_v2_service import AIListingIntelligenc
 from app.services.competitor_comparison_service import CompetitorComparisonService
 from app.services.listing_analysis_service import ListingAnalysisService
 from app.services.listing_analysis_v2_service import ListingAnalysisV2Service
+from app.services.scoring_profile_service import ScoringProfileService, get_scoring_profile_service
 from app.services.product_service import ProductService
+from app.usage.openai_pricing import estimate_openai_cost_usd
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
@@ -80,6 +97,26 @@ def get_ai_listing_intelligence_v2_service() -> AIListingIntelligenceV2Service:
 
 def get_ai_image_intelligence_service() -> AIImageIntelligenceService:
     return AIImageIntelligenceService(provider=get_ai_provider())
+
+
+def _parse_report_id(value: str | None) -> UUID | None:
+    if not value:
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+def _token_cost(model: str, usage) -> float | None:
+    if usage is None:
+        return None
+    return estimate_openai_cost_usd(
+        model=model,
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        output_tokens=usage.output_tokens,
+    )
 
 
 def get_competitor_comparison_service() -> CompetitorComparisonService:
@@ -109,6 +146,22 @@ def _ai_http_error(exc: Exception) -> HTTPException:
     raise exc
 
 
+def _profile_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ScoringProfileValidationError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, ScoringProfileNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ScoringProfileImmutableError):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, ScoringProfileConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, PersistenceNotConfiguredError):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, ReportNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    raise exc
+
+
 @router.post("/listing", response_model=ListingAnalysisResponse)
 def analyze_listing(
     payload: ListingAnalysisRequest,
@@ -128,18 +181,63 @@ def analyze_listing(
 
 @router.post("/listing/v2", response_model=ListingAnalysisV2Response)
 def analyze_listing_v2(
-    payload: ListingAnalysisRequest,
+    payload: ListingAnalysisV2Request,
     service: ListingAnalysisV2Service = Depends(get_listing_analysis_v2_service),
+    history: AnalysisHistoryService = Depends(get_analysis_history_service),
+    profiles: ScoringProfileService = Depends(get_scoring_profile_service),
 ) -> ListingAnalysisV2Response:
     analysis = service.analyze(payload.product)
+    try:
+        custom_score = profiles.custom_score_for_analysis(analysis, payload.scoring_profile_id)
+    except Exception as exc:
+        raise _profile_http_error(exc) from exc
+    persist = history.record_listing_v2(
+        payload.product,
+        analysis,
+        payload.source.value if payload.source else None,
+        custom_score=custom_score,
+    )
     return ListingAnalysisV2Response(
         product=payload.product,
         analysis=analysis,
+        custom_score=custom_score,
         meta=ListingAnalysisV2Meta(
             engine="deterministic",
             score_version=SCORE_VERSION_V2,
             source=payload.source,
+            report_id=str(persist.report_id) if persist.report_id else None,
+            persisted=persist.persisted,
+            persistence_warning=persist.persistence_warning,
+            scoring_profile=custom_score.profile if custom_score else None,
         ),
+    )
+
+
+@router.post("/listing/v2/reweight", response_model=ListingReweightResponse)
+def reweight_listing_v2(
+    payload: ListingReweightRequest,
+    history: AnalysisHistoryService = Depends(get_analysis_history_service),
+    profiles: ScoringProfileService = Depends(get_scoring_profile_service),
+) -> ListingReweightResponse:
+    try:
+        if payload.report_id is not None:
+            analysis = history.get_report(payload.report_id).analysis
+        elif payload.analysis is not None:
+            analysis = payload.analysis
+        else:
+            raise ScoringProfileValidationError("Provide report_id or the existing V2 analysis.")
+        custom_score = profiles.custom_score_for_analysis(analysis, payload.scoring_profile_id)
+        persisted = False
+        if payload.persist and payload.report_id is not None:
+            persisted = history.update_custom_score(payload.report_id, custom_score)
+    except Exception as exc:
+        raise _profile_http_error(exc) from exc
+    return ListingReweightResponse(
+        analysis=analysis,
+        standard_listing_quality_score=analysis.listing_quality_score,
+        custom_score=custom_score,
+        persisted=persisted,
+        preview=not persisted,
     )
 
 
@@ -179,7 +277,9 @@ async def analyze_listing_ai(
 async def analyze_listing_v2_ai(
     payload: AIListingIntelligenceV2Request,
     service: AIListingIntelligenceV2Service = Depends(get_ai_listing_intelligence_v2_service),
+    history: AnalysisHistoryService = Depends(get_analysis_history_service),
 ) -> AIListingIntelligenceV2Response:
+    report_id = _parse_report_id(payload.report_id)
     try:
         result = await service.generate(payload.product, payload.analysis)
     except (
@@ -190,7 +290,21 @@ async def analyze_listing_v2_ai(
         AIStructuredOutputError,
         AISafetyRefusalError,
     ) as exc:
+        history.record_ai_v2_failure(report_id, str(exc))
         raise _ai_http_error(exc) from exc
+    persist = history.record_ai_v2(
+        payload.product,
+        payload.analysis,
+        result.payload,
+        report_id=report_id,
+        source=payload.source.value if payload.source else None,
+        provider=result.provider,
+        model=result.model,
+        prompt_version=result.prompt_version or PROMPT_VERSION_V2,
+        usage=result.usage,
+        latency_ms=result.latency_ms,
+        estimated_cost_usd=_token_cost(result.model, result.usage),
+    )
     return AIListingIntelligenceV2Response(
         product=payload.product,
         analysis=payload.analysis,
@@ -203,6 +317,9 @@ async def analyze_listing_v2_ai(
             source=payload.source,
             usage=result.usage,
             latency_ms=result.latency_ms,
+            report_id=str(persist.report_id) if persist.report_id else None,
+            persisted=persist.persisted,
+            persistence_warning=persist.persistence_warning,
         ),
     )
 
@@ -211,7 +328,9 @@ async def analyze_listing_v2_ai(
 async def analyze_listing_images_ai(
     payload: AIImageIntelligenceRequest,
     service: AIImageIntelligenceService = Depends(get_ai_image_intelligence_service),
+    history: AnalysisHistoryService = Depends(get_analysis_history_service),
 ) -> AIImageIntelligenceResponse:
+    report_id = _parse_report_id(payload.report_id)
     try:
         result, selection = await service.generate(payload.product, payload.analysis)
     except (
@@ -223,7 +342,24 @@ async def analyze_listing_images_ai(
         AISafetyRefusalError,
         NoValidMediaError,
     ) as exc:
+        history.record_image_failure(report_id, str(exc))
         raise _ai_http_error(exc) from exc
+    persist = history.record_image_intelligence(
+        payload.product,
+        payload.analysis,
+        result.payload,
+        report_id=report_id,
+        source=payload.source.value if payload.source else None,
+        provider=result.provider,
+        model=result.model,
+        prompt_version=result.prompt_version or IMAGE_PROMPT_VERSION,
+        images_available=selection.images_available,
+        images_selected=selection.images_selected,
+        images_skipped=selection.images_skipped,
+        usage=result.usage,
+        latency_ms=result.latency_ms,
+        estimated_cost_usd=_token_cost(result.model, result.usage),
+    )
     return AIImageIntelligenceResponse(
         product=payload.product,
         analysis=payload.analysis,
@@ -242,6 +378,9 @@ async def analyze_listing_images_ai(
             usage=result.usage,
             latency_ms=result.latency_ms,
             media=selection,
+            report_id=str(persist.report_id) if persist.report_id else None,
+            persisted=persist.persisted,
+            persistence_warning=persist.persistence_warning,
         ),
     )
 

@@ -1,7 +1,10 @@
 from functools import lru_cache
+from uuid import UUID
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_DEVELOPMENT_ORGANIZATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
 class Settings(BaseSettings):
@@ -65,6 +68,14 @@ class Settings(BaseSettings):
     business_low_conversion: float = 0.05
     business_low_buybox: float = 0.80
     business_low_buybox_min_sessions: int = 50
+    database_url: str = ""
+    supabase_url: str = ""
+    supabase_service_role_key: SecretStr | None = None
+    default_organization_id: UUID = DEFAULT_DEVELOPMENT_ORGANIZATION_ID
+    default_organization_name: str = "Development"
+    storage_uploads_bucket: str = "seller-report-uploads"
+    storage_generated_bucket: str = "generated-reports"
+    signed_url_ttl_seconds: int = 300
 
 
 @lru_cache

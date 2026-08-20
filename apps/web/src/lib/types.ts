@@ -219,6 +219,10 @@ export type AnalysisMeta = {
   engine: string;
   score_version: string;
   source: ProductSource | null;
+  report_id?: string | null;
+  persisted?: boolean;
+  persistence_warning?: string | null;
+  scoring_profile?: ScoringProfileSnapshot | null;
 };
 
 export type ListingAnalysisResponse = {
@@ -298,7 +302,65 @@ export type ListingAnalysisV2 = {
 export type ListingAnalysisV2Response = {
   product: Product;
   analysis: ListingAnalysisV2;
+  custom_score?: CustomScoreResult | null;
   meta: AnalysisMeta;
+};
+
+export type ScoringWeights = {
+  title: number;
+  bullets: number;
+  description_a_plus: number;
+  media: number;
+  content_structure: number;
+};
+
+export type ScoringProfileSnapshot = {
+  profile_id: string;
+  profile_name: string;
+  type: "standard" | "custom";
+  weights: ScoringWeights;
+};
+
+export type CustomScoreResult = {
+  custom_listing_quality_score: number;
+  profile: ScoringProfileSnapshot;
+};
+
+export type ScoringProfile = {
+  id: string;
+  name: string;
+  description: string | null;
+  weights: ScoringWeights;
+  is_system: boolean;
+  is_default: boolean;
+  is_archived: boolean;
+  editable: boolean;
+  deletable: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  archived_at: string | null;
+};
+
+export type ScoringProfileListResponse = {
+  items: ScoringProfile[];
+};
+
+export type ListingReweightResponse = {
+  analysis: ListingAnalysisV2;
+  standard_listing_quality_score: number;
+  custom_score: CustomScoreResult | null;
+  persisted: boolean;
+  preview: boolean;
+};
+
+export const STANDARD_SCORING_PROFILE_ID = "standard-v2";
+
+export const STANDARD_V2_WEIGHTS: ScoringWeights = {
+  title: 20,
+  bullets: 25,
+  description_a_plus: 20,
+  media: 20,
+  content_structure: 15,
 };
 
 export type ActionPriority = "high" | "medium" | "low";
@@ -355,6 +417,9 @@ export type AIListingIntelligenceMeta = {
   source: ProductSource | null;
   usage: AITokenUsage | null;
   latency_ms: number | null;
+  report_id?: string | null;
+  persisted?: boolean;
+  persistence_warning?: string | null;
 };
 
 export type AIListingIntelligenceResponse = {
@@ -1000,4 +1065,58 @@ export type BulkJobResponse = {
   created_at: string;
   updated_at: string;
   live_providers_enabled: boolean;
+};
+
+export type SavedAnalysisSummary = {
+  report_id: string;
+  asin: string;
+  product_title: string | null;
+  brand: string | null;
+  marketplace: string;
+  listing_quality_score: number | null;
+  custom_listing_quality_score?: number | null;
+  scoring_profile_name?: string | null;
+  source: string | null;
+  has_ai_strategy: boolean;
+  has_image_intelligence: boolean;
+  created_at: string;
+  completed_at: string | null;
+  status: string;
+  display_name: string | null;
+};
+
+export type SavedAnalysisListResponse = {
+  items: SavedAnalysisSummary[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type SavedAnalysisMetadata = {
+  historical: boolean;
+  analyzed_at: string | null;
+  product_fetched_at: string | null;
+  product_source: ProductSource | string | null;
+  listing_score_version: string | null;
+  ai_prompt_version: string | null;
+  image_prompt_version: string | null;
+  ai_provider: string | null;
+  ai_model: string | null;
+  image_provider: string | null;
+  image_model: string | null;
+  images_available: number | null;
+  images_selected: number | null;
+  images_skipped: number | null;
+  status: string;
+};
+
+export type SavedAnalysisDetail = {
+  report_id: string;
+  display_name: string | null;
+  product: Product;
+  analysis: ListingAnalysisV2;
+  custom_score?: CustomScoreResult | null;
+  ai_intelligence: AIListingIntelligenceV2 | null;
+  image_intelligence: AIImageIntelligence | null;
+  meta: SavedAnalysisMetadata;
 };

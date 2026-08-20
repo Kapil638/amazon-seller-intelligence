@@ -108,6 +108,7 @@ class AIImageIntelligenceRequest(BaseModel):
     product: Product
     analysis: ListingAnalysisV2
     source: ProductSource | None = None
+    report_id: str | None = None
 
 
 class AIImageIntelligenceMeta(BaseModel):
@@ -124,6 +125,9 @@ class AIImageIntelligenceMeta(BaseModel):
     usage: AITokenUsage | None = None
     latency_ms: int | None = None
     media: MediaSelectionResult | None = None
+    report_id: str | None = None
+    persisted: bool = False
+    persistence_warning: str | None = None
 
 
 class AIImageIntelligenceResponse(BaseModel):

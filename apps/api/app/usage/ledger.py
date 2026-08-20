@@ -76,14 +76,23 @@ class ApplicationUsageLedger:
     def record_rainforest_product_call(self) -> None:
         with self._lock:
             self.rainforest_product_calls += 1
+        self._emit_usage_event(provider="rainforest", workflow="product_lookup", event_type="call")
 
     def record_rainforest_search_call(self) -> None:
         with self._lock:
             self.rainforest_search_calls += 1
+        self._emit_usage_event(provider="rainforest", workflow="competitor_discovery", event_type="call")
 
     def record_rainforest_cache_hit(self, _kind: RainforestCallKind) -> None:
         with self._lock:
             self.rainforest_cache_hits += 1
+        workflow = "product_lookup" if _kind == "product" else "competitor_discovery"
+        self._emit_usage_event(provider="rainforest", workflow=workflow, event_type="cache_hit", cache_hit=True)
+
+    def record_openai_cache_hit(self) -> None:
+        with self._lock:
+            self.openai_cache_hits += 1
+        self._emit_usage_event(provider="openai", workflow="listing_intelligence_v2", event_type="cache_hit", cache_hit=True)
 
     def record_rainforest_failure(self, _kind: RainforestCallKind) -> None:
         with self._lock:
@@ -93,10 +102,6 @@ class ApplicationUsageLedger:
         """Account API is free. Tracked only so tests can prove it is not a paid product call."""
         with self._lock:
             self.rainforest_account_lookups += 1
-
-    def record_openai_cache_hit(self) -> None:
-        with self._lock:
-            self.openai_cache_hits += 1
 
     def record_openai_failure(self) -> None:
         with self._lock:
@@ -145,6 +150,17 @@ class ApplicationUsageLedger:
             self.openai_calls.append(record)
             if len(self.openai_calls) > 500:
                 self.openai_calls = self.openai_calls[-500:]
+        self._emit_usage_event(
+            provider="openai",
+            workflow=workflow,
+            event_type="call",
+            model=model,
+            input_tokens=inp,
+            output_tokens=out,
+            total_tokens=max(total, 0),
+            estimated_cost_usd=cost,
+            cache_hit=False,
+        )
         return cost
 
     def rainforest_app_snapshot(self) -> RainforestAppUsage:
@@ -187,6 +203,14 @@ class ApplicationUsageLedger:
                 failed_calls=self.openai_failed_calls,
                 unpriced_requests=unpriced,
             )
+
+    def _emit_usage_event(self, **kwargs: object) -> None:
+        try:
+            from app.services.artifact_persistence_service import get_artifact_service
+
+            get_artifact_service().record_usage_event(**kwargs)
+        except Exception:
+            return
 
 
 _LEDGER = ApplicationUsageLedger()

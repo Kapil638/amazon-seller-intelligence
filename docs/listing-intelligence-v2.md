@@ -39,6 +39,8 @@ POST /api/v1/analysis/listing/ai     → AIListingIntelligenceService  → uses 
 Rules live in `apps/api/app/analytics/listing_rules_v2.py`.  
 Models live in `apps/api/app/models/listing_analysis_v2.py`.
 
+Optional **Custom Scoring Profiles** re-aggregate these section scores only. They do not change this engine. See [custom-scoring-profiles.md](custom-scoring-profiles.md).
+
 ---
 
 ## Listing quality formula

@@ -1,10 +1,73 @@
 # Amazon Seller Intelligence — Change Summary
 
 **Date:** 20 August 2026  
-**Scope:** Milestone 8D Image & Media Intelligence V1  
-**Status:** Milestone 8D complete. Image generation, Reviews API, and Offers API were not started.
+**Scope:** Milestone 10C.1 Professional PDF Design V2  
+**Status:** Milestone 10C.1 complete. Authentication, SP-API, Ads API, Redis/Celery, Reviews API, Offers API, hard delete, Recycle Bin, email/public PDFs, and white-label templates were not started.
 
 This document records what was built and updated. It is a change log, not a product spec.
+
+---
+
+## Milestone 10C.1 — Professional PDF Design V2 (20 August 2026)
+
+Client PDF template upgraded from `analysis-report-v1` to `analysis-report-v2`. Persistence, deletion, analysis logic, and provider calls are unchanged.
+
+- Presentation view model (`ClientReportViewModel`) formats labels, currency, dates, grouping, and Unicode text. ReportLab only lays out those fields.
+- Cover, executive score dashboard, What to Fix First, KPI cards, coverage cards, findings groups, action-plan roadmap, suggested-copy boxes, and subdued metadata.
+- v1 artifacts remain valid. Requesting PDF when only v1 exists generates and stores v2. Uniqueness remains `report_id + template_version`.
+- Font embedding when a Unicode TTF is available on the host. No vendored font files. Vector score bars. Long text paginates instead of overflowing a table cell.
+
+See [client-pdf-reports.md](client-pdf-reports.md).
+
+---
+
+## Milestone 10C — Report lifecycle & client PDF export (20 August 2026)
+
+Saved History reports can be soft-deleted and exported as a professional A4 client PDF. Both operations use **persisted historical data only**.
+
+- `DELETE /api/v1/reports/{report_id}` sets `analysis_runs.deleted_at`. Snapshots, listing/AI/image results, and scoring snapshots are retained.
+- Deleted reports disappear from `GET /api/v1/reports` and return 404 on detail/PDF. Cross-organization access also returns 404.
+- `POST /api/v1/reports/{report_id}/pdf` generates ReportLab A4 `analysis-report-v1` if missing; otherwise reuses the stored artifact. `GET` streams `application/pdf` from private `generated-reports`.
+- History UI: Open, PDF (user-initiated, Generating…), and a ⋯ menu with Delete Report plus confirmation dialog.
+- Migration `0003_report_lifecycle` adds `deleted_at` and `generated_reports.template_version`. `0001` and `0002` were not modified.
+
+See [report-lifecycle.md](report-lifecycle.md) and [client-pdf-reports.md](client-pdf-reports.md).
+
+---
+
+## Milestone 10B — Custom Scoring Profiles (20 August 2026)
+
+Optional organization-owned **Custom Weights** for the Listing Intelligence V2 **aggregate only**.
+
+- Standard V2 (`standard-v2`, 20 / 25 / 20 / 20 / 15) remains the immutable benchmark and is always calculated.
+- Custom profiles re-aggregate existing section scores. Section rules, findings, Market Signals, Data Coverage, AI V2, and Image AI are unchanged.
+- Weights must total exactly 100 (server-side). Zero is allowed; negatives and totals other than 100 are rejected.
+- Historical reports store a weight snapshot and custom score. Editing or archiving a profile does not rewrite old reports.
+- Competitor comparison still uses standard listing scores. Custom competitor comparison was deferred.
+- Creating, editing, selecting, or reweighting a profile uses **0** Rainforest and **0** OpenAI calls.
+
+See [custom-scoring-profiles.md](custom-scoring-profiles.md). Completion record: [custom-scoring-profiles-report.md](custom-scoring-profiles-report.md).
+
+---
+
+## Milestone 10 — Persistence & Report History (20 August 2026)
+
+Turned the in-memory analyzer into a persistent intelligence workspace.
+
+- SQLAlchemy 2.0 + Alembic + PostgreSQL (Supabase). SQLite is used only for automated tests.
+- Private Storage buckets `seller-report-uploads` and `generated-reports`. Service role key is backend-only.
+- Default development organization (`DEFAULT_ORGANIZATION_ID`). Auth is future; tenant column exists now.
+- Immutable `product_snapshots` (same ASIN can have many historical rows).
+- `analysis_runs` plus listing V2 / AI V2 / image intelligence JSONB result tables. Optional AI/image attach to the same report. Optional failure → `partial`, deterministic result kept.
+- `GET /api/v1/reports` (pagination/filters) and `GET /api/v1/reports/{id}` reconstruct the historical report with **zero** Rainforest and OpenAI calls.
+- Frontend **History** (`/history`) is saved ASIN analyses. `/reports` remains Seller Central uploads.
+- Seller report originals hashed (SHA-256) and stored. Duplicates are identified, not rejected.
+- Bulk jobs/items and generated Excel persisted. Usage events dual-written when the database is configured.
+- Live analysis still returns if save fails, with an explicit persistence warning.
+
+See [persistence-supabase.md](persistence-supabase.md), [database-schema.md](database-schema.md), and [persistence-report.md](persistence-report.md).
+
+Re-analyze current listing and report deletion are future. Re-analyze must create a new snapshot and run.
 
 ---
 
@@ -82,8 +145,9 @@ A user can:
 9. Upload a **Search Term Report** or **Business Report** and view deterministic PPC / business analytics.
 10. See compact **API Budget** cards (Rainforest account credits vs this app’s calls; OpenAI provider spend vs app-estimated cost).
 11. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI by default; Excel report after the job completes).
+12. Reopen **saved ASIN analyses** from History without calling Rainforest or OpenAI.
 
-No SP-API, Claude, database, or authentication is required.
+No SP-API, Claude, or authentication is required. Persistence is optional until `DATABASE_URL` is set.
 
 The Amazon.in public HTML lookup remains available but is experimental. Rainforest is the V1 default.
 

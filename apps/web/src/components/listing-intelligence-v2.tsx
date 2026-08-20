@@ -1,10 +1,13 @@
 "use client";
 
+import type { ReactNode } from "react";
+
 import { Panel, Section } from "@/components/ui/layout";
 import { ScoreBar, SeverityDot, SeverityLabel } from "@/components/ui/score";
 import { cn } from "@/lib/utils";
 import type {
   CoverageGroup,
+  CustomScoreResult,
   Finding,
   FindingSeverity,
   ListingAnalysisV2,
@@ -150,21 +153,73 @@ function CoveragePanel({ group }: { group: CoverageGroup }) {
   );
 }
 
-export function ListingIntelligenceV2({ analysis }: { analysis: ListingAnalysisV2 }) {
+export function ListingIntelligenceV2({
+  analysis,
+  customScore,
+  selector,
+  historical = false,
+}: {
+  analysis: ListingAnalysisV2;
+  customScore?: CustomScoreResult | null;
+  selector?: ReactNode;
+  historical?: boolean;
+}) {
   return (
     <Section
       title="Listing quality"
       description={`Deterministic listing-score-${analysis.score_version}. This is structural coverage, not a sales or conversion prediction. Bands are internal heuristics, not Amazon performance grades.`}
     >
+      {!historical && selector ? (
+        <Panel className="p-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium">Scoring Profile</p>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Custom profiles change how section scores are weighted. They do not change the
+                underlying analysis.
+              </p>
+            </div>
+            {selector}
+          </div>
+        </Panel>
+      ) : null}
+
       <Panel className="p-5">
-        <div className="grid gap-8 lg:grid-cols-[11rem_1fr] lg:items-start">
-          <div>
-            <p className="text-xs text-muted-foreground">Listing quality score</p>
-            <p className="mt-1 text-[2rem] font-semibold tabular-nums tracking-tight">
-              {analysis.listing_quality_score}
-              <span className="text-base font-medium text-muted-foreground"> / 100</span>
-            </p>
-            <p className={cn("mt-1 text-xs capitalize text-muted-foreground")}>{analysis.status}</p>
+        <div className="grid gap-8 lg:grid-cols-[16rem_1fr] lg:items-start">
+          <div className="space-y-5">
+            <div>
+              <p className="text-xs text-muted-foreground">Standard Listing Quality Score</p>
+              <p className="mt-1 text-[2rem] font-semibold tabular-nums tracking-tight">
+                {analysis.listing_quality_score}
+                <span className="text-base font-medium text-muted-foreground"> / 100</span>
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">Standard V2 · universal benchmark</p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">Custom Listing Quality Score</p>
+              {customScore ? (
+                <>
+                  <p className="mt-1 text-[2rem] font-semibold tabular-nums tracking-tight">
+                    {customScore.custom_listing_quality_score}
+                    <span className="text-base font-medium text-muted-foreground"> / 100</span>
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Profile: {customScore.profile.profile_name}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="mt-1 text-[2rem] font-semibold tabular-nums tracking-tight text-muted-foreground">
+                    —
+                    <span className="text-base font-medium"> / 100</span>
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Select or create a custom profile above to compare against Standard V2.
+                  </p>
+                </>
+              )}
+            </div>
+            <p className={cn("text-xs capitalize text-muted-foreground")}>{analysis.status}</p>
           </div>
           <div className="space-y-3">
             {QUALITY_SECTIONS.map(([key, label]) => {

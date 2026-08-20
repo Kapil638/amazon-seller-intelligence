@@ -11,16 +11,22 @@ import type {
   ListingAnalysisResponse,
   ListingAnalysisV2,
   ListingAnalysisV2Response,
+  ListingReweightResponse,
   ManualProductInput,
   Product,
   ProductResponse,
   ProductSource,
   ReportAnalysisResponse,
+  ScoringProfile,
+  ScoringProfileListResponse,
+  ScoringWeights,
   UsageDashboardResponse,
   BulkAnalysisMode,
   BulkAISelection,
   BulkIngestStats,
   BulkJobResponse,
+  SavedAnalysisDetail,
+  SavedAnalysisListResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -186,13 +192,18 @@ export async function analyzeListing(
 export async function analyzeListingV2(
   product: Product,
   source?: ProductSource,
+  scoringProfileId?: string | null,
 ): Promise<ListingAnalysisV2Response> {
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ product, source: source ?? null }),
+      body: JSON.stringify({
+        product,
+        source: source ?? null,
+        scoring_profile_id: scoringProfileId ?? null,
+      }),
     });
   } catch {
     throw new ProductLookupError(
@@ -216,6 +227,104 @@ export async function analyzeListingV2(
     detail || "Something went wrong while analyzing this listing.",
     "unknown",
   );
+}
+
+export async function reweightListingV2(payload: {
+  scoring_profile_id: string;
+  report_id?: string | null;
+  analysis?: ListingAnalysisV2;
+  persist?: boolean;
+}): Promise<ListingReweightResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/reweight`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scoring_profile_id: payload.scoring_profile_id,
+        report_id: payload.report_id ?? null,
+        analysis: payload.analysis ?? null,
+        persist: payload.persist ?? false,
+      }),
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+
+  if (response.ok) {
+    return (await response.json()) as ListingReweightResponse;
+  }
+
+  const detail = await readError(response);
+  throw new ProductLookupError(
+    detail || "The custom score could not be recalculated.",
+    response.status === 400 ? "invalid" : "unknown",
+  );
+}
+
+export async function listScoringProfiles(
+  includeArchived = false,
+): Promise<ScoringProfileListResponse> {
+  const query = includeArchived ? "?include_archived=true" : "";
+  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles${query}`);
+  if (!response.ok) {
+    const detail = await readError(response);
+    throw new ProductLookupError(detail || "Scoring profiles could not be loaded.", "unknown");
+  }
+  return (await response.json()) as ScoringProfileListResponse;
+}
+
+export async function createScoringProfile(payload: {
+  name: string;
+  description?: string | null;
+  weights: ScoringWeights;
+  is_default?: boolean;
+}): Promise<ScoringProfile> {
+  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = await readError(response);
+    throw new ProductLookupError(detail || "The scoring profile could not be saved.", "invalid");
+  }
+  return (await response.json()) as ScoringProfile;
+}
+
+export async function updateScoringProfile(
+  profileId: string,
+  payload: {
+    name?: string;
+    description?: string | null;
+    weights?: ScoringWeights;
+    is_default?: boolean;
+  },
+): Promise<ScoringProfile> {
+  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = await readError(response);
+    throw new ProductLookupError(detail || "The scoring profile could not be updated.", "invalid");
+  }
+  return (await response.json()) as ScoringProfile;
+}
+
+export async function archiveScoringProfile(profileId: string): Promise<ScoringProfile> {
+  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const detail = await readError(response);
+    throw new ProductLookupError(detail || "The scoring profile could not be archived.", "invalid");
+  }
+  return (await response.json()) as ScoringProfile;
 }
 
 export async function generateAIListingIntelligence(
@@ -270,13 +379,19 @@ export async function generateAIListingIntelligenceV2(
   product: Product,
   analysis: ListingAnalysisV2,
   source?: ProductSource,
+  reportId?: string | null,
 ): Promise<AIListingIntelligenceV2Response> {
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ product, analysis, source: source ?? null }),
+      body: JSON.stringify({
+        product,
+        analysis,
+        source: source ?? null,
+        report_id: reportId ?? null,
+      }),
     });
   } catch {
     throw new ProductLookupError(
@@ -318,13 +433,19 @@ export async function generateImageIntelligence(
   product: Product,
   analysis: ListingAnalysisV2,
   source?: ProductSource,
+  reportId?: string | null,
 ): Promise<AIImageIntelligenceResponse> {
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/images/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ product, analysis, source: source ?? null }),
+      body: JSON.stringify({
+        product,
+        analysis,
+        source: source ?? null,
+        report_id: reportId ?? null,
+      }),
     });
   } catch {
     throw new ProductLookupError(
@@ -684,4 +805,163 @@ export async function downloadBulkReport(jobId: string): Promise<void> {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+export async function fetchSavedAnalyses(params?: {
+  offset?: number;
+  limit?: number;
+  asin?: string;
+  status?: string;
+}): Promise<SavedAnalysisListResponse> {
+  const search = new URLSearchParams();
+  search.set("offset", String(params?.offset ?? 0));
+  search.set("limit", String(params?.limit ?? 20));
+  if (params?.asin) {
+    search.set("asin", params.asin);
+  }
+  if (params?.status) {
+    search.set("status", params.status);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/reports?${search.toString()}`, {
+      cache: "no-store",
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as SavedAnalysisListResponse;
+  }
+  const detail = await readError(response);
+  if (response.status === 503) {
+    throw new ProductLookupError(
+      detail || "Report history is not configured.",
+      "unavailable",
+    );
+  }
+  throw new ProductLookupError(detail || "Saved analyses could not be loaded.", "unknown");
+}
+
+export async function fetchSavedAnalysis(reportId: string): Promise<SavedAnalysisDetail> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
+      cache: "no-store",
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as SavedAnalysisDetail;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new ProductLookupError(detail || "This saved analysis was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new ProductLookupError(
+      detail || "Report history is not configured.",
+      "unavailable",
+    );
+  }
+  throw new ProductLookupError(detail || "This saved analysis could not be opened.", "unknown");
+}
+
+export type ClientPdfGenerateResponse = {
+  report_id: string;
+  generated: boolean;
+  reused: boolean;
+  filename: string;
+  template_version: string;
+};
+
+export async function generateSavedAnalysisPdf(
+  reportId: string,
+): Promise<ClientPdfGenerateResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
+      method: "POST",
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as ClientPdfGenerateResponse;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new ProductLookupError(detail || "This saved analysis was not found.", "not_found");
+  }
+  throw new ProductLookupError(detail || "PDF could not be generated. Please try again.", "unknown");
+}
+
+export async function downloadSavedAnalysisPdf(
+  reportId: string,
+  filename?: string,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
+      cache: "no-store",
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+  if (!response.ok) {
+    const detail = await readError(response);
+    if (response.status === 404) {
+      throw new ProductLookupError(detail || "This PDF is not available.", "not_found");
+    }
+    throw new ProductLookupError(detail || "PDF could not be generated. Please try again.", "unknown");
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition");
+  const matched = disposition?.match(/filename="([^"]+)"/);
+  const downloadName = filename || matched?.[1] || `Amazon-Listing-Analysis-${reportId.slice(0, 8)}.pdf`;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = downloadName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function deleteSavedAnalysis(
+  reportId: string,
+): Promise<{ report_id: string; deleted: boolean }> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
+      method: "DELETE",
+    });
+  } catch {
+    throw new ProductLookupError(
+      "Can't reach the API. Make sure the FastAPI backend is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as { report_id: string; deleted: boolean };
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new ProductLookupError(detail || "This saved analysis was not found.", "not_found");
+  }
+  throw new ProductLookupError(detail || "This report could not be deleted.", "unknown");
 }
