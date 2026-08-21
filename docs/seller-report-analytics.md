@@ -131,7 +131,7 @@ Logs include report type, file size, valid/invalid row counts, parser version, l
 
 Logs do **not** include file contents, row values, seller metrics, or filenames.
 
-Reports are ephemeral. No database, disk archive, or history.
+When `DATABASE_URL` is set, the original file (SHA-256, bytes) and analysis payload are stored via `ArtifactPersistenceService`. Seller Reports UI remains a live-upload workflow, not History.
 
 ## API
 

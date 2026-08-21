@@ -2,7 +2,7 @@
 
 AI-powered Amazon seller intelligence platform.
 
-This repository currently contains **Milestone 0–10C**: a local monorepo with mock lookup, manual product input, deterministic listing intelligence (v1 and v2), optional **custom scoring profiles** (aggregate weights only), Rainforest real-ASIN lookup, AI listing strategy (V2 primary, V1 unchanged), optional image/media vision, competitor discovery and comparison, Seller Central report analytics, API usage, mock-only bulk ASIN due diligence, **persistent report history**, **soft-delete of saved analyses**, and **client PDF export** of historical reports.
+This repository currently contains **Milestone 0–11A**: a local monorepo with mock lookup, manual product input, deterministic listing intelligence (v1 and v2), optional **custom scoring profiles** (aggregate weights only), Rainforest real-ASIN lookup, AI listing strategy (V2 primary, V1 unchanged), optional image/media vision, competitor discovery and comparison, Seller Central report analytics, API usage, mock-only bulk ASIN due diligence, **persistent report history**, **soft-delete of saved analyses**, **client PDF export** of historical reports, and an **internal intelligence tool layer** for future Copilot (no chat UI yet).
 
 ## What this project is
 
@@ -18,11 +18,12 @@ Right now the app does these things:
 6. Optionally **Analyze Images & Media** — multimodal visual intelligence. Separate from listing-quality scores. Explicit click only.
 7. **Discover candidate competitors** via Rainforest Amazon search. The seller still chooses up to three.
 8. Compare selected or manually entered competitor ASINs — deterministic comparison, then optional AI competitive insights.
-9. Upload a **Sponsored Products Search Term Report** or **Business Report** and run deterministic PPC / business analytics. No AI. No database.
+9. Upload a **Sponsored Products Search Term Report** or **Business Report** and run deterministic PPC / business analytics. No AI. Uploads are persisted when the database is configured.
 10. See **API Budget** at the top of the app — Rainforest account credits and OpenAI spend (provider vs this app).
 11. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI only in this milestone).
 12. Reopen **saved ASIN analyses** from **History** without calling Rainforest or OpenAI again. Export a client PDF or soft-delete a report from History; neither refreshes Amazon or AI data.
 13. Create organization **scoring profiles** that change only the V2 aggregate weights. Standard V2 remains the benchmark.
+14. Internal **intelligence tools** (`get_saved_report`, `list_saved_reports`, `analyze_listing_v2`, `get_product`) wrap those services for a future Copilot. There is no Copilot chat UI yet.
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -204,6 +205,7 @@ Full rule thresholds: [docs/listing-intelligence.md](docs/listing-intelligence.m
 │   │       ├── parsers/
 │   │       ├── providers/
 │   │       ├── services/
+│   │       ├── copilot/
 │   │       └── core/
 │   └── web/                 Next.js frontend
 ├── docs/
@@ -246,7 +248,7 @@ For tests with pip, also install `pytest`, `httpx`, and `pytest-asyncio`.
 
 Copy `apps/api/.env.example` to `apps/api/.env`. For real ASIN lookup set `RAINFOREST_API_KEY`. For AI recommendations set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` (default `gpt-5.4`). For saved History set `DATABASE_URL` (and Storage keys if you want uploaded/generated files kept). Keys stay in that backend file only. Never put them in Next.js or `NEXT_PUBLIC_*`. CORS is already set for `http://localhost:3000`.
 
-Persistence setup: [docs/persistence-supabase.md](docs/persistence-supabase.md). Schema: [docs/database-schema.md](docs/database-schema.md). Custom scoring profiles: [docs/custom-scoring-profiles.md](docs/custom-scoring-profiles.md). Report lifecycle: [docs/report-lifecycle.md](docs/report-lifecycle.md). Client PDFs: [docs/client-pdf-reports.md](docs/client-pdf-reports.md). Completion records: [docs/persistence-report.md](docs/persistence-report.md), [docs/custom-scoring-profiles-report.md](docs/custom-scoring-profiles-report.md).
+Persistence setup: [docs/persistence-supabase.md](docs/persistence-supabase.md). Schema: [docs/database-schema.md](docs/database-schema.md). Custom scoring profiles: [docs/custom-scoring-profiles.md](docs/custom-scoring-profiles.md). Report lifecycle: [docs/report-lifecycle.md](docs/report-lifecycle.md). Client PDFs: [docs/client-pdf-reports.md](docs/client-pdf-reports.md). Intelligence tools: [docs/milestone-11/copilot-tool-layer.md](docs/milestone-11/copilot-tool-layer.md). Completion records: [docs/persistence-report.md](docs/persistence-report.md), [docs/custom-scoring-profiles-report.md](docs/custom-scoring-profiles-report.md), [docs/milestone-11/milestone-11a-report.md](docs/milestone-11/milestone-11a-report.md).
 
 ```bash
 cd apps/api
@@ -362,5 +364,6 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 - OpenAI **provider spend** needs an Admin API key (`OPENAI_ADMIN_API_KEY`). App-estimated cost is calculated from response token usage and is not authoritative provider billing.
 - Bulk due diligence currently uses **mock product and mock AI providers**. Live Rainforest/OpenAI bulk is guarded off. Bulk **Excel** export is implemented; PDF export is not. See [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md).
 - No authentication yet. A default development organization scopes persisted rows. RLS does not isolate users today because there is no login.
+- Intelligence tools exist in `app.copilot` for a future Copilot. There is **no** `/copilot` UI, OpenAI planner, or RAG yet. See [docs/milestone-11/copilot-tool-layer.md](docs/milestone-11/copilot-tool-layer.md).
 - Re-analyze current listing (new snapshot + new report) and report deletion are not implemented.
 - India marketplace (`amazon.in`) only. Report money is treated as INR.

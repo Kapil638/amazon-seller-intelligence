@@ -1,10 +1,26 @@
 # Amazon Seller Intelligence — Change Summary
 
-**Date:** 20 August 2026  
-**Scope:** Milestone 10C.1 Professional PDF Design V2  
-**Status:** Milestone 10C.1 complete. Authentication, SP-API, Ads API, Redis/Celery, Reviews API, Offers API, hard delete, Recycle Bin, email/public PDFs, and white-label templates were not started.
+**Date:** 21 August 2026  
+**Scope:** Milestone 11A Intelligence Tool Layer  
+**Status:** Milestone 11A complete. 11B Copilot chat, OpenAI planner, RAG, MCP, SP-API, Ads API, Redis/Celery, and authentication were not started.
 
 This document records what was built and updated. It is a change log, not a product spec.
+
+---
+
+## Milestone 11A — Intelligence Tool Layer (21 August 2026)
+
+Internal Python tool registry so future Copilot can call trusted wrappers instead of application services. No chat UI. No new REST routes. No scoring duplication.
+
+- `app.copilot`: registry, evidence envelope, budget policy, four tools (`get_saved_report`, `list_saved_reports`, `analyze_listing_v2`, `get_product`).
+- `execute()` requires a `BudgetTracker`. Planner catalog is `{name, description, input_schema, cost, confirmation_required}` — no handlers. `analyze_listing_v2` accepts ASIN only (manual product input stays on the existing listing V2 HTTP API).
+- `confirmed=True` is application permission; a `confirmed` key in model JSON is ignored.
+- Tools wrap `AnalysisHistoryService`, `ListingAnalysisV2Service`, and `ProductService`. Analyze / History / Reports / Bulk contracts are unchanged.
+- Evidence claims are typed (`observed` / `calculated` / `historical` / …). History remains organization-scoped.
+- Budget: 4 tools per turn; first product lookup allowed; further product lookups and any search/OpenAI cost require confirmation. OpenAI is unused in 11A.
+- Tests are offline (mock + SQLite). Alembic `0001`–`0003` were not modified.
+
+See [milestone-11/copilot-tool-layer.md](milestone-11/copilot-tool-layer.md). Completion record: [milestone-11/milestone-11a-report.md](milestone-11/milestone-11a-report.md). Code review: [milestone-11/milestone-11a-code-review.md](milestone-11/milestone-11a-code-review.md).
 
 ---
 
