@@ -1,0 +1,190 @@
+{
+  "checkpoint_name": "pre-amazon-api-data-backbone",
+  "date": "2026-08-22",
+  "documentation_only": true,
+  "not_runtime_config": true,
+  "git_head": "e3311821053b930c84301d85c9569bb8e2fa1b3e",
+  "git_head_message": "feat(copilot): complete milestone 11D.1 copilot domain tools",
+  "parent_head": "0a21a88a62ad7fe88b5744fc1e2dec46c8aabb38",
+  "parent_head_message": "feat(advertising): complete milestone 11C.2 advertising intelligence foundation",
+  "annotated_tag": "pre-amazon-api-data-backbone",
+  "branch": "main",
+  "remote": "https://github.com/Kapil638/amazon-seller-intelligence.git",
+  "test_baseline": {
+    "backend": { "command": "cd apps/api && uv run pytest", "passed": 472 },
+    "frontend": { "command": "cd apps/web && npm test", "passed": 20 }
+  },
+  "completed_milestones": [
+    {
+      "id": "mvp",
+      "commit": "7c12db9",
+      "status": "complete"
+    },
+    {
+      "id": "listing-intelligence-v2-ai-8c",
+      "commit": "901fa4b",
+      "status": "complete"
+    },
+    {
+      "id": "listing-v2-image-intelligence",
+      "commit": "7b5a050",
+      "status": "complete"
+    },
+    {
+      "id": "history-scoring-pdf",
+      "commit": "c0706cb",
+      "status": "complete"
+    },
+    {
+      "id": "11A",
+      "name": "Intelligence Tool Layer",
+      "commit": "834a79b",
+      "status": "complete"
+    },
+    {
+      "id": "11B",
+      "name": "Seller Copilot Foundation",
+      "commit": "c3b75d4",
+      "status": "complete"
+    },
+    {
+      "id": "11C.1",
+      "name": "Profit Intelligence Foundation",
+      "commit": "171e668",
+      "status": "complete",
+      "calculation_version": "profit-calc-v1"
+    },
+    {
+      "id": "11C.2",
+      "name": "Advertising Intelligence Foundation",
+      "commit": "0a21a88",
+      "status": "complete",
+      "calculation_version": "ads-calc-v1",
+      "adr": "0001"
+    },
+    {
+      "id": "11D",
+      "name": "Skill Architecture Foundation",
+      "commit": "e331182",
+      "status": "architecture_only",
+      "document": "docs/milestone-11d-architecture.md"
+    },
+    {
+      "id": "11D.1",
+      "name": "Copilot Domain Tool Enablement Foundation",
+      "commit": "e331182",
+      "status": "complete",
+      "document": "docs/milestone-11/milestone-11d1-copilot-domain-tools.md"
+    }
+  ],
+  "architecture": {
+    "tool_registry": "frozen_11A",
+    "evidence": "EvidenceEnvelope_unchanged",
+    "copilot": "frozen_11B",
+    "listing": "engine_snapshots_tools_available",
+    "profit": "engine_snapshots_tools_available",
+    "advertising": "engine_snapshots_tools_available",
+    "skills": "architecture_only"
+  },
+  "registered_copilot_tools": [
+    {
+      "name": "list_saved_reports",
+      "cost": "none",
+      "confirmation_required": false
+    },
+    {
+      "name": "get_saved_report",
+      "cost": "none",
+      "confirmation_required": false
+    },
+    {
+      "name": "analyze_listing_v2",
+      "cost": "rainforest_product",
+      "confirmation_required": true
+    },
+    {
+      "name": "get_product",
+      "cost": "rainforest_product",
+      "confirmation_required": true
+    },
+    {
+      "name": "get_profit_snapshot",
+      "cost": "none",
+      "confirmation_required": false
+    },
+    {
+      "name": "analyze_profitability",
+      "cost": "none",
+      "confirmation_required": false
+    },
+    {
+      "name": "get_advertising_snapshot",
+      "cost": "none",
+      "confirmation_required": false
+    },
+    {
+      "name": "analyze_advertising_impact",
+      "cost": "none",
+      "confirmation_required": false
+    }
+  ],
+  "calculation_versions": ["profit-calc-v1", "ads-calc-v1"],
+  "copilot_intents": [
+    "explain_listing_score",
+    "summarize_report",
+    "list_history",
+    "analyze_asin",
+    "what_changed",
+    "explain_profit",
+    "explain_advertising_impact",
+    "out_of_scope",
+    "clarify"
+  ],
+  "current_data_sources": {
+    "listing": ["saved_history", "rainforest", "mock", "manual_product", "amazon_public_experimental"],
+    "profit": ["seller_provided_unit_inputs"],
+    "advertising": ["seller_provided_period_worksheet"],
+    "seller_reports": ["uploaded_str_and_business_reports"],
+    "interpretation": ["openai_language_only"]
+  },
+  "frozen_principles": [
+    "Deterministic Python owns facts and calculations",
+    "AI owns language, planning proposals, and explanation",
+    "ToolRegistry is the technical execution boundary",
+    "EvidenceEnvelope is the trust boundary",
+    "Historical snapshots are immutable",
+    "Missing data remains unknown",
+    "AI must not invent money, COGS, ACOS, TACOS, ROAS, listing scores, rankings, conversion rates, or search volume",
+    "No Amazon write actions",
+    "Human confirmation is required where provider or API cost or future action policy requires it",
+    "Skills, when implemented later, sit above tools",
+    "Intelligence domains remain independent",
+    "No LangGraph, CrewAI, or autonomous agent architecture is currently required"
+  ],
+  "future_data_sources": [
+    "Amazon SP-API",
+    "Amazon Ads API",
+    "Rainforest",
+    "Seller report uploads",
+    "Seller-provided private cost inputs"
+  ],
+  "explicitly_not_implemented": [
+    "SP-API",
+    "Ads API",
+    "OAuth account connection",
+    "Skill Registry",
+    "Skill implementation",
+    "LangGraph",
+    "CrewAI",
+    "autonomous agents",
+    "Amazon writes"
+  ],
+  "resume_after_data_backbone": [
+    "Skill Registry implementation",
+    "First Skill implementation",
+    "Profit Improvement Skill",
+    "Advertising Optimization Skill",
+    "Business Diagnostic"
+  ],
+  "pause_statement": "Skill implementation is intentionally paused at Milestone 11D.1 while ASI builds the Amazon-connected data backbone. After SP-API / Ads API foundations are mature, Skill implementation resumes from this checkpoint."
+}

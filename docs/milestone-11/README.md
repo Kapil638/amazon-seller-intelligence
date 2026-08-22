@@ -17,6 +17,8 @@ Turn Amazon Seller Intelligence from a feature menu of reports into a Copilot th
 | [milestone-11c2-advertising-foundation.md](milestone-11c2-advertising-foundation.md) | **11C.2 Advertising Intelligence foundation** (implemented) |
 | [../milestone-11d-architecture.md](../milestone-11d-architecture.md) | **11D Skill Architecture Foundation** (architecture only; not implemented) |
 | [milestone-11d1-copilot-domain-tools.md](milestone-11d1-copilot-domain-tools.md) | **11D.1 Copilot domain tools** for profit and advertising (implemented; not Skills) |
+| [../checkpoints/pre-amazon-api-data-backbone-checkpoint.md](../checkpoints/pre-amazon-api-data-backbone-checkpoint.md) | **Checkpoint:** freeze before SP-API / Ads API (through 11D.1) |
+| [../checkpoints/post-data-backbone-resume-plan.md](../checkpoints/post-data-backbone-resume-plan.md) | Resume Skill work after connected Amazon data is mature |
 | [copilot-tool-layer.md](copilot-tool-layer.md) | 11A tool layer behavior (registry, evidence, budgets) |
 | [milestone-11a-report.md](milestone-11a-report.md) | 11A initial completion record |
 | [milestone-11a-code-review.md](milestone-11a-code-review.md) | Pre-hardening review (B; High items later closed) |
