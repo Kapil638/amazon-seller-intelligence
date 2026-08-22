@@ -20,7 +20,7 @@ The first **Advertising Intelligence** engine, nested in the Profit workspace. A
 - Keep historical advertising snapshots
 - Read evidence-backed advertising claims
 
-Python owns all advertising math. The browser does not calculate ACOS/TACOS/ROAS. Copilot does not call advertising tools yet (11C.4).
+Python owns all advertising math. The browser does not calculate ACOS/TACOS/ROAS. Copilot reads advertising snapshots through ToolRegistry (11D.1). Skills are not implemented.
 
 ```text
 Seller advertising inputs

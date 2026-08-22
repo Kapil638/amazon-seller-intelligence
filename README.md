@@ -23,8 +23,8 @@ Right now the app does these things:
 11. Upload a CSV/XLSX of ASINs for **Bulk Due Diligence** (mock catalog and mock AI only in this milestone).
 12. Reopen **saved ASIN analyses** from **History** without calling Rainforest or OpenAI again. Export a client PDF or soft-delete a report from History; neither refreshes Amazon or AI data.
 13. Create organization **scoring profiles** that change only the V2 aggregate weights. Standard V2 remains the benchmark.
-14. Internal **intelligence tools** (`get_saved_report`, `list_saved_reports`, `analyze_listing_v2`, `get_product`) wrap those services for Copilot. Copilot explains listing evidence; it does not calculate money.
-15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. On the same worksheet, enter a period of advertising spend to see ACOS, TACOS, ROAS, and profit after ads. Copilot does not call profit or ads tools yet.
+14. Internal **intelligence tools** wrap Listing, Profit, and Advertising services for Copilot (`get_saved_report`, `analyze_listing_v2`, `get_profit_snapshot`, `get_advertising_snapshot`, and related tools). Copilot explains evidence; Python still owns scores and money math. These tools are not Skills.
+15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. On the same worksheet, enter a period of advertising spend to see ACOS, TACOS, ROAS, and profit after ads. Copilot can read those snapshots through ToolRegistry; it does not recalculate them.
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -394,6 +394,6 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 - OpenAI **provider spend** needs an Admin API key (`OPENAI_ADMIN_API_KEY`). App-estimated cost is calculated from response token usage and is not authoritative provider billing.
 - Bulk due diligence currently uses **mock product and mock AI providers**. Live Rainforest/OpenAI bulk is guarded off. Bulk **Excel** export is implemented; PDF export is not. See [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md).
 - No authentication yet. A default development organization scopes persisted rows. RLS does not isolate users today because there is no login.
-- Intelligence tools and Copilot V1 exist: `/copilot` uses plan → execute/confirm → synthesize. Analyze, History, Reports, Bulk, and **Profit** remain the expert surfaces. Profit math is Python-only (`profit-calc-v1`). There is **no** RAG or Amazon write path. See [docs/milestone-11/milestone-11c1-profit-foundation.md](docs/milestone-11/milestone-11c1-profit-foundation.md).
+- Intelligence tools and Copilot V1 exist: `/copilot` uses plan → execute/confirm → synthesize. Analyze, History, Reports, Bulk, and **Profit** remain the expert surfaces. Profit math is Python-only (`profit-calc-v1`). Advertising math is Python-only (`ads-calc-v1`). Copilot profit/ads tools read those engines through ToolRegistry. Skills are not implemented. There is **no** RAG or Amazon write path. See [docs/milestone-11/milestone-11d1-copilot-domain-tools.md](docs/milestone-11/milestone-11d1-copilot-domain-tools.md).
 - Re-analyze current listing (new snapshot + new report) and report deletion are not implemented.
 - India marketplace (`amazon.in`) only. Report money is treated as INR.

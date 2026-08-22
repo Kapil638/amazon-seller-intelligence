@@ -19,6 +19,8 @@ Intent = Literal[
     "list_history",
     "analyze_asin",
     "what_changed",
+    "explain_profit",
+    "explain_advertising_impact",
     "out_of_scope",
     "clarify",
 ]
@@ -29,6 +31,8 @@ INTENT_VALUES: tuple[str, ...] = (
     "list_history",
     "analyze_asin",
     "what_changed",
+    "explain_profit",
+    "explain_advertising_impact",
     "out_of_scope",
     "clarify",
 )

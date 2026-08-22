@@ -60,6 +60,17 @@ class AdvertisingModelingService:
             ads = self._get_or_create(session, org_id, profit)
             return self._to_response(session, org_id, ads)
 
+    def get_existing_for_profit_model(self, profit_model_id: UUID) -> AdvertisingModelResponse | None:
+        """Read-only. Does not create an advertising worksheet."""
+        self._require_persistence()
+        with session_scope() as session:
+            org_id = current_organization_id()
+            profit = self._require_profit(session, org_id, profit_model_id)
+            ads = AdvertisingModelRepository(session).get_for_profit_model(org_id, profit.id)
+            if ads is None:
+                return None
+            return self._to_response(session, org_id, ads)
+
     def update(self, profit_model_id: UUID, payload: AdvertisingUpdate) -> AdvertisingModelResponse:
         self._require_persistence()
         with session_scope() as session:

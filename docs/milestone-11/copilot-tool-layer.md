@@ -72,7 +72,9 @@ Each claim has `key`, `value`, `kind`, `source`, `confidence`, optional `as_of` 
 
 Scores in claims are copied from services. The tool layer does not recompute them.
 
-## Registered tools (11A)
+`list_tools()` / `get_tool()` return `{name, description, input_schema, cost, confirmation_required}` only. Handlers stay private.
+
+## Registered tools (11A–11D.1)
 
 | Name | Wraps | Copilot input | Typical cost |
 | --- | --- | --- | --- |
@@ -80,10 +82,14 @@ Scores in claims are copied from services. The tool layer does not recompute the
 | `list_saved_reports` | `AnalysisHistoryService.list_reports` | `{ asin?, limit? }` | none |
 | `analyze_listing_v2` | `ProductService` then `ListingAnalysisV2Service.analyze` | `{ asin, marketplace? }` | Rainforest product |
 | `get_product` | `ProductService.fetch_product` | `{ asin, marketplace? }` | Rainforest product |
+| `get_profit_snapshot` | `ProfitModelingService` latest snapshot | `{ profit_model_id? , asin? }` | none |
+| `analyze_profitability` | `ProfitModelingService.calculate` (`profit-calc-v1`) | same | none |
+| `get_advertising_snapshot` | Advertising modeling latest snapshot | same | none |
+| `analyze_advertising_impact` | `AdvertisingImpactService.compose` on stored snapshots | same | none |
+
+Profit and advertising tools are **not Skills**. See [milestone-11d1-copilot-domain-tools.md](milestone-11d1-copilot-domain-tools.md).
 
 `analyze_listing_v2` does **not** accept a `product` object. A fabricated listing must not be scored as Amazon-observed data. Manual / seller-entered listings remain on `POST /api/v1/analysis/listing/v2`.
-
-`list_tools()` / `get_tool()` return `{name, description, input_schema, cost, confirmation_required}` only. Handlers stay private.
 
 `marketplace` defaults to the configured default (`amazon.in`).
 
@@ -142,6 +148,8 @@ apps/api/app/copilot/
         history.py       get_saved_report, list_saved_reports
         listing.py       analyze_listing_v2
         product.py       get_product
+        profit.py        get_profit_snapshot, analyze_profitability
+        advertising.py   get_advertising_snapshot, analyze_advertising_impact
 ```
 
 ## Tests

@@ -27,6 +27,10 @@ _TOOL_LABELS = {
     "list_saved_reports": "Saved analyses",
     "analyze_listing_v2": "Listing analysis",
     "get_product": "Product lookup",
+    "get_profit_snapshot": "Profit snapshot",
+    "analyze_profitability": "Profit calculation",
+    "get_advertising_snapshot": "Advertising snapshot",
+    "analyze_advertising_impact": "Advertising impact",
 }
 
 _CONTEXT_KEYS = (
@@ -155,8 +159,8 @@ def template_response(
     if intent == "out_of_scope":
         return _canned(
             summary=(
-                "Competitor comparison, PPC, and profit questions are not available in "
-                "Copilot yet. Use Analyze for competitor discovery."
+                "Competitor comparison, campaign PPC, and product-launch questions are not "
+                "available in Copilot yet. Use Analyze for competitor discovery."
             ),
             confidence="none",
             extras=extras,
@@ -185,6 +189,43 @@ def template_response(
     recs_fact = _first(facts, "recommendations")
     reports_fact = _first(facts, "reports")
     total_fact = _first(facts, "total")
+    profit_fact = _first(facts, "net_profit_before_ads")
+    margin_fact = _first(facts, "margin_before_ads")
+    roi_fact = _first(facts, "roi_on_cogs")
+    acos_fact = _first(facts, "acos")
+    tacos_fact = _first(facts, "tacos")
+    after_ads_fact = _first(facts, "net_profit_after_ads")
+
+    if profit_fact is not None:
+        if profit_fact.kind == "unknown" or profit_fact.value is None:
+            findings.append("Unit profit before ads is unknown.")
+        else:
+            findings.append(f"Unit profit before ads: {profit_fact.value}")
+        _add_citation(citations, _citation(profit_fact))
+    if margin_fact is not None and margin_fact.value is not None and margin_fact.kind != "unknown":
+        findings.append(f"Margin before ads: {margin_fact.value}")
+        _add_citation(citations, _citation(margin_fact))
+    if roi_fact is not None and roi_fact.value is not None and roi_fact.kind != "unknown":
+        findings.append(f"ROI on COGS: {roi_fact.value}")
+        _add_citation(citations, _citation(roi_fact))
+    if acos_fact is not None:
+        if acos_fact.kind == "unknown" or acos_fact.value is None:
+            findings.append("ACOS is unknown.")
+        else:
+            findings.append(f"ACOS: {acos_fact.value}")
+        _add_citation(citations, _citation(acos_fact))
+    if tacos_fact is not None:
+        if tacos_fact.kind == "unknown" or tacos_fact.value is None:
+            findings.append("TACOS is unknown.")
+        else:
+            findings.append(f"TACOS: {tacos_fact.value}")
+        _add_citation(citations, _citation(tacos_fact))
+    if after_ads_fact is not None:
+        if after_ads_fact.kind == "unknown" or after_ads_fact.value is None:
+            findings.append("Profit after ads is unknown.")
+        else:
+            findings.append(f"Profit after ads: {after_ads_fact.value}")
+        _add_citation(citations, _citation(after_ads_fact))
 
     if score_fact is not None:
         findings.append(f"Listing quality score: {score_fact.value}")
@@ -235,6 +276,10 @@ def template_response(
             f"Your listing analysis identified improvement opportunities. "
             f"The listing quality score is {score_fact.value}."
         )
+    elif profit_fact is not None:
+        summary = "Your profit snapshot is ready to explain. Copilot does not recalculate these numbers."
+    elif acos_fact is not None or after_ads_fact is not None:
+        summary = "Your advertising snapshot is ready to explain. Copilot does not recalculate ACOS or profit."
     elif total_fact is not None:
         summary = f"You have {total_fact.value} saved analyses related to this question."
     else:

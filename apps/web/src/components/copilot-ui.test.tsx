@@ -64,6 +64,16 @@ describe("copilot view mappers", () => {
     expect(items.every((item) => !containsHiddenTerm(item.label))).toBe(true);
   });
 
+  it("maps profit tool activity without calling it a Skill", () => {
+    const items = activityFromPlan({
+      ...plan,
+      intent: "explain_profit",
+      tool_calls: [{ name: "get_profit_snapshot", arguments: { asin: "B0TEST0001" } }],
+    });
+    expect(items.map((item) => item.label)).toContain("Retrieved profit snapshot");
+    expect(items.map((item) => item.label).join(" ")).not.toMatch(/Skill/i);
+  });
+
   it("never puts confirmed on execute payloads", () => {
     expect(executePayload(plan)).toEqual({ plan_id: "plan-1", plan_hash: "abc123" });
     expect("confirmed" in executePayload(plan)).toBe(false);

@@ -39,6 +39,8 @@ const INTENT_LABELS: Record<string, string> = {
   list_history: "Reviewing saved analyses",
   analyze_asin: "Analyzing this ASIN",
   what_changed: "Looking at what changed",
+  explain_profit: "Explaining profit evidence",
+  explain_advertising_impact: "Explaining advertising impact",
   out_of_scope: "This question is outside Copilot",
   clarify: "Need a bit more detail",
 };
@@ -48,6 +50,10 @@ const TOOL_ACTIVITY: Record<string, string> = {
   get_saved_report: "Retrieved saved listing analysis",
   analyze_listing_v2: "Ran listing analysis",
   get_product: "Looked up current product data",
+  get_profit_snapshot: "Retrieved profit snapshot",
+  analyze_profitability: "Ran profit calculation",
+  get_advertising_snapshot: "Retrieved advertising snapshot",
+  analyze_advertising_impact: "Composed advertising impact",
 };
 
 const TOOL_SOURCE: Record<string, string> = {
@@ -55,6 +61,10 @@ const TOOL_SOURCE: Record<string, string> = {
   get_saved_report: "Saved listing analysis",
   analyze_listing_v2: "Listing analysis",
   get_product: "Product lookup",
+  get_profit_snapshot: "Profit snapshot",
+  analyze_profitability: "Profit calculation",
+  get_advertising_snapshot: "Advertising snapshot",
+  analyze_advertising_impact: "Advertising impact",
 };
 
 const HIDDEN_TERMS = [
@@ -210,6 +220,28 @@ export function evidenceCardsFromEnvelopes(envelopes: CopilotEvidenceEnvelope[])
         value: String(claims.title.value ?? "—"),
         source,
         date,
+      });
+    }
+    if (claims.net_profit_before_ads) {
+      cards.push({
+        id: `${envelope.evidence_id}-profit`,
+        title: "Unit profit before ads",
+        value: claims.net_profit_before_ads.value == null ? "Unknown" : String(claims.net_profit_before_ads.value),
+        source,
+        date,
+        href: "/profit",
+        hrefLabel: "Open Profit",
+      });
+    }
+    if (claims.acos) {
+      cards.push({
+        id: `${envelope.evidence_id}-acos`,
+        title: "ACOS",
+        value: claims.acos.value == null ? "Unknown" : String(claims.acos.value),
+        source,
+        date,
+        href: "/profit",
+        hrefLabel: "Open Profit",
       });
     }
   }

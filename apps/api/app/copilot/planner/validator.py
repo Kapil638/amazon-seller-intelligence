@@ -46,14 +46,12 @@ _OUT_OF_SCOPE = (
     "competitor",
     "competitors",
     "ppc",
-    "acos",
-    "advertis",
     "sponsored",
-    "profit",
-    "p&l",
     "launch this",
     "should i launch",
 )
+_PROFIT_WORDS = ("profit", "p&l", "cogs", "unit economics", "roi on cogs", "roi")
+_ADS_WORDS = ("acos", "tacos", "roas", "advertis", "after ads", "after-ads", "ad spend")
 _CHANGE_WORDS = ("changed", "vs last", "versus last", "last month", "compared to last", "what changed")
 _ANALYZE_WORDS = ("analyze", "analyse", "look up")
 _REFRESH_WORDS = ("refresh", "re-analyze", "reanalyze", "new analysis")
@@ -104,6 +102,10 @@ def infer_fallback_intent(
     text = (user_message or "").lower()
     if any(token in text for token in _OUT_OF_SCOPE):
         return "out_of_scope"
+    if any(token in text for token in _ADS_WORDS):
+        return "explain_advertising_impact"
+    if any(token in text for token in _PROFIT_WORDS) or "margin" in text:
+        return "explain_profit"
     if any(token in text for token in _CHANGE_WORDS):
         return "what_changed"
     if any(token in text for token in _REFRESH_WORDS):
@@ -147,6 +149,14 @@ def fallback_tool_calls(intent: Intent, slots: ExtractedSlots) -> list[ProposedT
             return history_first_calls(slots)
         if slots.asin:
             return [ProposedToolCall(name="analyze_listing_v2", arguments={"asin": slots.asin})]
+        return []
+    if intent == "explain_profit":
+        if slots.asin:
+            return [ProposedToolCall(name="get_profit_snapshot", arguments={"asin": slots.asin})]
+        return []
+    if intent == "explain_advertising_impact":
+        if slots.asin:
+            return [ProposedToolCall(name="get_advertising_snapshot", arguments={"asin": slots.asin})]
         return []
     return []
 
@@ -290,7 +300,13 @@ class PlanValidator:
                 else:
                     intent = (
                         fallback_intent
-                        if fallback_intent in {"clarify", "out_of_scope", "analyze_asin"}
+                        if fallback_intent in {
+                            "clarify",
+                            "out_of_scope",
+                            "analyze_asin",
+                            "explain_profit",
+                            "explain_advertising_impact",
+                        }
                         else "clarify"
                     )
                     source = "fallback_rules"
@@ -306,6 +322,9 @@ class PlanValidator:
 
         if intent in {"out_of_scope", "clarify"}:
             approved = []
+        if intent in {"explain_profit", "explain_advertising_impact"} and not slots.asin:
+            approved = []
+            intent = "clarify"
         if intent == "clarify" and not slots.asin and not slots.report_id:
             approved = []
 

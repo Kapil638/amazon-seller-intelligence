@@ -85,8 +85,12 @@ def test_planner_catalog_hides_handlers_and_product_input() -> None:
     registry = default_registry()
     names = {item.name for item in registry.list_tools()}
     assert names == {
+        "analyze_advertising_impact",
         "analyze_listing_v2",
+        "analyze_profitability",
+        "get_advertising_snapshot",
         "get_product",
+        "get_profit_snapshot",
         "get_saved_report",
         "list_saved_reports",
     }

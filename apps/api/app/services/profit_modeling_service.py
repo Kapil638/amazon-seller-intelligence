@@ -126,6 +126,20 @@ class ProfitModelingService:
                 raise ProfitModelNotFoundError(str(model_id))
             return self._to_response(repo, org_id, row)
 
+    def get_snapshot(self, snapshot_id: UUID) -> ProfitSnapshotResponse | None:
+        self._require_persistence()
+        with session_scope() as session:
+            repo = ProfitModelRepository(session)
+            org_id = current_organization_id()
+            latest = repo.get_snapshot(org_id, snapshot_id)
+            if latest is None:
+                return None
+            row = repo.get(org_id, latest.profit_model_id)
+            if row is None:
+                return None
+            response = self._to_response(repo, org_id, row, snapshot=latest)
+            return response.latest_snapshot
+
     def update_model(self, model_id: UUID, payload: ProfitModelUpdate) -> ProfitModelResponse:
         self._require_persistence()
         with session_scope() as session:

@@ -21,7 +21,7 @@ The first **Seller Profit Intelligence** engine and workspace. A seller can:
 - See evidence-backed numbers
 - Understand missing inputs
 
-Python owns all money math. The browser does not calculate profit. Copilot does not call profit tools yet (11C.4).
+Python owns all money math. The browser does not calculate profit. Copilot reads profit snapshots through ToolRegistry (11D.1). Skills are not implemented.
 
 ```text
 Seller inputs

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.validation import normalize_asin
 
@@ -45,3 +45,44 @@ class AnalyzeListingV2Input(CopilotToolInput):
 class GetProductInput(CopilotToolInput):
     asin: str
     marketplace: str | None = None
+
+
+class ProfitDomainToolInput(CopilotToolInput):
+    """Locate a profit worksheet. organization_id is server-owned and ignored."""
+
+    profit_model_id: UUID | None = None
+    asin: str | None = None
+    marketplace: str | None = None
+
+    @field_validator("asin")
+    @classmethod
+    def _normalize_asin(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        return normalize_asin(value)
+
+    @model_validator(mode="after")
+    def _require_locator(self) -> ProfitDomainToolInput:
+        if self.profit_model_id is None and not self.asin:
+            raise ValueError("Provide profit_model_id or asin.")
+        return self
+
+
+class GetProfitSnapshotInput(ProfitDomainToolInput):
+    pass
+
+
+class AnalyzeProfitabilityInput(ProfitDomainToolInput):
+    pass
+
+
+class AdvertisingDomainToolInput(ProfitDomainToolInput):
+    """Locate advertising evidence via the parent profit model or ASIN."""
+
+
+class GetAdvertisingSnapshotInput(AdvertisingDomainToolInput):
+    pass
+
+
+class AnalyzeAdvertisingImpactInput(AdvertisingDomainToolInput):
+    pass

@@ -10,7 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.copilot.evidence import EvidenceEnvelope
 
 PAID_TOOLS = frozenset({"get_product", "analyze_listing_v2"})
-FREE_TOOLS = frozenset({"list_saved_reports", "get_saved_report"})
+FREE_TOOLS = frozenset(
+    {
+        "list_saved_reports",
+        "get_saved_report",
+        "get_profit_snapshot",
+        "analyze_profitability",
+        "get_advertising_snapshot",
+        "analyze_advertising_impact",
+    }
+)
 ALLOWED_TOOLS = PAID_TOOLS | FREE_TOOLS
 
 ToolCallStatus = Literal["planned", "blocked_confirmation", "succeeded", "failed", "skipped"]
