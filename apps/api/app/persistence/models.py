@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.persistence.types import Guid, JsonPayload
@@ -251,3 +251,78 @@ class UsageEvent(Base):
     cache_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CopilotConversation(Base):
+    __tablename__ = "copilot_conversations"
+    __table_args__ = (Index("ix_copilot_conversations_org_updated", "organization_id", "updated_at"),)
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    last_report_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    previous_intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    messages: Mapped[list[CopilotMessage]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="CopilotMessage.created_at",
+    )
+    pending_confirmations: Mapped[list[CopilotPendingConfirmation]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+    )
+
+
+class CopilotMessage(Base):
+    __tablename__ = "copilot_messages"
+    __table_args__ = (
+        Index("ix_copilot_messages_org_conversation_created", "organization_id", "conversation_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    conversation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("copilot_conversations.id"), nullable=False
+    )
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    structured_payload: Mapped[dict | None] = mapped_column(JsonPayload, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    conversation: Mapped[CopilotConversation] = relationship(back_populates="messages")
+
+
+class CopilotPendingConfirmation(Base):
+    __tablename__ = "copilot_pending_confirmations"
+    __table_args__ = (
+        Index(
+            "ix_copilot_pending_confirmations_org_conversation",
+            "organization_id",
+            "conversation_id",
+        ),
+        UniqueConstraint("nonce", name="uq_copilot_pending_confirmations_nonce"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    conversation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("copilot_conversations.id"), nullable=False
+    )
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    plan_schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    conversation: Mapped[CopilotConversation] = relationship(back_populates="pending_confirmations")

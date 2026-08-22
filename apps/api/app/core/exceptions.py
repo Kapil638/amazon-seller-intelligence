@@ -166,6 +166,43 @@ class ReportNotFoundError(Exception):
         super().__init__(f"Saved analysis {report_id} was not found.")
 
 
+class ConversationNotFoundError(Exception):
+    def __init__(self, conversation_id: str) -> None:
+        self.conversation_id = conversation_id
+        super().__init__(f"Conversation {conversation_id} was not found.")
+
+
+class PlanNotFoundError(Exception):
+    def __init__(self, plan_id: str) -> None:
+        self.plan_id = plan_id
+        super().__init__(f"Validated plan {plan_id} was not found.")
+
+
+class PlanInvalidError(Exception):
+    def __init__(self, message: str = "The plan cannot be executed.") -> None:
+        super().__init__(message)
+
+
+class PlanHashMismatchError(Exception):
+    def __init__(self, message: str = "The confirmation does not match this plan.") -> None:
+        super().__init__(message)
+
+
+class ConfirmationNonceInvalidError(Exception):
+    def __init__(self, message: str = "This confirmation is not valid.") -> None:
+        super().__init__(message)
+
+
+class ConfirmationNonceExpiredError(Exception):
+    def __init__(self, message: str = "This confirmation has expired. Ask again to continue.") -> None:
+        super().__init__(message)
+
+
+class ConfirmationNonceConsumedError(Exception):
+    def __init__(self, message: str = "This confirmation was already used.") -> None:
+        super().__init__(message)
+
+
 class ScoringProfileValidationError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)

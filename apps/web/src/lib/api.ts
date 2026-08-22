@@ -27,6 +27,12 @@ import type {
   BulkJobResponse,
   SavedAnalysisDetail,
   SavedAnalysisListResponse,
+  CopilotCompactContext,
+  CopilotConversationDetail,
+  CopilotEvidenceEnvelope,
+  CopilotExecutionResult,
+  CopilotPlan,
+  CopilotSynthesizedResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -964,4 +970,131 @@ export async function deleteSavedAnalysis(
     throw new ProductLookupError(detail || "This saved analysis was not found.", "not_found");
   }
   throw new ProductLookupError(detail || "This report could not be deleted.", "unknown");
+}
+
+export class CopilotError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "unavailable" | "invalid" | "unknown",
+  ) {
+    super(message);
+    this.name = "CopilotError";
+  }
+}
+
+function copilotUrl(path: string): string {
+  return `${apiBaseUrl()}/api/v1/copilot${path}`;
+}
+
+async function copilotRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(copilotUrl(path), {
+      cache: "no-store",
+      ...init,
+      headers: {
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch {
+    throw new CopilotError(
+      "Copilot could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 503) {
+    throw new CopilotError(
+      detail || "Copilot is not configured right now. Please try again later.",
+      "unavailable",
+    );
+  }
+  if (response.status === 400 || response.status === 409 || response.status === 404) {
+    throw new CopilotError(
+      detail || "Copilot could not complete this analysis. Please try again.",
+      "invalid",
+    );
+  }
+  throw new CopilotError(
+    "Copilot could not complete this analysis. Please try again.",
+    "unknown",
+  );
+}
+
+export async function createCopilotConversation(): Promise<CopilotConversationDetail> {
+  return copilotRequest<CopilotConversationDetail>("/conversations", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export async function fetchCopilotConversation(
+  conversationId: string,
+): Promise<CopilotConversationDetail> {
+  return copilotRequest<CopilotConversationDetail>(`/conversations/${conversationId}`);
+}
+
+export async function planCopilotTurn(
+  conversationId: string,
+  userMessage: string,
+): Promise<CopilotPlan> {
+  return copilotRequest<CopilotPlan>(`/conversations/${conversationId}/plan`, {
+    method: "POST",
+    body: JSON.stringify({ user_message: userMessage }),
+  });
+}
+
+export async function executeCopilotPlan(
+  conversationId: string,
+  payload: { plan_id: string; plan_hash: string; confirmation_nonce?: string },
+): Promise<CopilotExecutionResult> {
+  const body: Record<string, string> = {
+    plan_id: payload.plan_id,
+    plan_hash: payload.plan_hash,
+  };
+  if (payload.confirmation_nonce) {
+    body.confirmation_nonce = payload.confirmation_nonce;
+  }
+  return copilotRequest<CopilotExecutionResult>(`/conversations/${conversationId}/execute`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function confirmCopilotPlan(
+  conversationId: string,
+  nonce: string,
+): Promise<CopilotExecutionResult> {
+  return copilotRequest<CopilotExecutionResult>(`/conversations/${conversationId}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({ nonce }),
+  });
+}
+
+export async function synthesizeCopilot(payload: {
+  user_message: string;
+  intent: string;
+  evidence: CopilotEvidenceEnvelope[];
+  compact_context?: CopilotCompactContext | Record<string, unknown>;
+}): Promise<CopilotSynthesizedResponse> {
+  const compact = (payload.compact_context ?? {}) as Record<string, unknown>;
+  return copilotRequest<CopilotSynthesizedResponse>("/synthesize", {
+    method: "POST",
+    body: JSON.stringify({
+      user_message: payload.user_message,
+      intent: payload.intent,
+      evidence: payload.evidence,
+      compact_context: {
+        last_asin: compact.last_asin ?? null,
+        last_report_id: compact.last_report_id ?? null,
+        previous_intent: compact.previous_intent ?? null,
+        evidence_refs: compact.evidence_refs ?? [],
+        recent_user_snippets: compact.recent_user_snippets ?? [],
+      },
+    }),
+  });
 }

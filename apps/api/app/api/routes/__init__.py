@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.competitors import router as competitors_router
+from app.api.routes.copilot import router as copilot_router
 from app.api.routes.products import router as products_router
 from app.api.routes.reports import router as reports_router
 from app.api.routes.scoring_profiles import router as scoring_profiles_router
@@ -16,3 +17,4 @@ api_router.include_router(competitors_router)
 api_router.include_router(reports_router)
 api_router.include_router(usage_router)
 api_router.include_router(bulk_router)
+api_router.include_router(copilot_router)

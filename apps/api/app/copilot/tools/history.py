@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.copilot.budget import COST_NONE
 from app.copilot.evidence import EvidenceEnvelope, claim, envelope
+from app.copilot.listing_evidence import listing_analysis_claims
 from app.copilot.registry import ToolDefinition, ToolRegistry
 from app.copilot.schemas import GetSavedReportInput, ListSavedReportsInput
 from app.services.analysis_history_service import AnalysisHistoryService
@@ -33,15 +34,6 @@ def register(registry: ToolRegistry, history: AnalysisHistoryService | None = No
 
 def _get_saved_report(history: AnalysisHistoryService, payload: GetSavedReportInput) -> EvidenceEnvelope:
     detail = history.get_report(payload.report_id)
-    findings = [
-        {
-            "code": item.code,
-            "category": item.category,
-            "severity": item.severity.value,
-            "message": item.message,
-        }
-        for item in detail.analysis.findings
-    ]
     source = "snapshot"
     as_of = detail.meta.analyzed_at
     return envelope(
@@ -59,15 +51,7 @@ def _get_saved_report(history: AnalysisHistoryService, payload: GetSavedReportIn
             ),
             claim("display_name", detail.display_name, kind="historical", source=source, as_of=as_of),
             claim("status", detail.meta.status, kind="historical", source=source, as_of=as_of),
-            claim(
-                "listing_quality_score",
-                detail.analysis.listing_quality_score,
-                kind="historical",
-                source=source,
-                as_of=as_of,
-                notes="Score from the saved analysis. Not recalculated.",
-            ),
-            claim("findings", findings, kind="historical", source=source, as_of=as_of),
+            *listing_analysis_claims(detail.analysis, kind="historical", source=source, as_of=as_of),
         ],
     )
 

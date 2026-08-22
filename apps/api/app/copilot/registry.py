@@ -70,6 +70,10 @@ class ToolRegistry:
         """Public contract for a planner. Does not include the handler."""
         return _catalog_entry(self._definition(name))
 
+    def get_input_schema(self, name: str) -> type[BaseModel]:
+        """Pydantic input model for a registered tool. Does not execute."""
+        return self._definition(name).input_schema
+
     def list_tools(self) -> list[ToolCatalogEntry]:
         """Public catalog for a planner. Sorted by name. No handlers."""
         return [_catalog_entry(self._tools[name]) for name in sorted(self._tools)]

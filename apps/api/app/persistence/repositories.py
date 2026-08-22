@@ -14,6 +14,9 @@ from app.persistence.models import (
     AnalysisRun,
     BulkJob,
     BulkJobItem,
+    CopilotConversation,
+    CopilotMessage,
+    CopilotPendingConfirmation,
     GeneratedReport,
     ImageIntelligenceResult,
     ListingAnalysisResult,
@@ -132,6 +135,28 @@ class AnalysisRunRepository:
         )
         return self.session.scalars(statement).first()
 
+    def latest_complete_for_asin(self, organization_id: UUID, asin: str) -> AnalysisRun | None:
+        normalized = asin.strip().upper()
+        statement = (
+            select(AnalysisRun)
+            .join(AnalysisRun.listing_result)
+            .options(
+                selectinload(AnalysisRun.snapshot),
+                selectinload(AnalysisRun.listing_result),
+                selectinload(AnalysisRun.ai_result),
+                selectinload(AnalysisRun.image_result),
+            )
+            .where(
+                AnalysisRun.organization_id == organization_id,
+                func.upper(AnalysisRun.asin) == normalized,
+                AnalysisRun.deleted_at.is_(None),
+                AnalysisRun.status.in_(("complete", "partial")),
+            )
+            .order_by(AnalysisRun.created_at.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
+
     def list_page(
         self,
         organization_id: UUID,
@@ -146,7 +171,7 @@ class AnalysisRunRepository:
     ) -> tuple[list[AnalysisRun], int]:
         filters = [AnalysisRun.organization_id == organization_id, AnalysisRun.deleted_at.is_(None)]
         if asin:
-            filters.append(AnalysisRun.asin == asin.upper())
+            filters.append(func.upper(AnalysisRun.asin) == asin.strip().upper())
         if marketplace:
             filters.append(AnalysisRun.marketplace == marketplace)
         if status:
@@ -578,6 +603,185 @@ class ScoringProfileRepository:
                 continue
             row.is_default = False
 
+
+class CopilotConversationRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        title: str | None = None,
+        status: str = "active",
+    ) -> CopilotConversation:
+        now = datetime.now(UTC)
+        row = CopilotConversation(
+            organization_id=organization_id,
+            title=title,
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get(self, organization_id: UUID, conversation_id: UUID) -> CopilotConversation | None:
+        return self.session.scalars(
+            select(CopilotConversation).where(
+                CopilotConversation.organization_id == organization_id,
+                CopilotConversation.id == conversation_id,
+            )
+        ).first()
+
+    def list_page(
+        self,
+        organization_id: UUID,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[CopilotConversation], int]:
+        filters = [CopilotConversation.organization_id == organization_id]
+        count = self.session.scalar(
+            select(func.count()).select_from(CopilotConversation).where(*filters)
+        ) or 0
+        statement = (
+            select(CopilotConversation)
+            .where(*filters)
+            .order_by(CopilotConversation.updated_at.desc(), CopilotConversation.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement).all()), int(count)
+
+    def add_message(
+        self,
+        *,
+        organization_id: UUID,
+        conversation: CopilotConversation,
+        role: str,
+        content: str,
+        structured_payload: dict[str, Any] | None = None,
+    ) -> CopilotMessage:
+        now = datetime.now(UTC)
+        message = CopilotMessage(
+            conversation_id=conversation.id,
+            organization_id=organization_id,
+            role=role,
+            content=content,
+            structured_payload=structured_payload,
+            created_at=now,
+        )
+        conversation.updated_at = now
+        self.session.add(message)
+        self.session.flush()
+        return message
+
+    def list_messages(self, organization_id: UUID, conversation_id: UUID) -> list[CopilotMessage]:
+        return list(
+            self.session.scalars(
+                select(CopilotMessage)
+                .where(
+                    CopilotMessage.organization_id == organization_id,
+                    CopilotMessage.conversation_id == conversation_id,
+                )
+                .order_by(CopilotMessage.created_at.asc())
+            ).all()
+        )
+
+    def get_active_pending(
+        self, organization_id: UUID, conversation_id: UUID
+    ) -> CopilotPendingConfirmation | None:
+        return self.session.scalars(
+            select(CopilotPendingConfirmation)
+            .where(
+                CopilotPendingConfirmation.organization_id == organization_id,
+                CopilotPendingConfirmation.conversation_id == conversation_id,
+                CopilotPendingConfirmation.consumed_at.is_(None),
+            )
+            .order_by(CopilotPendingConfirmation.created_at.desc())
+        ).first()
+
+    def get_plan_payload(
+        self, organization_id: UUID, conversation_id: UUID, plan_id: UUID
+    ) -> dict[str, Any] | None:
+        messages = self.list_messages(organization_id, conversation_id)
+        target = str(plan_id)
+        for message in reversed(messages):
+            payload = message.structured_payload or {}
+            if payload.get("type") != "copilot_plan":
+                continue
+            plan = payload.get("plan")
+            if isinstance(plan, dict) and str(plan.get("plan_id")) == target:
+                return plan
+        return None
+
+    def get_pending_by_nonce(
+        self, organization_id: UUID, nonce: str
+    ) -> CopilotPendingConfirmation | None:
+        return self.session.scalars(
+            select(CopilotPendingConfirmation).where(
+                CopilotPendingConfirmation.organization_id == organization_id,
+                CopilotPendingConfirmation.nonce == nonce,
+            )
+        ).first()
+
+    def create_pending(
+        self,
+        *,
+        organization_id: UUID,
+        conversation: CopilotConversation,
+        nonce: str,
+        plan_id: UUID,
+        plan_schema_version: str | None,
+        plan_hash: str,
+        summary: str | None,
+        expires_at: datetime,
+    ) -> CopilotPendingConfirmation:
+        now = datetime.now(UTC)
+        row = CopilotPendingConfirmation(
+            conversation_id=conversation.id,
+            organization_id=organization_id,
+            nonce=nonce,
+            plan_id=plan_id,
+            plan_schema_version=plan_schema_version,
+            plan_hash=plan_hash,
+            summary=summary,
+            expires_at=expires_at,
+            created_at=now,
+        )
+        conversation.status = "awaiting_confirmation"
+        conversation.updated_at = now
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def consume_pending(self, pending: CopilotPendingConfirmation) -> None:
+        now = datetime.now(UTC)
+        pending.consumed_at = now
+        conversation = self.get(pending.organization_id, pending.conversation_id)
+        if conversation is not None:
+            conversation.status = "active"
+            conversation.updated_at = now
+
+    def cancel_active_pendings(
+        self,
+        organization_id: UUID,
+        conversation_id: UUID,
+        *,
+        except_id: UUID | None = None,
+    ) -> None:
+        statement = select(CopilotPendingConfirmation).where(
+            CopilotPendingConfirmation.organization_id == organization_id,
+            CopilotPendingConfirmation.conversation_id == conversation_id,
+            CopilotPendingConfirmation.consumed_at.is_(None),
+        )
+        now = datetime.now(UTC)
+        for row in self.session.scalars(statement).all():
+            if except_id is not None and row.id == except_id:
+                continue
+            row.consumed_at = now
 
 def file_sha256(data: bytes) -> str:
     return sha256_bytes(data)

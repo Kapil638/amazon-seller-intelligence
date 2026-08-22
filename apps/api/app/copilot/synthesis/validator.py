@@ -1,0 +1,496 @@
+"""Citation validator and evidence-backed template fallback. Does not call tools."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+from uuid import UUID
+
+from app.copilot.evidence import EvidenceEnvelope
+from app.copilot.synthesis.schemas import (
+    AllowedFact,
+    EvidenceCitation,
+    ProposedFinding,
+    ProposedRecommendation,
+    SynthesisProposal,
+    SynthesizedResponse,
+)
+
+MAX_FACTS = 40
+MAX_VALUE_CHARS = 400
+MAX_FINDINGS = 6
+MAX_RECOMMENDATIONS = 5
+
+_CONFIDENCE = {"high", "medium", "low", "none"}
+_TOOL_LABELS = {
+    "get_saved_report": "Saved analysis",
+    "list_saved_reports": "Saved analyses",
+    "analyze_listing_v2": "Listing analysis",
+    "get_product": "Product lookup",
+}
+
+_CONTEXT_KEYS = (
+    "last_asin",
+    "last_report_id",
+    "previous_intent",
+    "evidence_refs",
+    "recent_user_snippets",
+)
+
+
+def sanitize_compact_context(raw: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(raw or {})
+    compact: dict[str, Any] = {}
+    for key in _CONTEXT_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if key == "recent_user_snippets" and isinstance(value, list):
+            compact[key] = [str(item)[:500] for item in value[:2]]
+        elif key == "evidence_refs" and isinstance(value, list):
+            compact[key] = value[:8]
+        else:
+            compact[key] = value
+    return compact
+
+
+def copy_evidence(envelopes: list[EvidenceEnvelope]) -> list[EvidenceEnvelope]:
+    return [item.model_copy(deep=True) for item in envelopes]
+
+
+def build_allowed_facts(envelopes: list[EvidenceEnvelope]) -> list[AllowedFact]:
+    facts: list[AllowedFact] = []
+    for item in envelopes:
+        for claim in item.claims:
+            if len(facts) >= MAX_FACTS:
+                return facts
+            facts.append(
+                AllowedFact(
+                    evidence_id=item.evidence_id,
+                    tool_name=item.tool_name,
+                    claim_key=claim.key,
+                    value=_trim_value(claim.value),
+                    kind=claim.kind,
+                    source=claim.source,
+                )
+            )
+    return facts
+
+
+def validate_proposal(
+    proposal: SynthesisProposal,
+    *,
+    facts: list[AllowedFact],
+    intent: str,
+    user_message: str,
+    prompt_version: str | None,
+    synthesis_model: str | None,
+) -> SynthesizedResponse:
+    index = _FactIndex(facts)
+    findings: list[str] = []
+    recommendations: list[str] = []
+    citations: list[EvidenceCitation] = []
+    unknowns = [str(item).strip() for item in proposal.unknowns if str(item).strip()]
+    rewritten = False
+
+    for item in proposal.findings:
+        grounded, citation, changed = index.ground_finding(item)
+        if grounded is None:
+            if item.text.strip():
+                unknowns.append("Dropped an unsupported finding.")
+            rewritten = True
+            continue
+        findings.append(grounded)
+        if citation is not None:
+            _add_citation(citations, citation)
+        rewritten = rewritten or changed
+        if len(findings) >= MAX_FINDINGS:
+            break
+
+    for item in proposal.recommendations:
+        grounded, citation, changed = index.ground_recommendation(item)
+        if grounded is None:
+            rewritten = True
+            continue
+        recommendations.append(grounded)
+        if citation is not None:
+            _add_citation(citations, citation)
+        rewritten = rewritten or changed
+        if len(recommendations) >= MAX_RECOMMENDATIONS:
+            break
+
+    summary = (proposal.summary or "").strip()
+    if not findings or not summary or _has_ungrounded_language(summary, index):
+        return template_response(
+            facts,
+            intent=intent,
+            user_message=user_message,
+            extras=unknowns,
+        )
+
+    confidence = proposal.confidence if proposal.confidence in _CONFIDENCE else "medium"
+    source = "rewritten_citations" if rewritten else "synthesis_llm"
+    response = SynthesizedResponse(
+        summary=summary[:800],
+        findings=findings,
+        recommendations=recommendations,
+        citations=citations,
+        confidence=confidence,  # type: ignore[arg-type]
+        unknowns=_unique(unknowns)[:8],
+        source=source,  # type: ignore[arg-type]
+        prompt_version=prompt_version,
+        synthesis_model=synthesis_model,
+        message="",
+    )
+    return response.model_copy(update={"message": format_seller_message(response)})
+
+
+def template_response(
+    facts: list[AllowedFact],
+    *,
+    intent: str,
+    user_message: str,
+    extras: list[str] | None = None,
+) -> SynthesizedResponse:
+    if intent == "out_of_scope":
+        return _canned(
+            summary=(
+                "Competitor comparison, PPC, and profit questions are not available in "
+                "Copilot yet. Use Analyze for competitor discovery."
+            ),
+            confidence="none",
+            extras=extras,
+        )
+    if intent == "clarify" and not facts:
+        return _canned(
+            summary="I need an ASIN or a saved analysis to continue. Paste an ASIN or open History.",
+            confidence="none",
+            extras=extras,
+        )
+    if not facts:
+        return _canned(
+            summary="I do not have analysis evidence for this question yet. Open History or confirm a new analysis.",
+            confidence="none",
+            extras=extras,
+        )
+
+    findings: list[str] = []
+    recommendations: list[str] = []
+    citations: list[EvidenceCitation] = []
+    score_fact = _first(facts, "listing_quality_score")
+    asin_fact = _first(facts, "asin")
+    section_fact = _first(facts, "section_scores")
+    weaknesses_fact = _first(facts, "weaknesses")
+    findings_fact = _first(facts, "findings")
+    recs_fact = _first(facts, "recommendations")
+    reports_fact = _first(facts, "reports")
+    total_fact = _first(facts, "total")
+
+    if score_fact is not None:
+        findings.append(f"Listing quality score: {score_fact.value}")
+        _add_citation(citations, _citation(score_fact))
+    if section_fact is not None:
+        for line in _section_score_lines(section_fact.value)[:3]:
+            findings.append(line)
+        _add_citation(citations, _citation(section_fact))
+    if asin_fact is not None and asin_fact.value:
+        if section_fact is None:
+            findings.append(f"ASIN: {asin_fact.value}")
+        _add_citation(citations, _citation(asin_fact))
+    weakness_source = weaknesses_fact or findings_fact
+    if weakness_source is not None:
+        for row in _finding_rows(weakness_source.value)[:MAX_FINDINGS]:
+            label = row.get("issue") or row.get("message") or row.get("code") or "Listing finding"
+            findings.append(f"Weak area: {label}")
+        _add_citation(citations, _citation(weakness_source))
+    if recs_fact is not None and _finding_rows(recs_fact.value):
+        for row in _finding_rows(recs_fact.value)[:MAX_RECOMMENDATIONS]:
+            action = row.get("action")
+            if action:
+                recommendations.append(str(action))
+        _add_citation(citations, _citation(recs_fact))
+    elif findings_fact is not None:
+        for row in _finding_rows(findings_fact.value)[:MAX_FINDINGS]:
+            code = row.get("code")
+            if code:
+                recommendations.append(f"Fix {code.replace('_', ' ').lower()} first.")
+    if reports_fact is not None and isinstance(reports_fact.value, list):
+        for row in reports_fact.value[:5]:
+            if not isinstance(row, dict):
+                continue
+            asin = row.get("asin") or ""
+            score = row.get("listing_quality_score")
+            findings.append(f"Saved analysis for {asin}: score {score}")
+        _add_citation(citations, _citation(reports_fact))
+        if total_fact is not None:
+            _add_citation(citations, _citation(total_fact))
+
+    findings = _unique(findings)[:MAX_FINDINGS]
+    recommendations = _unique(recommendations)[:MAX_RECOMMENDATIONS]
+    if not findings:
+        findings = ["The loaded analysis did not include a score or finding list."]
+
+    if score_fact is not None:
+        summary = (
+            f"Your listing analysis identified improvement opportunities. "
+            f"The listing quality score is {score_fact.value}."
+        )
+    elif total_fact is not None:
+        summary = f"You have {total_fact.value} saved analyses related to this question."
+    else:
+        summary = "Your listing analysis identified improvement opportunities."
+
+    confidence: str = "high" if score_fact is not None else "medium"
+    response = SynthesizedResponse(
+        summary=summary,
+        findings=findings,
+        recommendations=recommendations,
+        citations=citations,
+        confidence=confidence,  # type: ignore[arg-type]
+        unknowns=_unique(extras or []),
+        source="template_fallback",
+        prompt_version=None,
+        synthesis_model=None,
+        message="",
+    )
+    _ = user_message
+    return response.model_copy(update={"message": format_seller_message(response)})
+
+
+def format_seller_message(response: SynthesizedResponse) -> str:
+    lines = ["## Summary", response.summary, "", "## Key Findings"]
+    if response.findings:
+        lines.extend(f"- {item}" for item in response.findings)
+    else:
+        lines.append("- No evidence-backed findings were available.")
+    lines.extend(["", "## Recommended Actions"])
+    if response.recommendations:
+        lines.extend(f"- {item}" for item in response.recommendations)
+    else:
+        lines.append("- No evidence-backed actions were available.")
+    lines.extend(["", "## Evidence"])
+    if response.citations:
+        seen: set[str] = set()
+        for item in response.citations:
+            label = f"{item.claim_key} · {item.label}"
+            if label in seen:
+                continue
+            seen.add(label)
+            lines.append(f"- {label}")
+    else:
+        lines.append("- No citations.")
+    return "\n".join(lines)
+
+
+class _FactIndex:
+    def __init__(self, facts: list[AllowedFact]) -> None:
+        self.facts = facts
+        self.by_key: dict[str, list[AllowedFact]] = {}
+        self.by_id_key: dict[tuple[str, str], AllowedFact] = {}
+        self.finding_codes: dict[str, AllowedFact] = {}
+        for fact in facts:
+            self.by_key.setdefault(fact.claim_key, []).append(fact)
+            self.by_id_key[(str(fact.evidence_id), fact.claim_key)] = fact
+            if fact.claim_key == "findings":
+                for row in _finding_rows(fact.value):
+                    code = str(row.get("code") or "").strip()
+                    if code:
+                        self.finding_codes[code] = fact
+
+    def resolve(self, claim_key: str | None, evidence_id: UUID | None) -> AllowedFact | None:
+        key = (claim_key or "").strip()
+        if evidence_id is not None and key:
+            found = self.by_id_key.get((str(evidence_id), key))
+            if found is not None:
+                return found
+        if key in self.finding_codes and key not in self.by_key:
+            return self.finding_codes[key]
+        matches = self.by_key.get(key) or []
+        if evidence_id is not None:
+            for item in matches:
+                if item.evidence_id == evidence_id:
+                    return item
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return matches[0]
+        if key in self.finding_codes:
+            return self.finding_codes[key]
+        return None
+
+    def ground_finding(self, item: ProposedFinding) -> tuple[str | None, EvidenceCitation | None, bool]:
+        fact = self.resolve(item.claim_key, item.evidence_id)
+        if fact is None:
+            return None, None, True
+        text = (item.text or "").strip()
+        changed = False
+        if not text or _has_ungrounded_language(text, self):
+            text = _claim_as_finding(fact)
+            changed = True
+        if not text:
+            return None, None, True
+        return text, _citation(fact), changed
+
+    def ground_recommendation(
+        self, item: ProposedRecommendation
+    ) -> tuple[str | None, EvidenceCitation | None, bool]:
+        fact = self.resolve(item.claim_key, item.evidence_id)
+        text = (item.text or "").strip()
+        if fact is None or not text:
+            return None, None, True
+        if _has_ungrounded_language(text, self):
+            return None, None, True
+        return text, _citation(fact), False
+
+
+def _has_ungrounded_language(text: str, index: _FactIndex) -> bool:
+    lowered = (text or "").lower()
+    allowed_keys = {key.lower() for key in index.by_key}
+    if re.search(r"\bconversion\b", lowered) and not any("conversion" in key for key in allowed_keys):
+        return True
+    if any(token in lowered for token in ("ppc", "acos")) and not any(
+        key in allowed_keys for key in ("ppc", "acos")
+    ):
+        return True
+    if "profit margin" in lowered and "profit" not in allowed_keys:
+        return True
+    if "search volume" in lowered and "search_volume" not in allowed_keys:
+        return True
+    ranking_talk = any(
+        token in lowered
+        for token in ("amazon ranking", "organic rank", "bestseller rank", "amazon will penal", "amazon policy")
+    )
+    if ranking_talk and not any(key in {"bsr", "rank", "ranking"} or "rank" in key for key in allowed_keys):
+        return True
+    return False
+
+
+def _claim_as_finding(fact: AllowedFact) -> str:
+    if fact.claim_key == "listing_quality_score":
+        return f"Listing quality score: {fact.value}"
+    if fact.claim_key == "asin":
+        return f"ASIN: {fact.value}"
+    if fact.claim_key == "findings":
+        rows = _finding_rows(fact.value)
+        if not rows:
+            return "The listing analysis recorded findings."
+        first = rows[0]
+        label = first.get("issue") or first.get("message") or first.get("code") or "listing finding"
+        return f"Your listing analysis identified this weakness: {label}"
+    if fact.claim_key == "weaknesses":
+        rows = _finding_rows(fact.value)
+        if not rows:
+            return "The listing analysis recorded weaknesses."
+        first = rows[0]
+        label = first.get("issue") or first.get("code") or "listing weakness"
+        return f"Your listing analysis identified this weakness: {label}"
+    if fact.claim_key == "section_scores":
+        lines = _section_score_lines(fact.value)
+        if lines:
+            return f"Lowest section score — {lines[0]}"
+        return "Section scores are available from the listing analysis."
+    if fact.claim_key == "recommendations":
+        rows = _finding_rows(fact.value)
+        if not rows:
+            return "The listing analysis recorded recommended actions."
+        action = rows[0].get("action") or "Improve the listing using saved analysis findings."
+        return f"Your listing analysis recommended: {action}"
+    if fact.claim_key == "total":
+        return f"Saved analyses found: {fact.value}"
+    value = fact.value
+    if isinstance(value, (dict, list)):
+        return f"{fact.claim_key} from { _tool_label(fact.tool_name) }"
+    return f"{fact.claim_key}: {value}"
+
+
+def _citation(fact: AllowedFact) -> EvidenceCitation:
+    return EvidenceCitation(
+        evidence_id=fact.evidence_id,
+        claim_key=fact.claim_key,
+        tool_name=fact.tool_name,
+        label=_tool_label(fact.tool_name),
+    )
+
+
+def _tool_label(name: str) -> str:
+    return _TOOL_LABELS.get(name, "Analysis evidence")
+
+
+def _finding_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _section_score_lines(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    rows: list[tuple[int, str]] = []
+    for item in value.values():
+        if not isinstance(item, dict):
+            continue
+        score = item.get("score")
+        max_score = item.get("max_score")
+        label = item.get("label") or "Section"
+        if score is None or max_score is None:
+            continue
+        rows.append((int(score), f"{label}: {score}/{max_score}"))
+    rows.sort(key=lambda pair: pair[0])
+    return [line for _score, line in rows]
+
+
+def _first(facts: list[AllowedFact], key: str) -> AllowedFact | None:
+    for item in facts:
+        if item.claim_key == key:
+            return item
+    return None
+
+
+def _trim_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:MAX_VALUE_CHARS]
+    if isinstance(value, list):
+        return [_trim_value(item) for item in value[:12]]
+    if isinstance(value, dict):
+        return {str(key): _trim_value(item) for key, item in list(value.items())[:20]}
+    return value
+
+
+def _add_citation(citations: list[EvidenceCitation], item: EvidenceCitation) -> None:
+    key = (str(item.evidence_id), item.claim_key)
+    if any((str(existing.evidence_id), existing.claim_key) == key for existing in citations):
+        return
+    citations.append(item)
+
+
+def _unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = item.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _canned(*, summary: str, confidence: str, extras: list[str] | None) -> SynthesizedResponse:
+    response = SynthesizedResponse(
+        summary=summary,
+        findings=[],
+        recommendations=[],
+        citations=[],
+        confidence=confidence,  # type: ignore[arg-type]
+        unknowns=_unique(extras or []),
+        source="template_fallback",
+        prompt_version=None,
+        synthesis_model=None,
+        message="",
+    )
+    return response.model_copy(update={"message": format_seller_message(response)})

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.copilot.budget import COST_RAINFOREST_PRODUCT
 from app.copilot.evidence import EvidenceEnvelope, claim, envelope
+from app.copilot.listing_evidence import listing_analysis_claims
 from app.copilot.registry import ToolDefinition, ToolRegistry
 from app.copilot.schemas import AnalyzeListingV2Input
 from app.core.config import get_settings
@@ -47,15 +48,6 @@ async def _analyze_listing_v2(
     marketplace = payload.marketplace or get_settings().default_marketplace
     product, origin = await products.fetch_product(payload.asin, marketplace)
     analysis = analyzer.analyze(product)
-    findings = [
-        {
-            "code": item.code,
-            "category": item.category,
-            "severity": item.severity.value,
-            "message": item.message,
-        }
-        for item in analysis.findings
-    ]
     signals = analysis.market_signals
     market = {
         "rating": signals.rating,
@@ -68,14 +60,7 @@ async def _analyze_listing_v2(
         "analyze_listing_v2",
         [
             claim("asin", product.asin, kind="observed", source=origin),
-            claim(
-                "listing_quality_score",
-                analysis.listing_quality_score,
-                kind="calculated",
-                source="derived",
-                notes="Deterministic Listing Intelligence V2 score.",
-            ),
-            claim("score_version", analysis.score_version, kind="calculated", source="derived"),
+            *listing_analysis_claims(analysis, kind="calculated", source="derived"),
             claim("status", analysis.status.value, kind="calculated", source="derived"),
             claim(
                 "coverage_overall_percentage",
@@ -83,7 +68,6 @@ async def _analyze_listing_v2(
                 kind="calculated",
                 source="derived",
             ),
-            claim("findings", findings, kind="calculated", source="derived"),
             claim("market_signals", market, kind="observed", source=origin),
         ],
     )

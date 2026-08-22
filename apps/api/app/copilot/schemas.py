@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.validation import normalize_asin
 
 
 class CopilotToolInput(BaseModel):
@@ -20,6 +22,13 @@ class GetSavedReportInput(CopilotToolInput):
 class ListSavedReportsInput(CopilotToolInput):
     asin: str | None = None
     limit: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("asin")
+    @classmethod
+    def _normalize_asin(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        return normalize_asin(value)
 
 
 class AnalyzeListingV2Input(CopilotToolInput):

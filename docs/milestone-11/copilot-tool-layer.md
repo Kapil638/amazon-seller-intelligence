@@ -4,7 +4,7 @@ Internal façade so future Seller Copilot can call **trusted tools** instead of 
 
 This is not a chat product. There is no Copilot UI, no OpenAI planner, no RAG, and no new public REST contract.
 
-Completion record: [milestone-11a-report.md](milestone-11a-report.md). Plan: [milestone-11-plan.md](milestone-11-plan.md). Code review: [milestone-11a-code-review.md](milestone-11a-code-review.md).
+Completion record: [milestone-11a-report.md](milestone-11a-report.md). Checkpoint: [milestone-11a-checkpoint.md](milestone-11a-checkpoint.md). Plan: [milestone-11-plan.md](milestone-11-plan.md). Code review: [milestone-11a-code-review.md](milestone-11a-code-review.md).
 
 ## Purpose
 
@@ -89,7 +89,9 @@ Scores in claims are copied from services. The tool layer does not recompute the
 
 History tools use claim kind `historical` and source `snapshot`. They do not recalculate scores or call providers.
 
-`analyze_listing_v2` claims include listing quality score, coverage, findings, and market signals. Scoring is a single call to `ListingAnalysisV2Service.analyze()`. This tool does **not** persist a History row; `POST /api/v1/analysis/listing/v2` still does.
+`get_saved_report` and `analyze_listing_v2` copy compact Listing Intelligence V2 facts into the envelope: overall score, section scores (title, bullets, description/A+, images, content structure), findings, weaknesses, and deterministic recommendations. They do not send Product objects, ORM rows, or JSON payloads. Synthesis still cites these claims; it does not invent actions.
+
+`analyze_listing_v2` also includes coverage and market signals. Scoring is a single call to `ListingAnalysisV2Service.analyze()`. This tool does **not** persist a History row; `POST /api/v1/analysis/listing/v2` still does.
 
 `get_product` claims are `observed` with source `rainforest` or `mock` (or `manual` if that origin is used). Provider TTL cache is unchanged: a cache hit does not issue another HTTP request.
 

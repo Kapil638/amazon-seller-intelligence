@@ -1120,3 +1120,107 @@ export type SavedAnalysisDetail = {
   image_intelligence: AIImageIntelligence | null;
   meta: SavedAnalysisMetadata;
 };
+
+export type CopilotEvidenceClaim = {
+  key: string;
+  value: unknown;
+  kind: string;
+  source: string;
+  confidence?: string;
+  as_of?: string | null;
+  notes?: string | null;
+};
+
+export type CopilotEvidenceEnvelope = {
+  evidence_id: string;
+  tool_name: string;
+  organization_id: string;
+  produced_at: string;
+  claims: CopilotEvidenceClaim[];
+};
+
+export type CopilotApprovedToolCall = {
+  name: string;
+  arguments: Record<string, unknown>;
+};
+
+export type CopilotPlan = {
+  plan_id: string;
+  conversation_id: string;
+  organization_id: string;
+  intent: string;
+  tool_calls: CopilotApprovedToolCall[];
+  needs_confirmation: boolean;
+  confirm_summary: string | null;
+  plan_hash: string;
+  validation_status: string;
+  source: string;
+};
+
+export type CopilotToolCallResult = {
+  name: string;
+  status: string;
+  evidence: CopilotEvidenceEnvelope | null;
+  error_code: string | null;
+  error_message: string | null;
+};
+
+export type CopilotExecutionResult = {
+  plan_id: string;
+  conversation_id: string;
+  organization_id: string;
+  plan_hash: string;
+  status: "succeeded" | "blocked_confirmation" | "failed";
+  confirmation_required: boolean;
+  confirmation_nonce: string | null;
+  confirm_summary: string | null;
+  evidence: CopilotEvidenceEnvelope[];
+  tool_results: CopilotToolCallResult[];
+};
+
+export type CopilotCitation = {
+  evidence_id: string;
+  claim_key: string;
+  tool_name: string;
+  label: string;
+};
+
+export type CopilotSynthesizedResponse = {
+  summary: string;
+  findings: string[];
+  recommendations: string[];
+  citations: CopilotCitation[];
+  confidence: string;
+  unknowns: string[];
+  source: "synthesis_llm" | "template_fallback" | "rewritten_citations";
+  prompt_version: string | null;
+  synthesis_model: string | null;
+  message: string;
+};
+
+export type CopilotPendingConfirmationPublic = {
+  plan_id: string | null;
+  nonce_present: boolean;
+  summary: string | null;
+};
+
+export type CopilotCompactContext = {
+  last_asin: string | null;
+  last_report_id: string | null;
+  previous_intent: string | null;
+  pending_confirmation: CopilotPendingConfirmationPublic | null;
+  evidence_refs: { evidence_id: string; claim_keys: string[] }[];
+  recent_user_snippets: string[];
+};
+
+export type CopilotConversationDetail = {
+  id: string;
+  organization_id: string;
+  status: string;
+  title: string | null;
+  last_asin: string | null;
+  last_report_id: string | null;
+  previous_intent: string | null;
+  compact_context: CopilotCompactContext;
+  pending_confirmation: CopilotPendingConfirmationPublic | null;
+};

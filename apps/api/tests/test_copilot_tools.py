@@ -21,6 +21,8 @@ from app.copilot.exceptions import (
     UnknownToolError,
 )
 from app.copilot.registry import ToolCatalogEntry, ToolDefinition, ToolRegistry
+from app.copilot.synthesis.service import SynthesisService
+from app.copilot.synthesis.schemas import SynthesisRequest
 from app.core.exceptions import ReportNotFoundError
 from app.models.product import ProductSource
 from app.persistence.database import current_organization_id
@@ -132,6 +134,45 @@ async def test_get_saved_report_returns_historical_findings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_saved_report_preserves_section_scores_findings_and_recommendations() -> None:
+    product, analysis, persist = _persist_report()
+    result = await default_registry().execute(
+        "get_saved_report",
+        {"report_id": persist.report_id},
+        budget=_budget(),
+    )
+    assert result.value("listing_quality_score") == analysis.listing_quality_score
+    assert result.value("analysis_engine") == "listing_analysis_v2"
+    sections = result.value("section_scores")
+    assert sections["title"]["score"] == analysis.sections.title.score
+    assert sections["bullets"]["score"] == analysis.sections.bullets.score
+    assert sections["description_a_plus"]["score"] == analysis.sections.description_a_plus.score
+    assert sections["media_coverage"]["score"] == analysis.sections.media_coverage.score
+    assert sections["content_structure"]["score"] == analysis.sections.content_structure.score
+    assert sections["title"]["max_score"] == analysis.sections.title.max_score
+    assert {row["code"] for row in result.value("findings")} == {item.code for item in analysis.findings}
+    rec_actions = [row["action"] for row in result.value("recommendations")]
+    expected_actions = [
+        item.action
+        for item in sorted(
+            analysis.recommendations,
+            key=lambda rec: {"high": 1, "medium": 2, "low": 3}.get(rec.priority.value, 9),
+        )[:8]
+    ]
+    assert rec_actions == expected_actions
+    dumped = result.model_dump(mode="json")
+    blob = str(dumped)
+    assert "listing_analysis_results" not in blob
+    assert "sa_instance_state" not in blob
+    assert "ProductSnapshot" not in blob
+    claim_keys = {item["key"] for item in dumped["claims"]}
+    assert "product" not in claim_keys
+    assert "payload" not in claim_keys
+    assert "organization_id" not in claim_keys
+    assert result.value("asin") == product.asin
+
+
+@pytest.mark.asyncio
 async def test_get_saved_report_respects_organization_isolation() -> None:
     product, analysis, persist = _persist_report()
     other_id = _create_other_org_report(product, analysis)
@@ -143,6 +184,13 @@ async def test_get_saved_report_respects_organization_isolation() -> None:
     ids = {row["report_id"] for row in listed.value("reports")}
     assert str(persist.report_id) in ids
     assert str(other_id) not in ids
+    mixed = await default_registry().execute(
+        "list_saved_reports",
+        {"asin": product.asin.lower()},
+        budget=_budget(),
+    )
+    mixed_ids = {row["report_id"] for row in mixed.value("reports")}
+    assert str(persist.report_id) in mixed_ids
     with pytest.raises(ReportNotFoundError):
         await default_registry().execute(
             "get_saved_report",
@@ -181,6 +229,9 @@ async def test_analyze_listing_v2_matches_service_and_rejects_product_payload(
     assert result.claim_map()["asin"].source == ProductSource.MOCK.value
     assert result.value("coverage_overall_percentage") == expected.data_coverage.overall_percentage
     assert result.value("findings")
+    assert result.value("section_scores")["title"]["score"] == expected.sections.title.score
+    assert result.value("recommendations")
+    assert all("action" in row for row in result.value("recommendations"))
     assert "rating" in result.value("market_signals")
     fabricated = make_product().model_dump(mode="json")
     with pytest.raises(ToolValidationError):
@@ -276,3 +327,33 @@ async def test_budget_enforces_tool_limit_confirmation_and_rounds() -> None:
     policy.record_execution(COST_RAINFOREST_PRODUCT)
     assert policy.requires_confirmation(COST_RAINFOREST_PRODUCT) is True
     assert policy.requires_confirmation("unexpected_provider") is True
+
+
+@pytest.mark.asyncio
+async def test_saved_report_evidence_answers_how_to_improve_listing() -> None:
+    _product, analysis, persist = _persist_report()
+    packed = await default_registry().execute(
+        "get_saved_report",
+        {"report_id": persist.report_id},
+        budget=_budget(),
+    )
+    result = await SynthesisService().synthesize(
+        SynthesisRequest(
+            user_message="How can I improve my listing?",
+            intent="explain_listing_score",
+            evidence=[packed],
+        )
+    )
+    assert str(analysis.listing_quality_score) in result.summary
+    assert any("/" in item and item[0].isalpha() for item in result.findings)
+    assert result.recommendations
+    cited = {item.claim_key for item in result.citations}
+    assert "listing_quality_score" in cited
+    assert "section_scores" in cited
+    assert "weaknesses" in cited or "findings" in cited
+    if analysis.recommendations:
+        assert "recommendations" in cited
+        assert result.recommendations[0] == analysis.recommendations[0].action or result.recommendations
+    assert all("ranking will" not in item.lower() for item in result.findings + result.recommendations)
+    assert "20%" not in result.message
+    assert "ToolRegistry" not in result.message

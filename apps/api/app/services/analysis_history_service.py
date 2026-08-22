@@ -206,6 +206,8 @@ class AnalysisHistoryService:
             raise PersistenceNotConfiguredError()
         limit = min(max(limit, 1), 100)
         offset = max(offset, 0)
+        if asin:
+            asin = asin.strip().upper()
         with session_scope() as session:
             runs, total = AnalysisRunRepository(session).list_page(
                 current_organization_id(),
@@ -219,6 +221,22 @@ class AnalysisHistoryService:
             )
             items = [_summary(run) for run in runs]
         return SavedAnalysisListResponse(items=items, total=total, offset=offset, limit=limit)
+
+    def latest_complete_report_id(self, asin: str) -> UUID | None:
+        """Latest complete/partial listing analysis for this org and ASIN. Does not fetch Amazon."""
+        if not persistence_enabled():
+            return None
+        normalized = (asin or "").strip().upper()
+        if not normalized:
+            return None
+        with session_scope() as session:
+            run = AnalysisRunRepository(session).latest_complete_for_asin(
+                current_organization_id(),
+                normalized,
+            )
+            if run is None or run.listing_result is None:
+                return None
+            return run.id
 
     def get_report(self, report_id: UUID) -> SavedAnalysisDetail:
         if not persistence_enabled():
