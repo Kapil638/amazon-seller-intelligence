@@ -33,6 +33,10 @@ import type {
   CopilotExecutionResult,
   CopilotPlan,
   CopilotSynthesizedResponse,
+  ProfitModel,
+  ProfitModelListResponse,
+  ProfitModelInputs,
+  ProfitSnapshot,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1095,6 +1099,122 @@ export async function synthesizeCopilot(payload: {
         evidence_refs: compact.evidence_refs ?? [],
         recent_user_snippets: compact.recent_user_snippets ?? [],
       },
+    }),
+  });
+}
+
+export class ProfitError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "unavailable" | "invalid" | "unknown",
+  ) {
+    super(message);
+    this.name = "ProfitError";
+  }
+}
+
+function profitUrl(path: string): string {
+  return `${apiBaseUrl()}/api/v1/profit${path}`;
+}
+
+async function profitRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(profitUrl(path), {
+      cache: "no-store",
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new ProfitError(
+      "Profit Intelligence could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 503) {
+    throw new ProfitError(
+      detail || "Profit Intelligence is not configured right now.",
+      "unavailable",
+    );
+  }
+  if (response.status === 400 || response.status === 409 || response.status === 404) {
+    throw new ProfitError(
+      detail || "Profit Intelligence could not complete this request.",
+      "invalid",
+    );
+  }
+  throw new ProfitError(
+    "Profit Intelligence could not complete this request.",
+    "unknown",
+  );
+}
+
+export async function createProfitModel(payload: {
+  asin: string;
+  marketplace?: string;
+}): Promise<ProfitModel> {
+  return profitRequest<ProfitModel>("/models", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listProfitModels(asin?: string): Promise<ProfitModelListResponse> {
+  const query = asin ? `?asin=${encodeURIComponent(asin)}` : "";
+  return profitRequest<ProfitModelListResponse>(`/models${query}`);
+}
+
+export async function fetchProfitModel(modelId: string): Promise<ProfitModel> {
+  return profitRequest<ProfitModel>(`/models/${modelId}`);
+}
+
+export async function updateProfitModel(
+  modelId: string,
+  payload: ProfitModelInputs,
+): Promise<ProfitModel> {
+  const body: ProfitModelInputs = {
+    selling_price: payload.selling_price ?? null,
+    cogs: payload.cogs ?? null,
+    shipping_cost: payload.shipping_cost ?? null,
+    packaging_cost: payload.packaging_cost ?? null,
+    other_cost: payload.other_cost ?? null,
+    referral_fee_amount: payload.referral_fee_amount ?? null,
+    fba_fee_amount: payload.fba_fee_amount ?? null,
+  };
+  return profitRequest<ProfitModel>(`/models/${modelId}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function calculateProfitModel(modelId: string): Promise<ProfitModel> {
+  return profitRequest<ProfitModel>(`/models/${modelId}/calculate`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export async function previewProfit(payload: ProfitModelInputs & {
+  referral_fee?: string | null;
+  fba_fee?: string | null;
+}): Promise<ProfitSnapshot> {
+  return profitRequest<ProfitSnapshot>("/preview", {
+    method: "POST",
+    body: JSON.stringify({
+      selling_price: payload.selling_price ?? null,
+      cogs: payload.cogs ?? null,
+      referral_fee: payload.referral_fee ?? payload.referral_fee_amount ?? null,
+      fba_fee: payload.fba_fee ?? payload.fba_fee_amount ?? null,
+      shipping_cost: payload.shipping_cost ?? null,
+      packaging_cost: payload.packaging_cost ?? null,
+      other_cost: payload.other_cost ?? null,
     }),
   });
 }

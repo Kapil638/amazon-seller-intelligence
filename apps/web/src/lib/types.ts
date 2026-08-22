@@ -1224,3 +1224,104 @@ export type CopilotConversationDetail = {
   compact_context: CopilotCompactContext;
   pending_confirmation: CopilotPendingConfirmationPublic | null;
 };
+
+export type ProfitEvidenceClaim = {
+  key: string;
+  value: unknown;
+  kind: string;
+  source: string;
+  confidence: string;
+  notes: string | null;
+};
+
+export type ProfitEvidence = {
+  evidence_id: string;
+  tool_name: string;
+  organization_id: string;
+  produced_at: string;
+  claims: ProfitEvidenceClaim[];
+};
+
+export type ProfitInputs = {
+  selling_price: string | null;
+  cogs: string | null;
+  referral_fee: string | null;
+  fba_fee: string | null;
+  shipping_cost: string | null;
+  packaging_cost: string | null;
+  other_cost: string | null;
+};
+
+export type ProfitOutputs = {
+  amazon_fees: string | null;
+  operating_costs: string | null;
+  landed_cost: string | null;
+  net_profit_before_ads: string | null;
+  margin_before_ads: string | null;
+  roi_on_cogs: string | null;
+};
+
+export type ProfitCompleteness = {
+  unknown: string[];
+  messages: string[];
+};
+
+export type ProfitSnapshot = {
+  id: string;
+  organization_id: string;
+  profit_model_id: string;
+  status: string;
+  profit_formula_version: string;
+  inputs: ProfitInputs;
+  outputs: ProfitOutputs;
+  completeness: ProfitCompleteness;
+  evidence: ProfitEvidence;
+  calculated_at: string;
+};
+
+export type ProfitModel = {
+  id: string;
+  organization_id: string;
+  asin: string;
+  marketplace: string;
+  currency: string;
+  selling_price: string | null;
+  selling_price_source: string;
+  cogs: string | null;
+  shipping_cost: string | null;
+  packaging_cost: string | null;
+  other_cost: string | null;
+  referral_fee_amount: string | null;
+  fba_fee_amount: string | null;
+  fee_category_key: string | null;
+  latest_snapshot: ProfitSnapshot | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProfitModelSummary = {
+  id: string;
+  asin: string;
+  marketplace: string;
+  currency: string;
+  latest_status: string | null;
+  unknown: string[];
+  updated_at: string;
+};
+
+export type ProfitModelListResponse = {
+  items: ProfitModelSummary[];
+  total: number;
+};
+
+export type ProfitModelInputs = {
+  selling_price?: string | null;
+  cogs?: string | null;
+  shipping_cost?: string | null;
+  packaging_cost?: string | null;
+  other_cost?: string | null;
+  referral_fee_amount?: string | null;
+  fba_fee_amount?: string | null;
+  selling_price_source?: string | null;
+  fee_category_key?: string | null;
+};

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
-import { BarChart3, FileSpreadsheet, History, Search, Sparkles } from "lucide-react";
+import { BarChart3, FileSpreadsheet, History, IndianRupee, Search, Sparkles } from "lucide-react";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UsagePanel } from "@/components/usage-panel";
@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 const LINKS = [
   { id: "asin", href: "/", label: "Analyze", icon: Search },
   { id: "copilot", href: "/copilot", label: "Copilot", icon: Sparkles },
+  { id: "profit", href: "/profit", label: "Profit", icon: IndianRupee },
   { id: "history", href: "/history", label: "History", icon: History },
   { id: "reports", href: "/reports", label: "Seller Reports", icon: BarChart3 },
   { id: "bulk", href: "/bulk", label: "Bulk Due Diligence", icon: FileSpreadsheet },
@@ -18,7 +19,7 @@ export function AppShell({
   current,
   children,
 }: {
-  current: "asin" | "copilot" | "history" | "reports" | "bulk";
+  current: "asin" | "copilot" | "profit" | "history" | "reports" | "bulk";
   children: ReactNode;
 }) {
   return (

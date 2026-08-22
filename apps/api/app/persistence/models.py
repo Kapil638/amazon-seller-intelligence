@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
@@ -326,3 +327,68 @@ class CopilotPendingConfirmation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     conversation: Mapped[CopilotConversation] = relationship(back_populates="pending_confirmations")
+
+
+class ProfitModel(Base):
+    __tablename__ = "profit_models"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "asin",
+            "marketplace",
+            name="uq_profit_models_org_asin_marketplace",
+        ),
+        Index("ix_profit_models_org_updated", "organization_id", "updated_at"),
+        Index("ix_profit_models_org_asin", "organization_id", "asin"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    asin: Mapped[str] = mapped_column(String(10), nullable=False)
+    marketplace: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="INR")
+    selling_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    selling_price_source: Mapped[str] = mapped_column(String(32), nullable=False, default="seller")
+    cogs: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    packaging_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    other_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    referral_fee_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    fba_fee_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    fee_category_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    snapshots: Mapped[list[ProfitSnapshot]] = relationship(
+        back_populates="model",
+        cascade="all, delete-orphan",
+        order_by="ProfitSnapshot.calculated_at.desc()",
+    )
+
+
+class ProfitSnapshot(Base):
+    __tablename__ = "profit_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_profit_snapshots_org_model_calculated",
+            "organization_id",
+            "profit_model_id",
+            "calculated_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    profit_model_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("profit_models.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    profit_formula_version: Mapped[str] = mapped_column(String(32), nullable=False, default="profit-calc-v1")
+    inputs_json: Mapped[dict] = mapped_column(JsonPayload, nullable=False)
+    outputs_json: Mapped[dict] = mapped_column(JsonPayload, nullable=False)
+    completeness: Mapped[dict] = mapped_column(JsonPayload, nullable=False)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    organization: Mapped[Organization] = relationship()
+    model: Mapped[ProfitModel] = relationship(back_populates="snapshots")

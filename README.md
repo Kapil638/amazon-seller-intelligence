@@ -24,6 +24,7 @@ Right now the app does these things:
 12. Reopen **saved ASIN analyses** from **History** without calling Rainforest or OpenAI again. Export a client PDF or soft-delete a report from History; neither refreshes Amazon or AI data.
 13. Create organization **scoring profiles** that change only the V2 aggregate weights. Standard V2 remains the benchmark.
 14. Internal **intelligence tools** (`get_saved_report`, `list_saved_reports`, `analyze_listing_v2`, `get_product`) wrap those services for Copilot. Copilot explains listing evidence; it does not calculate money.
+15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. Copilot does not call profit tools yet.
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -57,6 +58,12 @@ GET  /api/v1/usage/dashboard          → UsageDashboardService.get_dashboard() 
 POST /api/v1/bulk/preview             → ingest ASINs from CSV/XLSX
 POST /api/v1/bulk/jobs                → in-process bulk due diligence job (mock providers)
 GET  /api/v1/bulk/jobs/{job_id}
+POST /api/v1/profit/models            → ProfitModelingService.create_model()
+GET  /api/v1/profit/models
+GET  /api/v1/profit/models/{id}
+PATCH /api/v1/profit/models/{id}
+POST /api/v1/profit/models/{id}/calculate → ProfitCalculationService (profit-calc-v1)
+POST /api/v1/profit/preview           → stateless calculate
 ```
 
 Persistence (when `DATABASE_URL` is set):
@@ -273,7 +280,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Copilot lives at [http://localhost:3000/copilot](http://localhost:3000/copilot).
+Open [http://localhost:3000](http://localhost:3000). Copilot lives at [http://localhost:3000/copilot](http://localhost:3000/copilot). Profit lives at [http://localhost:3000/profit](http://localhost:3000/profit).
 
 `NEXT_PUBLIC_API_BASE_URL` must point at the FastAPI server (default `http://localhost:8000`). Do not hardcode localhost in application code.
 
@@ -327,6 +334,12 @@ Use these fictional catalog IDs against the mock provider:
 | POST | `/api/v1/bulk/jobs` | Start a bulk due-diligence job (mock providers by default). |
 | GET | `/api/v1/bulk/jobs/{job_id}` | Job status / results. |
 | GET | `/api/v1/bulk/jobs/{job_id}/report.xlsx` | Excel report after the job completes (in-memory job or stored file). |
+| POST | `/api/v1/profit/models` | Create an ASIN profit worksheet. |
+| GET | `/api/v1/profit/models` | List profit models for the current organization. |
+| GET | `/api/v1/profit/models/{id}` | Model plus latest snapshot. |
+| PATCH | `/api/v1/profit/models/{id}` | Update seller inputs only. |
+| POST | `/api/v1/profit/models/{id}/calculate` | Persist an immutable `profit-calc-v1` snapshot. |
+| POST | `/api/v1/profit/preview` | Stateless calculate. Client-sent profit/margin/ROI are ignored. |
 
 Optional query parameter on GET: `marketplace` (default `amazon.in`).
 
@@ -371,6 +384,6 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 - OpenAI **provider spend** needs an Admin API key (`OPENAI_ADMIN_API_KEY`). App-estimated cost is calculated from response token usage and is not authoritative provider billing.
 - Bulk due diligence currently uses **mock product and mock AI providers**. Live Rainforest/OpenAI bulk is guarded off. Bulk **Excel** export is implemented; PDF export is not. See [docs/bulk-asin-due-diligence.md](docs/bulk-asin-due-diligence.md).
 - No authentication yet. A default development organization scopes persisted rows. RLS does not isolate users today because there is no login.
-- Intelligence tools and Copilot V1 exist: `/copilot` uses plan → execute/confirm → synthesize. Analyze, History, Reports, and Bulk remain the expert surfaces. There is **no** RAG or Amazon write path. See [docs/milestone-11/copilot-tool-layer.md](docs/milestone-11/copilot-tool-layer.md).
+- Intelligence tools and Copilot V1 exist: `/copilot` uses plan → execute/confirm → synthesize. Analyze, History, Reports, Bulk, and **Profit** remain the expert surfaces. Profit math is Python-only (`profit-calc-v1`). There is **no** RAG or Amazon write path. See [docs/milestone-11/milestone-11c1-profit-foundation.md](docs/milestone-11/milestone-11c1-profit-foundation.md).
 - Re-analyze current listing (new snapshot + new report) and report deletion are not implemented.
 - India marketplace (`amazon.in`) only. Report money is treated as INR.

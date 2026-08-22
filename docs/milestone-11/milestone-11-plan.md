@@ -349,6 +349,8 @@ This proves the Copilot can sit on current services without rewriting them.
 
 ### 11C — Profit Modeling Workspace
 
+**Architecture (approved for review, not for remaining slices):** [milestone-11c-architecture.md](../milestone-11c-architecture.md). **11C.1 implemented:** unit P&L engine, snapshots, `/profit` workspace. Not yet: advertising intelligence, scenarios, Copilot tools.
+
 **Goal:** First trusted interactive workspace.  
 **User story:** “I’m launching a similar product; build a profitability model.”  
 **Backend:** `ProfitModelingService`, CRUD + calculate, `0005`.  

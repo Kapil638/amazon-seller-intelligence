@@ -226,7 +226,7 @@ export function AnalysisHistory() {
                   <td className="px-4 py-3">{sourceLabel(item.source)}</td>
                   <td className="px-4 py-3">{formatDate(item.created_at)}</td>
                   <td className="px-4 py-3">{statusLabel(item.status)}</td>
-                  <td className="w-px px-4 py-3 align-middle text-right whitespace-nowrap">
+                  <td className="w-px px-4 py-3 align-top text-right whitespace-nowrap">
                     <RowActions
                       item={item}
                       pdfBusy={pdfBusyId === item.report_id}

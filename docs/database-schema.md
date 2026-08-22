@@ -17,6 +17,8 @@ erDiagram
   organizations ||--o{ bulk_jobs : owns
   organizations ||--o{ generated_reports : owns
   organizations ||--o{ usage_events : owns
+  organizations ||--o{ profit_models : owns
+  profit_models ||--o{ profit_snapshots : snapshots
   product_snapshots ||--o{ analysis_runs : snapshot
   analysis_runs ||--o| listing_analysis_results : listing_v2
   analysis_runs ||--o| ai_listing_results : ai_v2
@@ -197,6 +199,38 @@ erDiagram
     int latency_ms
     datetime created_at
   }
+
+  profit_models {
+    uuid id PK
+    uuid organization_id FK
+    string asin
+    string marketplace
+    string currency
+    numeric selling_price
+    string selling_price_source
+    numeric cogs
+    numeric shipping_cost
+    numeric packaging_cost
+    numeric other_cost
+    numeric referral_fee_amount
+    numeric fba_fee_amount
+    string fee_category_key
+    datetime created_at
+    datetime updated_at
+  }
+
+  profit_snapshots {
+    uuid id PK
+    uuid organization_id FK
+    uuid profit_model_id FK
+    string status
+    string profit_formula_version
+    jsonb inputs_json
+    jsonb outputs_json
+    jsonb completeness
+    datetime calculated_at
+  }
+
 ```
 
 `analysis_runs.id` is the public `report_id`.
@@ -213,6 +247,8 @@ Product snapshots are **append-only**. The same ASIN can have many snapshots (20
 - `usage_events (organization_id, created_at)`
 - `report_uploads (organization_id, file_hash)`
 - `generated_reports (analysis_run_id, report_type, template_version)`
+- `profit_models (organization_id, asin, marketplace)` unique
+- `profit_snapshots (organization_id, profit_model_id, calculated_at)`
 
 ## Future tables (not created)
 

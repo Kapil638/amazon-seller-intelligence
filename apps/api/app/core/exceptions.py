@@ -238,3 +238,19 @@ class PdfNotGeneratedError(Exception):
 class ArtifactStorageError(Exception):
     def __init__(self, message: str = "The generated report could not be stored.") -> None:
         super().__init__(message)
+
+
+class ProfitValidationError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class ProfitModelNotFoundError(Exception):
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        super().__init__(f"Profit model {model_id} was not found.")
+
+
+class ProfitModelConflictError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)

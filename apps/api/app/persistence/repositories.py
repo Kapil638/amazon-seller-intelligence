@@ -24,6 +24,8 @@ from app.persistence.models import (
     ReportUpload,
     ScoringProfile,
     UsageEvent,
+    ProfitModel,
+    ProfitSnapshot,
 )
 
 
@@ -782,6 +784,79 @@ class CopilotConversationRepository:
             if except_id is not None and row.id == except_id:
                 continue
             row.consumed_at = now
+
+
+class ProfitModelRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, row: ProfitModel) -> ProfitModel:
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get(self, organization_id: UUID, model_id: UUID) -> ProfitModel | None:
+        return self.session.scalars(
+            select(ProfitModel).where(
+                ProfitModel.organization_id == organization_id,
+                ProfitModel.id == model_id,
+            )
+        ).first()
+
+    def find_by_asin(
+        self,
+        organization_id: UUID,
+        asin: str,
+        marketplace: str,
+    ) -> ProfitModel | None:
+        return self.session.scalars(
+            select(ProfitModel).where(
+                ProfitModel.organization_id == organization_id,
+                func.lower(ProfitModel.asin) == asin.lower(),
+                ProfitModel.marketplace == marketplace,
+            )
+        ).first()
+
+    def list_for_org(
+        self,
+        organization_id: UUID,
+        *,
+        asin: str | None = None,
+    ) -> list[ProfitModel]:
+        filters = [ProfitModel.organization_id == organization_id]
+        if asin:
+            filters.append(func.lower(ProfitModel.asin) == asin.lower())
+        statement = (
+            select(ProfitModel)
+            .where(*filters)
+            .order_by(ProfitModel.updated_at.desc(), ProfitModel.created_at.desc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def latest_snapshot(self, organization_id: UUID, model_id: UUID) -> ProfitSnapshot | None:
+        return self.session.scalars(
+            select(ProfitSnapshot)
+            .where(
+                ProfitSnapshot.organization_id == organization_id,
+                ProfitSnapshot.profit_model_id == model_id,
+            )
+            .order_by(ProfitSnapshot.calculated_at.desc())
+            .limit(1)
+        ).first()
+
+    def get_snapshot(self, organization_id: UUID, snapshot_id: UUID) -> ProfitSnapshot | None:
+        return self.session.scalars(
+            select(ProfitSnapshot).where(
+                ProfitSnapshot.organization_id == organization_id,
+                ProfitSnapshot.id == snapshot_id,
+            )
+        ).first()
+
+    def add_snapshot(self, row: ProfitSnapshot) -> ProfitSnapshot:
+        self.session.add(row)
+        self.session.flush()
+        return row
+
 
 def file_sha256(data: bytes) -> str:
     return sha256_bytes(data)
