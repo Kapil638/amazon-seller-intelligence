@@ -254,3 +254,8 @@ class ProfitModelNotFoundError(Exception):
 class ProfitModelConflictError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class AdvertisingValidationError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)

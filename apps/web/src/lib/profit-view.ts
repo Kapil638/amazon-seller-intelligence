@@ -70,6 +70,51 @@ export function savePayloadFromForm(form: {
   };
 }
 
+export function formatRoas(value: string | null | undefined): string {
+  if (value == null || value === "") {
+    return "Unknown";
+  }
+  const amount = Number(value);
+  if (Number.isNaN(amount)) {
+    return "Unknown";
+  }
+  return `${amount.toFixed(2)}x`;
+}
+
+export function advertisingUnknownMessages(
+  completenessMessages: string[] | undefined,
+  impactMessages: string[] | undefined,
+): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const item of [...(completenessMessages ?? []), ...(impactMessages ?? [])]) {
+    if (!item || seen.has(item)) {
+      continue;
+    }
+    seen.add(item);
+    ordered.push(item);
+  }
+  return ordered;
+}
+
+export function saveAdvertisingPayloadFromForm(form: {
+  period_start: string;
+  period_end: string;
+  ad_spend: string;
+  ad_sales: string;
+  total_sales: string;
+  units_in_period: string;
+}) {
+  return {
+    period_start: emptyToNull(form.period_start),
+    period_end: emptyToNull(form.period_end),
+    ad_spend: emptyToNull(form.ad_spend),
+    ad_sales: emptyToNull(form.ad_sales),
+    total_sales: emptyToNull(form.total_sales),
+    units_in_period: emptyToNull(form.units_in_period),
+  };
+}
+
 function emptyToNull(value: string): string | null {
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;

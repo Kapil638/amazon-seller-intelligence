@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.persistence.types import Guid, JsonPayload
@@ -392,3 +392,67 @@ class ProfitSnapshot(Base):
 
     organization: Mapped[Organization] = relationship()
     model: Mapped[ProfitModel] = relationship(back_populates="snapshots")
+
+
+class AdvertisingModel(Base):
+    __tablename__ = "advertising_models"
+    __table_args__ = (
+        UniqueConstraint("profit_model_id", name="uq_advertising_models_profit_model_id"),
+        Index("ix_advertising_models_org_profit", "organization_id", "profit_model_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    profit_model_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("profit_models.id"), nullable=False)
+    asin: Mapped[str] = mapped_column(String(10), nullable=False)
+    marketplace: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="INR")
+    period_start: Mapped[date | None] = mapped_column(Date, nullable=True)
+    period_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    ad_spend: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    ad_sales: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    total_sales: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    units_in_period: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="seller_input")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profit_model: Mapped[ProfitModel] = relationship()
+    snapshots: Mapped[list[AdvertisingSnapshot]] = relationship(
+        back_populates="model",
+        cascade="all, delete-orphan",
+        order_by="AdvertisingSnapshot.calculated_at.desc()",
+    )
+
+
+class AdvertisingSnapshot(Base):
+    __tablename__ = "advertising_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_advertising_snapshots_org_model_calculated",
+            "organization_id",
+            "advertising_model_id",
+            "calculated_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("organizations.id"), nullable=False)
+    advertising_model_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("advertising_models.id"), nullable=False
+    )
+    profit_model_id: Mapped[UUID] = mapped_column(Guid(), ForeignKey("profit_models.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    ads_formula_version: Mapped[str] = mapped_column(String(32), nullable=False, default="ads-calc-v1")
+    inputs_json: Mapped[dict] = mapped_column(JsonPayload, nullable=False)
+    outputs_json: Mapped[dict] = mapped_column(JsonPayload, nullable=False)
+    completeness: Mapped[dict] = mapped_column("completeness_json", JsonPayload, nullable=False)
+    impact_json: Mapped[dict | None] = mapped_column(JsonPayload, nullable=True)
+    profit_snapshot_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    organization: Mapped[Organization] = relationship()
+    model: Mapped[AdvertisingModel] = relationship(back_populates="snapshots")

@@ -24,7 +24,7 @@ Right now the app does these things:
 12. Reopen **saved ASIN analyses** from **History** without calling Rainforest or OpenAI again. Export a client PDF or soft-delete a report from History; neither refreshes Amazon or AI data.
 13. Create organization **scoring profiles** that change only the V2 aggregate weights. Standard V2 remains the benchmark.
 14. Internal **intelligence tools** (`get_saved_report`, `list_saved_reports`, `analyze_listing_v2`, `get_product`) wrap those services for Copilot. Copilot explains listing evidence; it does not calculate money.
-15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. Copilot does not call profit tools yet.
+15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. On the same worksheet, enter a period of advertising spend to see ACOS, TACOS, ROAS, and profit after ads. Copilot does not call profit or ads tools yet.
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -64,6 +64,11 @@ GET  /api/v1/profit/models/{id}
 PATCH /api/v1/profit/models/{id}
 POST /api/v1/profit/models/{id}/calculate → ProfitCalculationService (profit-calc-v1)
 POST /api/v1/profit/preview           → stateless calculate
+GET  /api/v1/profit/models/{id}/advertising → AdvertisingModelingService
+PATCH /api/v1/profit/models/{id}/advertising
+POST /api/v1/profit/models/{id}/advertising/calculate → ads-calc-v1 snapshot
+GET  /api/v1/profit/models/{id}/advertising/snapshots
+POST /api/v1/advertising/preview      → stateless ads calculate
 ```
 
 Persistence (when `DATABASE_URL` is set):
@@ -340,6 +345,11 @@ Use these fictional catalog IDs against the mock provider:
 | PATCH | `/api/v1/profit/models/{id}` | Update seller inputs only. |
 | POST | `/api/v1/profit/models/{id}/calculate` | Persist an immutable `profit-calc-v1` snapshot. |
 | POST | `/api/v1/profit/preview` | Stateless calculate. Client-sent profit/margin/ROI are ignored. |
+| GET | `/api/v1/profit/models/{id}/advertising` | Advertising worksheet, latest snapshot, and after-ads impact. |
+| PATCH | `/api/v1/profit/models/{id}/advertising` | Update seller advertising inputs only. |
+| POST | `/api/v1/profit/models/{id}/advertising/calculate` | Persist an immutable `ads-calc-v1` snapshot. |
+| GET | `/api/v1/profit/models/{id}/advertising/snapshots` | Advertising snapshot history. |
+| POST | `/api/v1/advertising/preview` | Stateless ads calculate. Client-sent ACOS/TACOS/ROAS are ignored. |
 
 Optional query parameter on GET: `marketplace` (default `amazon.in`).
 

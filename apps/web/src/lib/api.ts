@@ -37,6 +37,10 @@ import type {
   ProfitModelListResponse,
   ProfitModelInputs,
   ProfitSnapshot,
+  AdvertisingModel,
+  AdvertisingModelInputs,
+  AdvertisingSnapshot,
+  AdvertisingSnapshotListResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1217,4 +1221,73 @@ export async function previewProfit(payload: ProfitModelInputs & {
       other_cost: payload.other_cost ?? null,
     }),
   });
+}
+
+export async function fetchAdvertising(modelId: string): Promise<AdvertisingModel> {
+  return profitRequest<AdvertisingModel>(`/models/${modelId}/advertising`);
+}
+
+export async function updateAdvertising(
+  modelId: string,
+  payload: AdvertisingModelInputs,
+): Promise<AdvertisingModel> {
+  const body: AdvertisingModelInputs = {
+    period_start: payload.period_start ?? null,
+    period_end: payload.period_end ?? null,
+    ad_spend: payload.ad_spend ?? null,
+    ad_sales: payload.ad_sales ?? null,
+    total_sales: payload.total_sales ?? null,
+    units_in_period: payload.units_in_period ?? null,
+  };
+  return profitRequest<AdvertisingModel>(`/models/${modelId}/advertising`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function calculateAdvertising(modelId: string): Promise<AdvertisingModel> {
+  return profitRequest<AdvertisingModel>(`/models/${modelId}/advertising/calculate`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export async function listAdvertisingSnapshots(
+  modelId: string,
+): Promise<AdvertisingSnapshotListResponse> {
+  return profitRequest<AdvertisingSnapshotListResponse>(`/models/${modelId}/advertising/snapshots`);
+}
+
+export async function previewAdvertising(
+  payload: AdvertisingModelInputs,
+): Promise<AdvertisingSnapshot> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/advertising/preview`, {
+      cache: "no-store",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        period_start: payload.period_start ?? null,
+        period_end: payload.period_end ?? null,
+        ad_spend: payload.ad_spend ?? null,
+        ad_sales: payload.ad_sales ?? null,
+        total_sales: payload.total_sales ?? null,
+        units_in_period: payload.units_in_period ?? null,
+      }),
+    });
+  } catch {
+    throw new ProfitError(
+      "Advertising Intelligence could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as AdvertisingSnapshot;
+  }
+  const detail = await readError(response);
+  throw new ProfitError(
+    detail || "Advertising Intelligence could not complete this request.",
+    response.status === 400 || response.status === 404 ? "invalid" : "unknown",
+  );
 }

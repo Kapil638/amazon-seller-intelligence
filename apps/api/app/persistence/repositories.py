@@ -26,6 +26,8 @@ from app.persistence.models import (
     UsageEvent,
     ProfitModel,
     ProfitSnapshot,
+    AdvertisingModel,
+    AdvertisingSnapshot,
 )
 
 
@@ -853,6 +855,74 @@ class ProfitModelRepository:
         ).first()
 
     def add_snapshot(self, row: ProfitSnapshot) -> ProfitSnapshot:
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AdvertisingModelRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, row: AdvertisingModel) -> AdvertisingModel:
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get(self, organization_id: UUID, model_id: UUID) -> AdvertisingModel | None:
+        return self.session.scalars(
+            select(AdvertisingModel).where(
+                AdvertisingModel.organization_id == organization_id,
+                AdvertisingModel.id == model_id,
+            )
+        ).first()
+
+    def get_for_profit_model(
+        self, organization_id: UUID, profit_model_id: UUID
+    ) -> AdvertisingModel | None:
+        return self.session.scalars(
+            select(AdvertisingModel).where(
+                AdvertisingModel.organization_id == organization_id,
+                AdvertisingModel.profit_model_id == profit_model_id,
+            )
+        ).first()
+
+    def latest_snapshot(
+        self, organization_id: UUID, advertising_model_id: UUID
+    ) -> AdvertisingSnapshot | None:
+        return self.session.scalars(
+            select(AdvertisingSnapshot)
+            .where(
+                AdvertisingSnapshot.organization_id == organization_id,
+                AdvertisingSnapshot.advertising_model_id == advertising_model_id,
+            )
+            .order_by(AdvertisingSnapshot.calculated_at.desc())
+            .limit(1)
+        ).first()
+
+    def list_snapshots(
+        self, organization_id: UUID, advertising_model_id: UUID
+    ) -> list[AdvertisingSnapshot]:
+        return list(
+            self.session.scalars(
+                select(AdvertisingSnapshot)
+                .where(
+                    AdvertisingSnapshot.organization_id == organization_id,
+                    AdvertisingSnapshot.advertising_model_id == advertising_model_id,
+                )
+                .order_by(AdvertisingSnapshot.calculated_at.desc())
+            ).all()
+        )
+
+    def get_snapshot(self, organization_id: UUID, snapshot_id: UUID) -> AdvertisingSnapshot | None:
+        return self.session.scalars(
+            select(AdvertisingSnapshot).where(
+                AdvertisingSnapshot.organization_id == organization_id,
+                AdvertisingSnapshot.id == snapshot_id,
+            )
+        ).first()
+
+    def add_snapshot(self, row: AdvertisingSnapshot) -> AdvertisingSnapshot:
         self.session.add(row)
         self.session.flush()
         return row

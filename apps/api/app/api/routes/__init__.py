@@ -9,6 +9,7 @@ from app.api.routes.scoring_profiles import router as scoring_profiles_router
 from app.api.routes.usage import router as usage_router
 from app.api.routes.bulk import router as bulk_router
 from app.api.routes.profit import router as profit_router
+from app.api.routes.advertising import router as advertising_router
 
 api_router = APIRouter()
 api_router.include_router(products_router)
@@ -20,3 +21,4 @@ api_router.include_router(usage_router)
 api_router.include_router(bulk_router)
 api_router.include_router(copilot_router)
 api_router.include_router(profit_router)
+api_router.include_router(advertising_router)

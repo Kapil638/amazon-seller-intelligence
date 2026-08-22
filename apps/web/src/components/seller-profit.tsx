@@ -12,22 +12,31 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { EmptyState, Kpi, PageHeader, Panel, Section } from "@/components/ui/layout";
 import {
+  calculateAdvertising,
   calculateProfitModel,
   createProfitModel,
+  fetchAdvertising,
   fetchProfitModel,
+  listAdvertisingSnapshots,
   listProfitModels,
   ProfitError,
+  updateAdvertising,
   updateProfitModel,
 } from "@/lib/api";
 import { isValidAsin, normalizeAsin } from "@/lib/asin";
 import {
+  advertisingUnknownMessages,
   formatClaimValue,
   formatInr,
   formatPercent,
+  formatRoas,
+  saveAdvertisingPayloadFromForm,
   savePayloadFromForm,
   unknownMessage,
 } from "@/lib/profit-view";
 import type {
+  AdvertisingModel,
+  AdvertisingSnapshotSummary,
   ProfitEvidenceClaim,
   ProfitModel,
   ProfitModelSummary,
@@ -262,15 +271,287 @@ function ProfitModelWorkspace({ modelId }: { modelId: string }) {
       ) : null}
       <Section
         title="Unit Economics"
-        description="Product cost and fees. Python calculates profit with profit-calc-v1."
+        description="Product cost and fees before advertising. Python calculates profit with profit-calc-v1."
       >
         <div className="mt-4 grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
           <InputsPanel form={form} onChange={setForm} onCalculate={() => void persistAndCalculate()} saving={saving} />
           <OutputsPanel snapshot={snapshot} />
         </div>
       </Section>
+      <AdvertisingIntelligencePanel modelId={modelId} profitSnapshotId={snapshot?.id ?? null} />
       <EvidencePanel snapshot={snapshot} />
     </div>
+  );
+}
+
+type AdsFormState = {
+  period_start: string;
+  period_end: string;
+  ad_spend: string;
+  ad_sales: string;
+  total_sales: string;
+  units_in_period: string;
+};
+
+const EMPTY_ADS_FORM: AdsFormState = {
+  period_start: "",
+  period_end: "",
+  ad_spend: "",
+  ad_sales: "",
+  total_sales: "",
+  units_in_period: "",
+};
+
+function adsFormFromModel(model: AdvertisingModel): AdsFormState {
+  return {
+    period_start: model.period_start ?? "",
+    period_end: model.period_end ?? "",
+    ad_spend: model.ad_spend ?? "",
+    ad_sales: model.ad_sales ?? "",
+    total_sales: model.total_sales ?? "",
+    units_in_period: model.units_in_period ?? "",
+  };
+}
+
+function AdvertisingIntelligencePanel({
+  modelId,
+  profitSnapshotId,
+}: {
+  modelId: string;
+  profitSnapshotId: string | null;
+}) {
+  const [model, setModel] = useState<AdvertisingModel | null>(null);
+  const [history, setHistory] = useState<AdvertisingSnapshotSummary[]>([]);
+  const [form, setForm] = useState<AdsFormState>(EMPTY_ADS_FORM);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [next, listed] = await Promise.all([
+        fetchAdvertising(modelId),
+        listAdvertisingSnapshots(modelId),
+      ]);
+      setModel(next);
+      setForm(adsFormFromModel(next));
+      setHistory(listed.items);
+    } catch (err) {
+      setError(err instanceof ProfitError ? err.message : "Could not load advertising data.");
+    } finally {
+      setLoading(false);
+    }
+  }, [modelId, profitSnapshotId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function persistAndCalculate() {
+    setSaving(true);
+    setError(null);
+    try {
+      await updateAdvertising(modelId, saveAdvertisingPayloadFromForm(form));
+      const calculated = await calculateAdvertising(modelId);
+      setModel(calculated);
+      setForm(adsFormFromModel(calculated));
+      const listed = await listAdvertisingSnapshots(modelId);
+      setHistory(listed.items);
+    } catch (err) {
+      setError(err instanceof ProfitError ? err.message : "Could not calculate advertising impact.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const snapshot = model?.latest_snapshot ?? null;
+  const outputs = snapshot?.outputs;
+  const impact = snapshot?.impact ?? model?.impact ?? null;
+  const inputs = snapshot?.inputs;
+  const unknownCopy = advertisingUnknownMessages(
+    snapshot?.completeness.messages,
+    impact?.messages,
+  );
+
+  return (
+    <Section
+      title="Advertising Intelligence"
+      description="Period advertising inputs. Python calculates ACOS, TACOS, ROAS, and after-ads profit. The browser does not compute those metrics."
+    >
+      {error ? (
+        <Alert variant="destructive" className="mt-4">
+          <AlertTitle>Could not continue</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+      {unknownCopy.length ? (
+        <Alert className="mt-4">
+          <AlertTitle>Unknown advertising values</AlertTitle>
+          <AlertDescription>
+            {unknownCopy.map((item) => (
+              <p key={item}>{item}</p>
+            ))}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {model?.profit_snapshot_stale ? (
+        <Alert className="mt-4">
+          <AlertTitle>Unit economics changed</AlertTitle>
+          <AlertDescription>
+            Unit economics changed since this ads snapshot. Recalculate advertising
+            impact. After-ads profit is not a matched monthly P&L — it uses the cited
+            unit snapshot plus this advertising period.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {loading ? (
+        <p className="mt-4 text-sm text-muted-foreground">Loading advertising inputs…</p>
+      ) : (
+        <div className="mt-4 grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <Panel className="p-6">
+            <Section
+              title="Advertising inputs"
+              description="Seller-entered period totals. Blank means unknown — it is not treated as zero."
+            >
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="ads-period-start">Period start</Label>
+                  <Input
+                    id="ads-period-start"
+                    type="date"
+                    value={form.period_start}
+                    onChange={(event) => setForm({ ...form, period_start: event.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ads-period-end">Period end</Label>
+                  <Input
+                    id="ads-period-end"
+                    type="date"
+                    value={form.period_end}
+                    onChange={(event) => setForm({ ...form, period_end: event.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ads-spend">Ad spend</Label>
+                  <Input
+                    id="ads-spend"
+                    inputMode="decimal"
+                    value={form.ad_spend}
+                    onChange={(event) => setForm({ ...form, ad_spend: event.target.value })}
+                    placeholder="0.00"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ads-sales">Ad sales</Label>
+                  <Input
+                    id="ads-sales"
+                    inputMode="decimal"
+                    value={form.ad_sales}
+                    onChange={(event) => setForm({ ...form, ad_sales: event.target.value })}
+                    placeholder="0.00"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ads-total-sales">Total sales</Label>
+                  <Input
+                    id="ads-total-sales"
+                    inputMode="decimal"
+                    value={form.total_sales}
+                    onChange={(event) => setForm({ ...form, total_sales: event.target.value })}
+                    placeholder="Required for TACOS"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ads-units">Units in period</Label>
+                  <Input
+                    id="ads-units"
+                    inputMode="decimal"
+                    value={form.units_in_period}
+                    onChange={(event) => setForm({ ...form, units_in_period: event.target.value })}
+                    placeholder="Required for after-ads profit"
+                  />
+                </div>
+              </div>
+              <div className="mt-6">
+                <Button onClick={() => void persistAndCalculate()} disabled={saving}>
+                  {saving ? <Loader2 className="animate-spin" /> : null}
+                  Calculate advertising impact
+                </Button>
+              </div>
+            </Section>
+          </Panel>
+          <Panel className="p-6">
+            <Section
+              title="Advertising results"
+              description="Values come from the API. ACOS, TACOS, and ROAS are not calculated in the browser."
+            >
+              <div className="mt-4 grid gap-6 sm:grid-cols-2">
+                <Kpi label="ACOS" value={formatPercent(outputs?.acos)} />
+                <Kpi label="TACOS" value={formatPercent(outputs?.tacos)} />
+                <Kpi label="ROAS" value={formatRoas(outputs?.roas)} />
+                <Kpi label="Ad spend" value={formatInr(inputs?.ad_spend)} />
+                <Kpi label="Ad sales" value={formatInr(inputs?.ad_sales)} />
+                <Kpi label="Net profit after ads" value={formatInr(impact?.net_profit_after_ads)} hint="Per unit" />
+                <Kpi
+                  label="Break-even ACOS"
+                  value={formatPercent(impact?.break_even_acos)}
+                  hint="Pre-ads margin. Not a TACOS cap. Volume and other costs assumed constant."
+                />
+              </div>
+              <div className="mt-4">
+                <StatusBadge status={snapshot?.status ?? null} unknown={snapshot?.completeness.unknown ?? []} />
+              </div>
+            </Section>
+          </Panel>
+        </div>
+      )}
+      <div className="mt-6">
+        <Section title="Advertising history" description="Previous snapshots are read-only. Saving inputs and calculating creates a new snapshot.">
+          {history.length === 0 ? (
+            <EmptyState
+              title="No advertising snapshots yet"
+              description="Enter a period and calculate to create an immutable advertising snapshot."
+            />
+          ) : (
+            <div className="mt-3 overflow-x-auto rounded-lg border border-border">
+              <table className="w-full text-sm">
+                <thead className="bg-surface-subtle text-left text-muted-foreground">
+                  <tr>
+                    <th className="px-4 py-2 font-medium">Period</th>
+                    <th className="px-4 py-2 font-medium">ACOS</th>
+                    <th className="px-4 py-2 font-medium">TACOS</th>
+                    <th className="px-4 py-2 font-medium">Status</th>
+                    <th className="px-4 py-2 font-medium">Calculated</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((row) => (
+                    <tr key={row.id} className="border-t border-border">
+                      <td className="px-4 py-2 tabular-nums">
+                        {row.period_start && row.period_end
+                          ? `${row.period_start} – ${row.period_end}`
+                          : "Unknown period"}
+                      </td>
+                      <td className="px-4 py-2 tabular-nums">{formatPercent(row.acos)}</td>
+                      <td className="px-4 py-2 tabular-nums">{formatPercent(row.tacos)}</td>
+                      <td className="px-4 py-2">
+                        <StatusBadge status={row.status} unknown={[]} />
+                      </td>
+                      <td className="px-4 py-2 text-muted-foreground">
+                        {new Date(row.calculated_at).toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Section>
+      </div>
+    </Section>
   );
 }
 

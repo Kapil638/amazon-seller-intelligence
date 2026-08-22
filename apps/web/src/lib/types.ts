@@ -1325,3 +1325,88 @@ export type ProfitModelInputs = {
   selling_price_source?: string | null;
   fee_category_key?: string | null;
 };
+
+export type AdvertisingInputs = {
+  ad_spend: string | null;
+  ad_sales: string | null;
+  total_sales: string | null;
+  units_in_period: string | null;
+  period_start: string | null;
+  period_end: string | null;
+};
+
+export type AdvertisingOutputs = {
+  acos: string | null;
+  tacos: string | null;
+  roas: string | null;
+};
+
+export type AdvertisingImpact = {
+  ad_spend_per_unit: string | null;
+  net_profit_after_ads: string | null;
+  break_even_acos: string | null;
+  profit_snapshot_id: string | null;
+  unknown: string[];
+  messages: string[];
+};
+
+export type AdvertisingSnapshot = {
+  id: string;
+  organization_id: string;
+  advertising_model_id: string;
+  profit_model_id: string;
+  status: string;
+  ads_formula_version: string;
+  inputs: AdvertisingInputs;
+  outputs: AdvertisingOutputs;
+  completeness: ProfitCompleteness;
+  impact: AdvertisingImpact | null;
+  evidence: ProfitEvidence;
+  calculated_at: string;
+};
+
+export type AdvertisingSnapshotSummary = {
+  id: string;
+  status: string;
+  period_start: string | null;
+  period_end: string | null;
+  acos: string | null;
+  tacos: string | null;
+  calculated_at: string;
+};
+
+export type AdvertisingSnapshotListResponse = {
+  items: AdvertisingSnapshotSummary[];
+  total: number;
+};
+
+export type AdvertisingModel = {
+  id: string;
+  organization_id: string;
+  profit_model_id: string;
+  asin: string;
+  marketplace: string;
+  currency: string;
+  source: string;
+  period_start: string | null;
+  period_end: string | null;
+  ad_spend: string | null;
+  ad_sales: string | null;
+  total_sales: string | null;
+  units_in_period: string | null;
+  latest_snapshot: AdvertisingSnapshot | null;
+  impact: AdvertisingImpact | null;
+  profit_snapshot_stale: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdvertisingModelInputs = {
+  period_start?: string | null;
+  period_end?: string | null;
+  ad_spend?: string | null;
+  ad_sales?: string | null;
+  total_sales?: string | null;
+  units_in_period?: string | null;
+};
+
