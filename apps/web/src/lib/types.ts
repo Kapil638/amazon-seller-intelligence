@@ -1410,3 +1410,32 @@ export type AdvertisingModelInputs = {
   units_in_period?: string | null;
 };
 
+export type AmazonConnectionStatus = "CONNECTED" | "NOT_CONNECTED" | "FAILED";
+
+export type AmazonAdsConnectionPlaceholder = {
+  provider: "ADS_API";
+  status: "NOT_CONNECTED";
+};
+
+export type AmazonConnectionOverview = {
+  status: AmazonConnectionStatus;
+  provider: "SP_API";
+  environment: "SANDBOX";
+  marketplace: string;
+  application: string;
+  credentials_configured: boolean;
+  last_test_at: string | null;
+  organization_id: string;
+  ads_api: AmazonAdsConnectionPlaceholder;
+};
+
+export type AmazonConnectionTestResult = {
+  status: AmazonConnectionStatus;
+  provider: "SP_API";
+  environment: "SANDBOX";
+  marketplace: string;
+  operation: string;
+  tested_at: string;
+  message: string | null;
+};
+

@@ -41,6 +41,8 @@ import type {
   AdvertisingModelInputs,
   AdvertisingSnapshot,
   AdvertisingSnapshotListResponse,
+  AmazonConnectionOverview,
+  AmazonConnectionTestResult,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1158,6 +1160,54 @@ async function profitRequest<T>(path: string, init?: RequestInit): Promise<T> {
     "Profit Intelligence could not complete this request.",
     "unknown",
   );
+}
+
+export class AmazonConnectionError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "AmazonConnectionError";
+  }
+}
+
+async function amazonConnectionRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, {
+      cache: "no-store",
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new AmazonConnectionError(
+      "Amazon Connection could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  throw new AmazonConnectionError(
+    detail || "Amazon Connection could not complete this request.",
+    response.status === 503 ? "unavailable" : "unknown",
+  );
+}
+
+export async function fetchAmazonConnection(): Promise<AmazonConnectionOverview> {
+  return amazonConnectionRequest<AmazonConnectionOverview>("/connection");
+}
+
+export async function testAmazonConnection(): Promise<AmazonConnectionTestResult> {
+  return amazonConnectionRequest<AmazonConnectionTestResult>("/connection/test", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export async function createProfitModel(payload: {
