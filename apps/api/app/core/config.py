@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     storage_uploads_bucket: str = "seller-report-uploads"
     storage_generated_bucket: str = "generated-reports"
     signed_url_ttl_seconds: int = 300
+    sp_api_sandbox_enabled: bool = False
+    sp_api_lwa_client_id: SecretStr | None = None
+    sp_api_lwa_client_secret: SecretStr | None = None
+    sp_api_sandbox_refresh_token: SecretStr | None = None
+    sp_api_region: str = "eu"
+    sp_api_sandbox_base_url: str = ""
+    sp_api_lwa_token_url: str = "https://api.amazon.com/auth/o2/token"
+    sp_api_timeout_seconds: float = 30
+    sp_api_user_agent: str = "AmazonSellerIntelligence/12A.0 (Language=Python/3.12)"
+    sp_api_application_name: str = "EWise"
 
 
 @lru_cache

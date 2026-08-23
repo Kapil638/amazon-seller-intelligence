@@ -259,3 +259,28 @@ class ProfitModelConflictError(Exception):
 class AdvertisingValidationError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class SpApiConfigurationError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class SpApiAuthenticationError(Exception):
+    def __init__(self, message: str = "Amazon SP-API authentication failed.") -> None:
+        super().__init__(message)
+
+
+class SpApiRateLimitedError(Exception):
+    def __init__(self, message: str = "Amazon SP-API rate limit reached.") -> None:
+        super().__init__(message)
+
+
+class SpApiRequestFailedError(Exception):
+    def __init__(self, message: str = "Amazon SP-API request failed.") -> None:
+        super().__init__(message)
+
+
+class SpApiParseFailedError(Exception):
+    def __init__(self, message: str = "Amazon SP-API response could not be parsed.") -> None:
+        super().__init__(message)
