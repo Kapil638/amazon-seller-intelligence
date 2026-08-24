@@ -7,8 +7,9 @@
 
 | Ref | Value |
 | --- | --- |
-| Implementation commit | `fb2704b` — feat(amazon): persist connection metadata, secrets, OAuth, and seller validation |
-| Handover docs commit | recorded in the commit that includes this file (see `git log -1`) |
+| Implementation commit | `fb2704be0b857bdbad09cff2e711f54c46ce026f` — feat(amazon): persist connection metadata, secrets, OAuth, and seller validation |
+| Handover docs commit | `8ba636a792fd89d16b6a573be7d062fbe0213d3b` — docs(handover): prepare ASI repository for Claude development |
+| Checkpoint tag | `amazon-seller-connection-foundation-v1` (this file’s recording commit) |
 | Prior freeze | tag `amazon-api-foundation-v1` at `67f54126c6ac165fe6db81a285c2e4fdad36adf8` |
 
 ## Current completed milestone
