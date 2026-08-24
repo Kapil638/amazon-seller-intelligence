@@ -1,4 +1,7 @@
-"""Login with Amazon token client. Refresh-token grant only. Never logs secrets."""
+"""Login with Amazon token client. Refresh-token grant only. Never logs secrets.
+
+Authorization-code exchange lives in `AmazonLwaTokenService` (`lwa_token.py`).
+"""
 
 from __future__ import annotations
 
@@ -40,6 +43,32 @@ def credentials_configured(
     refresh_token: SecretStr | str | None,
 ) -> bool:
     return bool(_secret_text(client_id) and _secret_text(client_secret) and _secret_text(refresh_token))
+
+
+def raise_for_lwa_status(status: int) -> None:
+    """Map LWA HTTP status to a safe exception. Never logs response bodies."""
+    if status == 200:
+        return
+    if status in {400, 401, 403}:
+        logger.warning("LWA token request rejected status=%s", status)
+        raise SpApiAuthenticationError("Amazon LWA authentication failed.")
+    if status == 429:
+        logger.warning("LWA token request rate-limited status=%s", status)
+        raise SpApiRateLimitedError("Amazon LWA rate limit reached.")
+    logger.warning("LWA token request failed status=%s", status)
+    raise SpApiRequestFailedError("Amazon LWA token request failed.")
+
+
+def read_lwa_json(response: httpx.Response) -> dict:
+    """Return the LWA JSON object. Never logs the payload."""
+    raise_for_lwa_status(response.status_code)
+    try:
+        payload = response.json()
+    except ValueError:
+        raise SpApiParseFailedError("Amazon LWA returned a non-JSON token response.") from None
+    if not isinstance(payload, dict):
+        raise SpApiParseFailedError("Amazon LWA token response was malformed.")
+    return payload
 
 
 class LwaClient:
@@ -92,24 +121,8 @@ class LwaClient:
         return self._parse_response(response)
 
     def _parse_response(self, response: httpx.Response) -> LwaTokenResponse:
-        status = response.status_code
-        if status in {400, 401, 403}:
-            logger.warning("LWA token request rejected status=%s", status)
-            raise SpApiAuthenticationError("Amazon LWA authentication failed.")
-        if status == 429:
-            logger.warning("LWA token request rate-limited status=%s", status)
-            raise SpApiRateLimitedError("Amazon LWA rate limit reached.")
-        if status >= 500:
-            logger.warning("LWA token request failed status=%s", status)
-            raise SpApiRequestFailedError("Amazon LWA token request failed.")
-        if status != 200:
-            logger.warning("LWA token request unexpected status=%s", status)
-            raise SpApiRequestFailedError("Amazon LWA token request failed.")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise SpApiParseFailedError("Amazon LWA returned a non-JSON token response.") from exc
+        payload = read_lwa_json(response)
         try:
             return LwaTokenResponse.model_validate(payload)
-        except ValidationError as exc:
-            raise SpApiParseFailedError("Amazon LWA token response was malformed.") from exc
+        except ValidationError:
+            raise SpApiParseFailedError("Amazon LWA token response was malformed.") from None

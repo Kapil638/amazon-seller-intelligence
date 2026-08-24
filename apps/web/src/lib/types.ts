@@ -1412,6 +1412,17 @@ export type AdvertisingModelInputs = {
 
 export type AmazonConnectionStatus = "CONNECTED" | "NOT_CONNECTED" | "FAILED";
 
+export type AmazonConnectionLifecycleStatus =
+  | "not_connected"
+  | "pending_authorization"
+  | "pending_validation"
+  | "connected"
+  | "degraded"
+  | "revoked"
+  | "error";
+
+export type AmazonConnectionEnvironment = "SANDBOX" | "PRODUCTION";
+
 export type AmazonAdsConnectionPlaceholder = {
   provider: "ADS_API";
   status: "NOT_CONNECTED";
@@ -1419,11 +1430,19 @@ export type AmazonAdsConnectionPlaceholder = {
 
 export type AmazonConnectionOverview = {
   status: AmazonConnectionStatus;
+  connection_status: AmazonConnectionLifecycleStatus;
+  persisted: boolean;
   provider: "SP_API";
-  environment: "SANDBOX";
+  environment: AmazonConnectionEnvironment;
+  region: string;
   marketplace: string;
   application: string;
   credentials_configured: boolean;
+  selling_partner_id: string | null;
+  authorized_at: string | null;
+  last_successful_validation_at: string | null;
+  last_successful_sync_at: string | null;
+  last_error_code: string | null;
   last_test_at: string | null;
   organization_id: string;
   ads_api: AmazonAdsConnectionPlaceholder;
@@ -1432,10 +1451,19 @@ export type AmazonConnectionOverview = {
 export type AmazonConnectionTestResult = {
   status: AmazonConnectionStatus;
   provider: "SP_API";
-  environment: "SANDBOX";
+  environment: AmazonConnectionEnvironment;
   marketplace: string;
   operation: string;
   tested_at: string;
   message: string | null;
+};
+
+export type AmazonAuthorizationStart = {
+  authorization_url: string;
+  expires_at: string;
+  connection_status: AmazonConnectionLifecycleStatus;
+  provider: "SP_API";
+  environment: AmazonConnectionEnvironment;
+  organization_id: string;
 };
 

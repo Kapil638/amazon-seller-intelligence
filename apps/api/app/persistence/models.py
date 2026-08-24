@@ -4,7 +4,21 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.persistence.types import Guid, JsonPayload
@@ -456,3 +470,97 @@ class AdvertisingSnapshot(Base):
 
     organization: Mapped[Organization] = relationship()
     model: Mapped[AdvertisingModel] = relationship(back_populates="snapshots")
+
+
+class AmazonConnection(Base):
+    """Organization-owned Amazon authorization metadata. Not seller business data.
+
+    Stores connection state only. Never stores refresh tokens, access tokens,
+    LWA client secrets, or API credentials. `token_reference` is an opaque
+    placeholder for a later SecretProvider; it is not a secret value.
+    """
+
+    __tablename__ = "amazon_connections"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "provider",
+            "environment",
+            name="uq_amazon_connections_org_provider_env",
+        ),
+        Index("ix_amazon_connections_org", "organization_id"),
+        CheckConstraint(
+            "status IN ("
+            "'not_connected', 'pending_authorization', 'pending_validation', "
+            "'connected', 'degraded', 'revoked', 'error'"
+            ")",
+            name="ck_amazon_connections_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    environment: Mapped[str] = mapped_column(String(32), nullable=False)
+    region: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_connected")
+    selling_partner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    application_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_successful_validation_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+
+
+class AmazonOAuthState(Base):
+    """Temporary Amazon authorization transaction. Stores a state hash only.
+
+    Never stores the raw OAuth state, authorization codes, refresh tokens,
+    access tokens, or client secrets.
+    """
+
+    __tablename__ = "amazon_oauth_states"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_amazon_oauth_states_state_hash"),
+        Index("ix_amazon_oauth_states_org", "organization_id"),
+        Index("ix_amazon_oauth_states_connection_id", "connection_id"),
+        Index("ix_amazon_oauth_states_expires_at", "expires_at"),
+        CheckConstraint(
+            "provider IN ('SP_API')",
+            name="ck_amazon_oauth_states_provider",
+        ),
+        CheckConstraint(
+            "environment IN ('SANDBOX', 'PRODUCTION')",
+            name="ck_amazon_oauth_states_environment",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    environment: Mapped[str] = mapped_column(String(32), nullable=False)
+    connection_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_connections.id", ondelete="RESTRICT"), nullable=False
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    amazon_state: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    organization: Mapped[Organization] = relationship()
+    connection: Mapped[AmazonConnection] = relationship()

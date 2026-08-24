@@ -28,9 +28,17 @@ SECRET_KEY_FRAGMENTS = (
     "x_amz_access",
 )
 
+# Public JSON keys that contain a secret fragment but are not credentials.
+# `authorization_url` is the Seller Central consent URL (12B.1C.2), not an
+# Authorization header or authorization_code.
+# `authorization_code_present` is a boolean flag (12B.1C.4A), not the code.
+PUBLIC_KEY_ALLOWLIST = frozenset({"authorization_url", "authorization_code_present"})
+
 
 def contains_secret_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
+    if normalized in PUBLIC_KEY_ALLOWLIST:
+        return False
     return any(fragment in normalized for fragment in SECRET_KEY_FRAGMENTS)
 
 

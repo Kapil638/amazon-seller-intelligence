@@ -43,6 +43,8 @@ import type {
   AdvertisingSnapshotListResponse,
   AmazonConnectionOverview,
   AmazonConnectionTestResult,
+  AmazonAuthorizationStart,
+  AmazonConnectionEnvironment,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1208,6 +1210,44 @@ export async function testAmazonConnection(): Promise<AmazonConnectionTestResult
     method: "POST",
     body: JSON.stringify({}),
   });
+}
+
+const AUTHORIZE_START_FAILED = "Unable to start Amazon connection. Please try again.";
+
+function isSellerCentralAuthorizationUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:") {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    const sellerCentral = host.startsWith("sellercentral.") || host.startsWith("sellercentral-");
+    if (!sellerCentral || !host.includes("amazon.")) {
+      return false;
+    }
+    return (
+      parsed.pathname === "/apps/authorize/consent" ||
+      parsed.pathname.endsWith("/apps/authorize/consent")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function authorizeAmazonConnection(
+  environment: AmazonConnectionEnvironment = "SANDBOX",
+): Promise<AmazonAuthorizationStart> {
+  const result = await amazonConnectionRequest<AmazonAuthorizationStart>("/connection/authorize", {
+    method: "POST",
+    body: JSON.stringify({ environment }),
+  });
+  if (
+    typeof result?.authorization_url !== "string" ||
+    !isSellerCentralAuthorizationUrl(result.authorization_url)
+  ) {
+    throw new AmazonConnectionError(AUTHORIZE_START_FAILED, "unknown");
+  }
+  return result;
 }
 
 export async function createProfitModel(payload: {

@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.amazon.secrets import InvalidSecretReferenceError, parse_asi_amazon_secret_reference
 from app.core.config import get_settings
 from app.persistence.hashing import product_content_hash, sha256_bytes
 from app.persistence.models import (
@@ -28,6 +29,8 @@ from app.persistence.models import (
     ProfitSnapshot,
     AdvertisingModel,
     AdvertisingSnapshot,
+    AmazonConnection,
+    AmazonOAuthState,
 )
 
 
@@ -926,6 +929,306 @@ class AdvertisingModelRepository:
         self.session.add(row)
         self.session.flush()
         return row
+
+
+class AmazonConnectionRepository:
+    """Org-scoped Amazon connection metadata. No secrets, no Amazon API calls."""
+
+    _SECRET_FIELDS = frozenset(
+        {
+            "refresh_token",
+            "access_token",
+            "client_secret",
+            "client_id",
+            "token_reference",
+            "authorization_code",
+            "spapi_oauth_code",
+            "oauth_code",
+        }
+    )
+    _LIFECYCLE_FIELDS = frozenset(
+        {
+            "status",
+            "last_successful_validation_at",
+            "last_successful_sync_at",
+            "last_error_at",
+            "last_error_code",
+            "authorized_at",
+            "selling_partner_id",
+        }
+    )
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        provider: str,
+        environment: str,
+        region: str,
+        status: str = "not_connected",
+        selling_partner_id: str | None = None,
+        application_id: str | None = None,
+    ) -> AmazonConnection:
+        row = AmazonConnection(
+            organization_id=organization_id,
+            provider=provider,
+            environment=environment,
+            region=region,
+            status=status,
+            selling_partner_id=selling_partner_id,
+            application_id=application_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get(
+        self,
+        organization_id: UUID,
+        *,
+        provider: str = "SP_API",
+        environment: str = "SANDBOX",
+    ) -> AmazonConnection | None:
+        return self.session.scalars(
+            select(AmazonConnection).where(
+                AmazonConnection.organization_id == organization_id,
+                AmazonConnection.provider == provider,
+                AmazonConnection.environment == environment,
+            )
+        ).first()
+
+    def get_by_id(self, organization_id: UUID, connection_id: UUID) -> AmazonConnection | None:
+        return self.session.scalars(
+            select(AmazonConnection).where(
+                AmazonConnection.organization_id == organization_id,
+                AmazonConnection.id == connection_id,
+            )
+        ).first()
+
+    def list_for_org(self, organization_id: UUID) -> list[AmazonConnection]:
+        statement: Select[tuple[AmazonConnection]] = (
+            select(AmazonConnection)
+            .where(AmazonConnection.organization_id == organization_id)
+            .order_by(AmazonConnection.created_at.asc(), AmazonConnection.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def update(
+        self,
+        organization_id: UUID,
+        connection_id: UUID,
+        **fields: Any,
+    ) -> AmazonConnection | None:
+        if self._SECRET_FIELDS.intersection(fields):
+            raise TypeError("Amazon connection repository cannot store secret fields.")
+        unknown = set(fields) - self._LIFECYCLE_FIELDS
+        if unknown:
+            raise TypeError(f"Unsupported Amazon connection update fields: {sorted(unknown)}")
+        row = self.get_by_id(organization_id, connection_id)
+        if row is None:
+            return None
+        for name, value in fields.items():
+            setattr(row, name, value)
+        row.updated_at = datetime.now(UTC)
+        self.session.flush()
+        return row
+
+    def bind_token_reference(
+        self,
+        organization_id: UUID,
+        connection_id: UUID,
+        token_reference: str,
+    ) -> AmazonConnection | None:
+        """Persist an opaque ASI pointer only. Never stores token material."""
+        try:
+            parsed = parse_asi_amazon_secret_reference(token_reference)
+        except InvalidSecretReferenceError as exc:
+            raise TypeError("Amazon connection repository cannot store secret fields.") from exc
+        if parsed.organization_id.lower() != str(organization_id).lower():
+            raise TypeError("Amazon token reference organization does not match.")
+        if parsed.connection_id.lower() != str(connection_id).lower():
+            raise TypeError("Amazon token reference connection does not match.")
+        row = self.get_by_id(organization_id, connection_id)
+        if row is None:
+            return None
+        if parsed.provider != row.provider or parsed.environment != row.environment:
+            raise TypeError("Amazon token reference does not match this connection.")
+        row.token_reference = parsed.value
+        row.updated_at = datetime.now(UTC)
+        self.session.flush()
+        return row
+
+    def clear_token_reference(
+        self,
+        organization_id: UUID,
+        connection_id: UUID,
+    ) -> AmazonConnection | None:
+        """Clear the opaque pointer only. Never writes token material."""
+        row = self.get_by_id(organization_id, connection_id)
+        if row is None:
+            return None
+        row.token_reference = None
+        row.updated_at = datetime.now(UTC)
+        self.session.flush()
+        return row
+
+    def delete(self, organization_id: UUID, connection_id: UUID) -> bool:
+        row = self.get_by_id(organization_id, connection_id)
+        if row is None:
+            return False
+        self.session.delete(row)
+        self.session.flush()
+        return True
+
+
+class AmazonOAuthStateRepository:
+    """Org-scoped hashed OAuth state. Never stores raw state or tokens."""
+
+    _SECRET_FIELDS = frozenset(
+        {
+            "refresh_token",
+            "access_token",
+            "client_secret",
+            "client_id",
+            "token_reference",
+            "authorization_code",
+            "oauth_code",
+            "spapi_oauth_code",
+            "state",
+        }
+    )
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _reject_secrets(self, fields: dict[str, Any]) -> None:
+        if self._SECRET_FIELDS.intersection(fields):
+            raise TypeError("Amazon OAuth state repository cannot store secret fields.")
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        provider: str,
+        environment: str,
+        connection_id: UUID,
+        state_hash: str,
+        expires_at: datetime,
+        amazon_state: str | None = None,
+    ) -> AmazonOAuthState:
+        self._reject_secrets(
+            {
+                "organization_id": organization_id,
+                "provider": provider,
+                "environment": environment,
+                "connection_id": connection_id,
+                "state_hash": state_hash,
+                "expires_at": expires_at,
+                "amazon_state": amazon_state,
+            }
+        )
+        digest = state_hash.strip()
+        if len(digest) != 64:
+            raise TypeError("Amazon OAuth state hash is invalid.")
+        connection = self.session.get(AmazonConnection, connection_id)
+        if connection is None or connection.organization_id != organization_id:
+            raise TypeError("Amazon OAuth state cannot bind a connection from another organization.")
+        row = AmazonOAuthState(
+            organization_id=organization_id,
+            provider=provider,
+            environment=environment,
+            connection_id=connection_id,
+            state_hash=digest,
+            amazon_state=amazon_state,
+            expires_at=expires_at,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_by_hash(self, organization_id: UUID, state_hash: str) -> AmazonOAuthState | None:
+        return self.session.scalars(
+            select(AmazonOAuthState).where(
+                AmazonOAuthState.organization_id == organization_id,
+                AmazonOAuthState.state_hash == state_hash,
+            )
+        ).first()
+
+    def get_usable_by_hash(
+        self,
+        organization_id: UUID,
+        state_hash: str,
+        *,
+        now: datetime | None = None,
+    ) -> AmazonOAuthState | None:
+        row = self.get_by_hash(organization_id, state_hash)
+        if row is None:
+            return None
+        moment = now or datetime.now(UTC)
+        expires = row.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        if row.consumed_at is not None or expires <= moment:
+            return None
+        return row
+
+    def classify(
+        self,
+        organization_id: UUID,
+        state_hash: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[AmazonOAuthState | None, str]:
+        """Return (row, missing|expired|consumed|usable). Org-scoped; unknown hash is missing."""
+        row = self.get_by_hash(organization_id, state_hash)
+        if row is None:
+            return None, "missing"
+        moment = now or datetime.now(UTC)
+        expires = row.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        if row.consumed_at is not None:
+            return row, "consumed"
+        if expires <= moment:
+            return row, "expired"
+        return row, "usable"
+
+    def consume(
+        self,
+        organization_id: UUID,
+        state_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> AmazonOAuthState | None:
+        row = self.get_by_id(organization_id, state_id)
+        if row is None or row.consumed_at is not None:
+            return None
+        row.consumed_at = now or datetime.now(UTC)
+        self.session.flush()
+        return row
+
+    def get_by_id(self, organization_id: UUID, state_id: UUID) -> AmazonOAuthState | None:
+        return self.session.scalars(
+            select(AmazonOAuthState).where(
+                AmazonOAuthState.organization_id == organization_id,
+                AmazonOAuthState.id == state_id,
+            )
+        ).first()
+
+    def list_for_org(self, organization_id: UUID) -> list[AmazonOAuthState]:
+        statement: Select[tuple[AmazonOAuthState]] = (
+            select(AmazonOAuthState)
+            .where(AmazonOAuthState.organization_id == organization_id)
+            .order_by(AmazonOAuthState.created_at.asc(), AmazonOAuthState.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
 
 
 def file_sha256(data: bytes) -> str:

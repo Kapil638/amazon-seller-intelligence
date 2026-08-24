@@ -18,6 +18,17 @@ class LwaTokenResponse(BaseModel):
     expires_in: int
 
 
+class LwaAuthorizationGrant(BaseModel):
+    """Authorization-code grant. Tokens are SecretStr; never log or dump publicly."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    access_token: SecretStr
+    refresh_token: SecretStr
+    token_type: str
+    expires_in: int
+
+
 class Marketplace(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -48,6 +59,7 @@ class GetMarketplaceParticipationsResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     payload: list[MarketplaceParticipation] | None = None
+    selling_partner_id: str | None = Field(default=None, alias="sellingPartnerId")
     errors: list[dict] | None = None
 
 

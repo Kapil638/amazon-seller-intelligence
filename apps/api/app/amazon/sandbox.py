@@ -5,15 +5,24 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from urllib.parse import urlparse
+from uuid import UUID
 
 import httpx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
-from app.amazon.lwa import LwaClient
+from app.amazon.lwa import MISSING_CREDENTIALS_MESSAGE, LwaClient
 from app.amazon.models import (
     GetMarketplaceParticipationsResponse,
     MarketplaceParticipationsSandboxResult,
     SpApiSandboxProvenance,
+)
+from app.amazon.secrets import (
+    InvalidSecretReferenceError,
+    SecretAccessError,
+    SecretNotFoundError,
+    SecretProvider,
+    development_sandbox_token_reference,
+    get_secret_provider,
 )
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
@@ -46,6 +55,24 @@ def sandbox_base_url(region: str, override: str = "") -> str:
     return SANDBOX_BASE_URLS[key]
 
 
+def resolve_sandbox_refresh_token(
+    *,
+    secret_provider: SecretProvider | None = None,
+    organization_id: UUID | str | None = None,
+) -> SecretStr:
+    """Resolve the seller refresh token through SecretProvider.
+
+    Uses the development sandbox reference only. Database token_reference
+    binding is out of scope for 12B.1B.3. App LWA client_id/client_secret
+    stay in settings.
+    """
+    try:
+        provider = secret_provider or get_secret_provider()
+        return provider.get_secret(development_sandbox_token_reference(organization_id))
+    except (SecretNotFoundError, SecretAccessError, InvalidSecretReferenceError):
+        raise SpApiConfigurationError(MISSING_CREDENTIALS_MESSAGE) from None
+
+
 class AmazonSpApiSandboxClient:
     """Authenticate with LWA, then call one Sellers static-sandbox operation."""
 
@@ -54,6 +81,7 @@ class AmazonSpApiSandboxClient:
         *,
         settings: Settings | None = None,
         lwa: LwaClient | None = None,
+        secret_provider: SecretProvider | None = None,
         transport: httpx.BaseTransport | None = None,
         base_url: str | None = None,
         region: str | None = None,
@@ -66,14 +94,21 @@ class AmazonSpApiSandboxClient:
         self._timeout = timeout_seconds if timeout_seconds is not None else cfg.sp_api_timeout_seconds
         self._user_agent = user_agent or cfg.sp_api_user_agent
         self._transport = transport
-        self._lwa = lwa or LwaClient(
-            client_id=cfg.sp_api_lwa_client_id,
-            client_secret=cfg.sp_api_lwa_client_secret,
-            refresh_token=cfg.sp_api_sandbox_refresh_token,
-            token_url=cfg.sp_api_lwa_token_url,
-            timeout_seconds=self._timeout,
-            transport=transport,
-        )
+        if lwa is not None:
+            self._lwa = lwa
+        else:
+            refresh_token = resolve_sandbox_refresh_token(
+                secret_provider=secret_provider,
+                organization_id=cfg.default_organization_id,
+            )
+            self._lwa = LwaClient(
+                client_id=cfg.sp_api_lwa_client_id,
+                client_secret=cfg.sp_api_lwa_client_secret,
+                refresh_token=refresh_token,
+                token_url=cfg.sp_api_lwa_token_url,
+                timeout_seconds=self._timeout,
+                transport=transport,
+            )
 
     def __repr__(self) -> str:
         return "AmazonSpApiSandboxClient()"

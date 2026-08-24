@@ -82,10 +82,36 @@ class Settings(BaseSettings):
     sp_api_sandbox_refresh_token: SecretStr | None = None
     sp_api_region: str = "eu"
     sp_api_sandbox_base_url: str = ""
+    sp_api_production_base_url: str = ""
     sp_api_lwa_token_url: str = "https://api.amazon.com/auth/o2/token"
     sp_api_timeout_seconds: float = 30
     sp_api_user_agent: str = "AmazonSellerIntelligence/12A.0 (Language=Python/3.12)"
     sp_api_application_name: str = "EWise"
+    # Sandbox app id. Used for Test Connection identity only.
+    sp_api_application_id: str = ""
+    # Draft / production app id used on the Seller Central consent URL.
+    sp_api_production_application_id: str = ""
+    sp_api_production_lwa_client_id: SecretStr | None = None
+    sp_api_production_lwa_client_secret: SecretStr | None = None
+    sp_api_oauth_consent_base_url: str = ""
+    sp_api_oauth_redirect_uri: str = ""
+    sp_api_oauth_state_ttl_seconds: int = 600
+    sp_api_consent_version_beta: bool = True
+    amazon_secret_backend: str = Field(
+        default="development",
+        description=(
+            "SecretProvider backend. development is the default live backend. "
+            "production is reserved and fails closed until a cloud provider is implemented. "
+            "Do not put cloud credentials here."
+        ),
+    )
+
+    def consent_application_id(self) -> str:
+        """Application id for website authorization. Production/Draft wins over sandbox."""
+        production = self.sp_api_production_application_id.strip()
+        if production:
+            return production
+        return self.sp_api_application_id.strip()
 
 
 @lru_cache
