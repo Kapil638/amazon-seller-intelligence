@@ -81,7 +81,7 @@ uv sync
 uv run alembic upgrade head
 ```
 
-Current Milestone 10 revision: `0001_m10_persistence`.
+Current Alembic head (24 August 2026): `0008_amazon_oauth_states`. Apply with `uv run alembic upgrade head`. Do not invent revisions. Amazon identity tables are 12B.2, not this persistence guide.
 
 Create a future migration:
 

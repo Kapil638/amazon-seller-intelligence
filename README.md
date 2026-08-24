@@ -2,11 +2,13 @@
 
 AI-powered Amazon seller intelligence platform.
 
-This repository currently contains **Milestone 0–11A**: a local monorepo with mock lookup, manual product input, deterministic listing intelligence (v1 and v2), optional **custom scoring profiles** (aggregate weights only), Rainforest real-ASIN lookup, AI listing strategy (V2 primary, V1 unchanged), optional image/media vision, competitor discovery and comparison, Seller Central report analytics, API usage, mock-only bulk ASIN due diligence, **persistent report history**, **soft-delete of saved analyses**, **client PDF export** of historical reports, and an **internal intelligence tool layer** for future Copilot (no chat UI yet).
+This repository currently contains **Milestones 0–12B.1D**: a local monorepo with Rainforest marketplace intelligence, deterministic listing/profit/advertising engines, Seller Copilot V1, and Amazon SP-API **connection + authorization + seller validation**. Seller business-data ingest has not started. Next approved work is **12B.2 Canonical Seller Identity + Marketplace Ingestion**.
+
+Claude onboarding: [`CLAUDE.md`](CLAUDE.md) and [`docs/AI_HANDOVER/17_CLAUDE_START_HERE.md`](docs/AI_HANDOVER/17_CLAUDE_START_HERE.md).
 
 ## What this project is
 
-Later milestones will add Amazon SP-API, Ads API, AI report interpretation, and human-approved Amazon actions.
+Ads API, seller listings/orders ingest, and human-approved Amazon actions remain future milestones. SP-API is connected through seller validation only (12B.1D).
 
 Right now the app does these things:
 
@@ -25,6 +27,8 @@ Right now the app does these things:
 13. Create organization **scoring profiles** that change only the V2 aggregate weights. Standard V2 remains the benchmark.
 14. Internal **intelligence tools** wrap Listing, Profit, and Advertising services for Copilot (`get_saved_report`, `analyze_listing_v2`, `get_profit_snapshot`, `get_advertising_snapshot`, and related tools). Copilot explains evidence; Python still owns scores and money math. These tools are not Skills.
 15. Open **Profit** to model unit economics for an ASIN. Python calculates profit, margin, and ROI. Missing COGS stays unknown. On the same worksheet, enter a period of advertising spend to see ACOS, TACOS, ROAS, and profit after ads. Copilot can read those snapshots through ToolRegistry; it does not recalculate them.
+16. Open **Seller Copilot** at `/copilot` for plan → confirm → tool execution → cited synthesis. Copilot does not call Rainforest or SP-API directly.
+17. Open **Amazon Connection** at `/connection` to run sandbox **Test Connection** or start **Connect Amazon** (OAuth). A seller is `connected` only after SP-API Sellers validation (12B.1D). Tokens never appear in the UI.
 
 All product flows produce the same normalized `Product` object. Listing analysis is a separate step after a product is loaded. **V2 listing quality does not use rating, reviews, or BSR.** Competitor comparison reuses that product model and the V1 listing scorer. Primary listing AI sits on V2 deterministic results and does not replace scores. V1 AI remains available.
 
@@ -69,6 +73,10 @@ PATCH /api/v1/profit/models/{id}/advertising
 POST /api/v1/profit/models/{id}/advertising/calculate → ads-calc-v1 snapshot
 GET  /api/v1/profit/models/{id}/advertising/snapshots
 POST /api/v1/advertising/preview      → stateless ads calculate
+GET  /api/v1/amazon/connection        → AmazonConnectionService overview (no Amazon HTTP)
+POST /api/v1/amazon/connection/test   → sandbox Test Connection or 12B.1D seller handshake
+POST /api/v1/amazon/connection/authorize → hashed OAuth state + Seller Central consent URL
+GET  /api/v1/amazon/connection/callback → LWA code exchange; pending_validation (no SP-API)
 ```
 
 Persistence (when `DATABASE_URL` is set):
@@ -98,7 +106,7 @@ ProductDataProvider
         ├── MockProductDataProvider              [implemented]
         ├── RainforestProductDataProvider        [implemented, V1 default]
         ├── AmazonPublicProductDataProvider      [experimental]
-        └── AmazonOfficialProductDataProvider    [future]
+        └── AmazonOfficialProductDataProvider    [not implemented; SP-API is seller-owned ops, not this catalog provider]
 ```
 
 The rest of the application — API responses and the frontend — uses only the normalized internal `Product` model.
@@ -260,7 +268,7 @@ For tests with pip, also install `pytest`, `httpx`, and `pytest-asyncio`.
 
 Copy `apps/api/.env.example` to `apps/api/.env`. For real ASIN lookup set `RAINFOREST_API_KEY`. For AI recommendations set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` (default `gpt-5.4`). For saved History set `DATABASE_URL` (and Storage keys if you want uploaded/generated files kept). Keys stay in that backend file only. Never put them in Next.js or `NEXT_PUBLIC_*`. CORS is already set for `http://localhost:3000`.
 
-Persistence setup: [docs/persistence-supabase.md](docs/persistence-supabase.md). Schema: [docs/database-schema.md](docs/database-schema.md). Custom scoring profiles: [docs/custom-scoring-profiles.md](docs/custom-scoring-profiles.md). Report lifecycle: [docs/report-lifecycle.md](docs/report-lifecycle.md). Client PDFs: [docs/client-pdf-reports.md](docs/client-pdf-reports.md). Intelligence tools: [docs/milestone-11/copilot-tool-layer.md](docs/milestone-11/copilot-tool-layer.md). Completion records: [docs/persistence-report.md](docs/persistence-report.md), [docs/custom-scoring-profiles-report.md](docs/custom-scoring-profiles-report.md), [docs/milestone-11/milestone-11a-report.md](docs/milestone-11/milestone-11a-report.md).
+Persistence setup: [docs/persistence-supabase.md](docs/persistence-supabase.md). Schema: [docs/database-schema.md](docs/database-schema.md). Custom scoring profiles: [docs/custom-scoring-profiles.md](docs/custom-scoring-profiles.md). Report lifecycle: [docs/report-lifecycle.md](docs/report-lifecycle.md). Client PDFs: [docs/client-pdf-reports.md](docs/client-pdf-reports.md). Intelligence tools: [docs/milestone-11/copilot-tool-layer.md](docs/milestone-11/copilot-tool-layer.md). Amazon / Claude handover: [CLAUDE.md](CLAUDE.md), [docs/AI_HANDOVER/](docs/AI_HANDOVER/), [docs/milestone-12/README.md](docs/milestone-12/README.md). Completion records: [docs/persistence-report.md](docs/persistence-report.md), [docs/custom-scoring-profiles-report.md](docs/custom-scoring-profiles-report.md), [docs/milestone-11/milestone-11a-report.md](docs/milestone-11/milestone-11a-report.md).
 
 ```bash
 cd apps/api
@@ -285,7 +293,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Copilot lives at [http://localhost:3000/copilot](http://localhost:3000/copilot). Profit lives at [http://localhost:3000/profit](http://localhost:3000/profit).
+Open [http://localhost:3000](http://localhost:3000). Copilot lives at [http://localhost:3000/copilot](http://localhost:3000/copilot). Profit lives at [http://localhost:3000/profit](http://localhost:3000/profit). Amazon Connection lives at [http://localhost:3000/connection](http://localhost:3000/connection).
 
 `NEXT_PUBLIC_API_BASE_URL` must point at the FastAPI server (default `http://localhost:8000`). Do not hardcode localhost in application code.
 
@@ -350,6 +358,10 @@ Use these fictional catalog IDs against the mock provider:
 | POST | `/api/v1/profit/models/{id}/advertising/calculate` | Persist an immutable `ads-calc-v1` snapshot. |
 | GET | `/api/v1/profit/models/{id}/advertising/snapshots` | Advertising snapshot history. |
 | POST | `/api/v1/advertising/preview` | Stateless ads calculate. Client-sent ACOS/TACOS/ROAS are ignored. |
+| GET | `/api/v1/amazon/connection` | Sanitized Amazon connection overview. Never returns tokens or `token_reference`. Does not call Amazon. |
+| POST | `/api/v1/amazon/connection/test` | Sandbox env-token Test Connection, or seller validation handshake when a `token_reference` exists. |
+| POST | `/api/v1/amazon/connection/authorize` | Start Connect Amazon. Returns a Seller Central consent URL. |
+| GET | `/api/v1/amazon/connection/callback` | OAuth callback: exchange code, store refresh token in SecretProvider, bind opaque pointer, set `pending_validation`. |
 
 Optional query parameter on GET: `marketplace` (default `amazon.in`).
 
@@ -387,7 +399,8 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 - Seller reports are analyzed in memory. When persistence is configured, the original file is stored in private Storage (SHA-256 used to identify duplicates; they are not rejected).
 - Report analytics are **deterministic**. AI interpretation is not implemented.
 - Scoring thresholds are heuristics, not Amazon policy.
-- No SP-API or Ads API yet.
+- SP-API seller connection exists through **12B.1D validation**. Sandbox Test Connection is not seller authorization. Live website OAuth is not fully production-proven. Canonical seller identity ingest is **12B.2**. Listings/orders/inventory/reports/finances ingest has not started. Ads API is **12C**.
+- Rainforest remains the marketplace/public ASIN provider. Do not replace it with SP-API.
 - No Claude provider yet. OpenAI is the current AI provider.
 - **PostgreSQL + Supabase Storage** persist ASIN analysis history, upload metadata, bulk jobs, generated Excel, and usage events when `DATABASE_URL` is set. Short-term provider caches remain in-process memory.
 - Rainforest **account credits** come from the Account API. This app’s call counts are a separate ledger. See [docs/api-usage-dashboard.md](docs/api-usage-dashboard.md).
@@ -396,4 +409,5 @@ Set `PRODUCT_PROVIDER=rainforest` (default) for real Amazon.in lookup, `mock` fo
 - No authentication yet. A default development organization scopes persisted rows. RLS does not isolate users today because there is no login.
 - Intelligence tools and Copilot V1 exist: `/copilot` uses plan → execute/confirm → synthesize. Analyze, History, Reports, Bulk, and **Profit** remain the expert surfaces. Profit math is Python-only (`profit-calc-v1`). Advertising math is Python-only (`ads-calc-v1`). Copilot profit/ads tools read those engines through ToolRegistry. Skills are not implemented. There is **no** RAG or Amazon write path. See [docs/milestone-11/milestone-11d1-copilot-domain-tools.md](docs/milestone-11/milestone-11d1-copilot-domain-tools.md).
 - Re-analyze current listing (new snapshot + new report) and report deletion are not implemented.
-- India marketplace (`amazon.in`) only. Report money is treated as INR.
+- Listing/UI default marketplace is `amazon.in`. A connected seller’s marketplace participation may differ (canonical identity is 12B.2). Report money is treated as INR today.
+- Amazon Connection: `/connection`. Tokens never appear in the UI. See [docs/AI_HANDOVER/09_AMAZON_AUTHORIZATION_AND_SECURITY.md](docs/AI_HANDOVER/09_AMAZON_AUTHORIZATION_AND_SECURITY.md).

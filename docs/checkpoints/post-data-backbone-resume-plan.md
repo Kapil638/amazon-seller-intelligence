@@ -2,6 +2,7 @@
 
 **Created:** 22 August 2026  
 **Depends on:** [pre-amazon-api-data-backbone-checkpoint.md](pre-amazon-api-data-backbone-checkpoint.md)  
+**Updated note (24 August 2026):** Amazon connection foundation is complete through **12B.1D** (validation handshake only). Seller identity ingest (**12B.2**) and later slices are **not** done. Ads API is still **12C**. Do **not** resume Skill implementation from this document until canonical seller data is actually mature.  
 **Architecture:** [Milestone 11D Skill Architecture](../milestone-11d-architecture.md)  
 **Status:** Handoff only. **Do not execute these steps as part of the pre-API checkpoint.**
 

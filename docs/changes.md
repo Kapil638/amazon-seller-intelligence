@@ -1,10 +1,18 @@
 # Amazon Seller Intelligence — Change Summary
 
-**Date:** 21 August 2026  
-**Scope:** Milestone 11A Intelligence Tool Layer  
-**Status:** Milestone 11A complete. 11B Copilot chat, OpenAI planner, RAG, MCP, SP-API, Ads API, Redis/Celery, and authentication were not started.
+**Date:** 24 August 2026  
+**Scope:** Cursor → Claude handover at Milestone 12B.1D  
+**Status:** Historical log. Latest Amazon implementation is 12B.1D. Next is 12B.2.
 
 This document records what was built and updated. It is a change log, not a product spec.
+
+---
+
+## Milestone 12B.1A–12B.1D — Amazon seller connection foundation (24 August 2026)
+
+Connection metadata persistence, SecretProvider (development), seller OAuth through LWA refresh-token storage, and SP-API Sellers validation handshake. No ingest. No Copilot/Skills changes. No Ads API.
+
+See [milestone-12/README.md](milestone-12/README.md) and [AI_HANDOVER/17_CLAUDE_START_HERE.md](AI_HANDOVER/17_CLAUDE_START_HERE.md).
 
 ---
 

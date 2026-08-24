@@ -2,7 +2,7 @@
 
 **Date:** 23 August 2026  
 **Role:** Principal Architect  
-**Status:** Architecture and implementation planning only. **Do not implement until this document is approved and a slice is explicitly started.**  
+**Status:** Architecture approved. Connection/secret/OAuth/validation slices **12B.1A–12B.1D are implemented**. This file remains the architecture record. Do not start 12B.2 from this document without a dedicated slice.  
 **Depends on:** 12A.0, 12A.1, 12B, ADR 0002–0005  
 **Companion:** [Implementation plan](milestone-12b1-implementation-plan.md), [ADR 0006](../adr/0006-amazon-connection-credential-boundary.md)
 

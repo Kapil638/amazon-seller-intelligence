@@ -1,8 +1,12 @@
-# Database schema (Milestone 10 / 10B)
+# Database schema (current through Milestone 12B.1D)
 
 PostgreSQL via SQLAlchemy 2.0. JSON payloads use JSONB on PostgreSQL and JSON on the SQLite test database. Tests do not use JSONB operators.
 
 Authentication is **not** implemented. Every business table is scoped by `organization_id` (directly or through a parent row). Local/dev uses `DEFAULT_ORGANIZATION_ID`.
+
+Amazon connection tables are **authorization metadata**. They must never store refresh tokens, access tokens, LWA secrets, or authorization codes. Canonical seller-account / marketplace identity tables are **not created yet** (12B.2).
+
+Current Alembic head: `0008_amazon_oauth_states`. Chain: `0001_m10_persistence` → `0002_scoring_profiles` → `0003_report_lifecycle` → `0004_copilot_conversations` → `0005_profit_models` → `0006_advertising_models` → `0007_amazon_connections` → `0008_amazon_oauth_states`.
 
 Standard V2 scoring weights are a **code constant** (`standard-v2`), not a `scoring_profiles` row. One active custom default per organization is enforced in the service layer (SQLite-friendly; no PostgreSQL partial unique index).
 
@@ -19,6 +23,9 @@ erDiagram
   organizations ||--o{ usage_events : owns
   organizations ||--o{ profit_models : owns
   organizations ||--o{ advertising_models : owns
+  organizations ||--o{ amazon_connections : amazon_auth
+  organizations ||--o{ amazon_oauth_states : oauth_txn
+  amazon_connections ||--o{ amazon_oauth_states : states
   profit_models ||--o{ profit_snapshots : snapshots
   profit_models ||--o| advertising_models : advertising
   advertising_models ||--o{ advertising_snapshots : snapshots
@@ -266,6 +273,38 @@ erDiagram
     uuid profit_snapshot_id
     datetime calculated_at
   }
+
+  amazon_connections {
+    uuid id PK
+    uuid organization_id FK
+    string provider
+    string environment
+    string region
+    string status
+    string selling_partner_id
+    string application_id
+    string token_reference
+    datetime authorized_at
+    datetime last_successful_validation_at
+    datetime last_successful_sync_at
+    datetime last_error_at
+    string last_error_code
+    datetime created_at
+    datetime updated_at
+  }
+
+  amazon_oauth_states {
+    uuid id PK
+    uuid organization_id FK
+    uuid connection_id FK
+    string provider
+    string environment
+    string state_hash
+    string amazon_state
+    datetime expires_at
+    datetime consumed_at
+    datetime created_at
+  }
 ```
 
 `analysis_runs.id` is the public `report_id`.
@@ -287,9 +326,19 @@ Product snapshots are **append-only**. The same ASIN can have many snapshots (20
 - `advertising_models (profit_model_id)` unique
 - `advertising_models (organization_id, profit_model_id)`
 - `advertising_snapshots (organization_id, advertising_model_id, calculated_at)`
+- `amazon_connections (organization_id, provider, environment)` unique
+- `amazon_connections (organization_id)`
+- `amazon_oauth_states (state_hash)` unique
+- `amazon_oauth_states (organization_id)`
+- `amazon_oauth_states (connection_id)`
+- `amazon_oauth_states (expires_at)`
+
+`amazon_connections.token_reference` is an opaque SecretProvider pointer (`asi/amazon/...`). It is not a refresh token. Status values: `not_connected`, `pending_authorization`, `pending_validation`, `connected`, `degraded`, `revoked`, `error`. `connected` means authorization validated, not that seller business data has been ingested.
 
 ## Future tables (not created)
 
+- Canonical `amazon_seller_accounts` / `amazon_marketplaces` (12B.2)
+- Seller listings / orders / inventory / reports / finances (12B.3+)
 - `users` / auth identity mapping
 - `organization_memberships`
 - RLS policies keyed on authenticated `organization_id`

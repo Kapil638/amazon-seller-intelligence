@@ -2,7 +2,7 @@
 
 **Date:** 23 August 2026  
 **Role:** Principal Architect  
-**Status:** Architecture only. **Not approved for implementation of ingestion, OAuth, Ads API, Copilot, or Skills.**  
+**Status:** Architecture approved. Seller-data **ingestion remains not implemented**. Connection/authorization/validation through 12B.1D does not satisfy this document’s ingest design. Next ingest slice is **12B.2**. Do not implement listings/orders from this file.  
 **Depends on (frozen):** 11A–11D.1, ADR 0001, pre–Amazon data backbone checkpoint, 12A.0, 12A.1, ADR 0002  
 **Companions:** [ADR 0003](../adr/0003-canonical-amazon-seller-data-model.md), [ADR 0004](../adr/0004-seller-data-provenance-and-source-precedence.md), [ADR 0005](../adr/0005-amazon-seller-identity-model.md)
 

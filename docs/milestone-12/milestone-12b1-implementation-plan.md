@@ -1,10 +1,10 @@
 # Milestone 12B.1 — Implementation Plan
 
 **Date:** 23 August 2026  
-**Status:** Planning only. **Do not implement until a slice is explicitly started.**  
+**Status:** Historical plan. Slices **12B.1A–12B.1D are implemented** (as-built docs in this folder). Do not treat this file as “not started.”  
 **Architecture:** [milestone-12b1-production-connection-security-architecture.md](milestone-12b1-production-connection-security-architecture.md)
 
-This plan does not create migrations, OAuth handlers, or SecretProvider code until the named slice is approved to start.
+Next approved work is **12B.2**, not a continuation of this plan’s unimplemented ingest. Latest Alembic head: `0008_amazon_oauth_states`.
 
 Expected order after architecture approval:
 
@@ -22,7 +22,7 @@ Do not skip to Orders, Catalog, Inventory, Reports, Finances, Ads API, Copilot, 
 - Do not break 12A.0 (`python -m app.amazon`) or 12A.1 `GET/POST /connection` sandbox behavior until an overlay is tested.
 - No live Amazon in pytest. Keep `conftest.py` clearing SP-API env.
 - Public responses: extra-forbid + `public_model_dump`. Never return `token_reference` (the sanitizer already treats `token` as a forbidden key fragment).
-- Latest Alembic head today: `0006_advertising_models`. Next revision only in 12B.1A.
+- Latest Alembic head at plan time: `0006_advertising_models`. As-built head after 12B.1C: `0008_amazon_oauth_states`.
 
 ---
 

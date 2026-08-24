@@ -4,6 +4,8 @@ Turn Amazon Seller Intelligence from a feature menu of reports into a Copilot th
 
 **Status:** 11A complete and hardened (`834a79b`). **11B.1–11B.5** implemented (Copilot workspace UI). **11C.1** implemented (Profit Intelligence foundation). **11C.2** implemented (Advertising Intelligence foundation). **11D Skill Architecture** is specified (not implemented). **11D.1 Copilot domain tools** implemented (profit + advertising tools; not Skills). 11C.3–11C.4, Skill implementation, and 11E not started.
 
+Amazon SP-API connection work is **Milestone 12** (through **12B.1D** as of 24 August 2026). See [../milestone-12/README.md](../milestone-12/README.md). Do not treat Copilot as calling SP-API.
+
 | Document | What it is |
 | --- | --- |
 | [milestone-11-architecture-review.md](milestone-11-architecture-review.md) | Current-system review and recommended Copilot architecture |
