@@ -39,9 +39,9 @@ const fallbackOverview: AmazonConnectionOverview = {
   connection_status: "not_connected",
   persisted: false,
   provider: "SP_API",
-  environment: "SANDBOX",
-  region: "eu",
-  marketplace: "amazon.in",
+  environment: "PRODUCTION",
+  region: "na",
+  marketplace: "amazon.com",
   application: "EWise",
   credentials_configured: true,
   selling_partner_id: null,
@@ -65,6 +65,26 @@ const pendingOverview: AmazonConnectionOverview = {
   ...fallbackOverview,
   persisted: true,
   connection_status: "pending_authorization",
+};
+
+const pendingValidationOverview: AmazonConnectionOverview = {
+  ...fallbackOverview,
+  persisted: true,
+  connection_status: "pending_validation",
+  authorized_at: "2026-08-25T05:14:00.000Z",
+};
+
+const secretLostOverview: AmazonConnectionOverview = {
+  ...pendingValidationOverview,
+  last_error_code: "secret_access_failed",
+};
+
+const connectedOverview: AmazonConnectionOverview = {
+  ...pendingValidationOverview,
+  connection_status: "connected",
+  selling_partner_id: "A1SELLERID",
+  last_successful_validation_at: "2026-08-25T05:20:00.000Z",
+  last_error_code: null,
 };
 
 const consentUrl =
@@ -141,12 +161,13 @@ describe("Amazon Connection page", () => {
     expect(screen.getByText("NOT_CONNECTED")).toBeInTheDocument();
     expect(screen.getByText("Not connected")).toBeInTheDocument();
     expect(screen.getAllByText("Amazon SP-API").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Sandbox").length).toBeGreaterThan(0);
-    expect(screen.getByText("EU")).toBeInTheDocument();
-    expect(screen.getByText("Amazon.in")).toBeInTheDocument();
+    expect(screen.getByText("Production")).toBeInTheDocument();
+    expect(screen.getByText("NA (US)")).toBeInTheDocument();
+    expect(screen.getByText("Amazon.com")).toBeInTheDocument();
     expect(screen.getByText("EWise")).toBeInTheDocument();
     expect(screen.getByText("Not tested", { selector: "h2" })).toBeInTheDocument();
     expect(screen.getByText("Status: Not connected")).toBeInTheDocument();
+    expect(screen.getByText("Status: Seller ingest not started")).toBeInTheDocument();
     expect(
       screen.getByText(/No saved Amazon connection. Showing environment defaults/),
     ).toBeInTheDocument();
@@ -182,7 +203,7 @@ describe("Amazon Connection page", () => {
     expect(screen.getByText("NOT_CONNECTED")).toBeInTheDocument();
     expect(screen.getByText("Not connected")).toBeInTheDocument();
     expect(screen.getByText("Validated successfully at")).toBeInTheDocument();
-    expect(screen.getByText("Sandbox validation succeeded. This is not seller authorization.")).toBeInTheDocument();
+    expect(screen.getByText("Grant validation succeeded.")).toBeInTheDocument();
     expect(screen.queryByText("Not tested")).not.toBeInTheDocument();
   });
 
@@ -259,7 +280,7 @@ describe("Amazon Connection page", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Connect Amazon" }));
     await waitFor(() => {
-      expect(authorizeAmazonConnection).toHaveBeenCalledWith("SANDBOX");
+      expect(authorizeAmazonConnection).toHaveBeenCalledWith("PRODUCTION");
     });
     expect(locationAssign).toHaveBeenCalledWith(consentUrl);
     expect(screen.queryByText(consentUrl)).not.toBeInTheDocument();
@@ -311,6 +332,47 @@ describe("Amazon Connection page", () => {
     expect(screen.getByRole("button", { name: "Continue Amazon authorization" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "CONNECTED" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Test Connection" })).toBeInTheDocument();
+  });
+
+  it("asks to validate a pending seller grant and reloads overview after success", async () => {
+    vi.mocked(fetchAmazonConnection)
+      .mockResolvedValueOnce(pendingValidationOverview)
+      .mockResolvedValueOnce(connectedOverview);
+    vi.mocked(testAmazonConnection).mockResolvedValue({
+      ...connected,
+      environment: "PRODUCTION",
+      marketplace: "amazon.com",
+    });
+    render(<AmazonConnection />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Validate connection" })).toBeEnabled();
+    });
+    expect(screen.getByText("Waiting for grant validation")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Amazon authorization completed. Click Validate connection/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Test Connection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "CONNECTED" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Validate connection" }));
+    await waitFor(() => {
+      expect(screen.getByText("Connected")).toBeInTheDocument();
+    });
+    expect(testAmazonConnection).toHaveBeenCalledTimes(1);
+    expect(fetchAmazonConnection).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "Connected" })).toBeInTheDocument();
+    expect(screen.getByText("A1SELLERID")).toBeInTheDocument();
+  });
+
+  it("asks to reconnect when the stored grant cannot be read", async () => {
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(secretLostOverview);
+    render(<AmazonConnection />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Connect Amazon again" })).toBeEnabled();
+    });
+    expect(screen.getByText("secret_access_failed")).toBeInTheDocument();
+    expect(screen.getByText(/could not read the stored grant/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Validate connection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "CONNECTED" })).not.toBeInTheDocument();
   });
 
   it("does not keep tokens or authorization URLs in the rendered tree", async () => {

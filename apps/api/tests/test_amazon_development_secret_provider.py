@@ -180,7 +180,50 @@ def test_development_provider_does_not_call_amazon() -> None:
     assert "amazon_connections" not in source
 
 
-def test_get_secret_provider_defaults_to_development() -> None:
+def test_file_store_survives_a_new_provider_instance(tmp_path) -> None:
+    store = tmp_path / "amazon-development-secrets.json"
+    first = DevelopmentSecretProvider(
+        sandbox_refresh_token=None,
+        default_organization_id=DEFAULT_DEVELOPMENT_ORGANIZATION_ID,
+        store_path=store,
+    )
+    first.put_secret(PRODUCTION_REFERENCE, SecretStr(OTHER_TOKEN))
+    reloaded = DevelopmentSecretProvider(
+        sandbox_refresh_token=None,
+        default_organization_id=DEFAULT_DEVELOPMENT_ORGANIZATION_ID,
+        store_path=store,
+    )
+    assert reloaded.exists(PRODUCTION_REFERENCE) is True
+    assert reloaded.get_secret(PRODUCTION_REFERENCE).get_secret_value() == OTHER_TOKEN
+    _assert_no_secrets(repr(reloaded))
+    _assert_no_secrets(store.name)
+
+
+def test_file_store_delete_persists(tmp_path) -> None:
+    store = tmp_path / "amazon-development-secrets.json"
+    provider = DevelopmentSecretProvider(store_path=store, sandbox_refresh_token=None)
+    provider.put_secret(MEMORY_REFERENCE, SecretStr(OTHER_TOKEN))
+    provider.delete_secret(MEMORY_REFERENCE)
+    reloaded = DevelopmentSecretProvider(store_path=store, sandbox_refresh_token=None)
+    assert reloaded.exists(MEMORY_REFERENCE) is False
+    with pytest.raises(SecretNotFoundError):
+        reloaded.get_secret(MEMORY_REFERENCE)
+
+
+def test_corrupt_store_fails_closed_without_leaking(tmp_path) -> None:
+    store = tmp_path / "amazon-development-secrets.json"
+    store.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(SecretAccessError) as exc_info:
+        DevelopmentSecretProvider(store_path=store, sandbox_refresh_token=None)
+    _assert_no_secrets(str(exc_info.value))
+
+
+def test_empty_store_path_stays_in_memory_only() -> None:
+    provider = DevelopmentSecretProvider(store_path="", sandbox_refresh_token=None)
+    provider.put_secret(MEMORY_REFERENCE, SecretStr(OTHER_TOKEN))
+    other = DevelopmentSecretProvider(store_path="", sandbox_refresh_token=None)
+    with pytest.raises(SecretNotFoundError):
+        other.get_secret(MEMORY_REFERENCE)
     reset_secret_provider()
     try:
         settings = Settings(

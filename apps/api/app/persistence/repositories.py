@@ -948,6 +948,8 @@ class AmazonConnectionRepository:
     )
     _LIFECYCLE_FIELDS = frozenset(
         {
+            "region",
+            "application_id",
             "status",
             "last_successful_validation_at",
             "last_successful_sync_at",

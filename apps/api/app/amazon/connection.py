@@ -22,6 +22,7 @@ from app.amazon.oauth import (
     new_oauth_state,
     oauth_state_expiry,
     seller_central_consent_origin,
+    seller_connection_marketplace,
 )
 from app.amazon.oauth_callback import (
     AuthorizationCodeReceived,
@@ -145,8 +146,8 @@ class AmazonConnectionOverview(BaseModel):
     connection_status: ConnectionLifecycleStatus = "not_connected"
     persisted: bool = False
     provider: SpApiProvider = "SP_API"
-    environment: ConnectionEnvironment = "SANDBOX"
-    region: str = "eu"
+    environment: ConnectionEnvironment = "PRODUCTION"
+    region: str = "na"
     marketplace: str
     application: str
     credentials_configured: bool
@@ -183,7 +184,7 @@ class AmazonAuthorizationStart(BaseModel):
     expires_at: datetime
     connection_status: ConnectionLifecycleStatus
     provider: SpApiProvider = "SP_API"
-    environment: ConnectionEnvironment = "SANDBOX"
+    environment: ConnectionEnvironment = "PRODUCTION"
     organization_id: str
 
 
@@ -232,14 +233,22 @@ class AmazonConnectionService:
         if _SECRET_FIELDS.intersection(fields):
             raise PersistenceError("Amazon connection service cannot store secret fields.")
 
+    def _connection_marketplace(self, cfg: Settings, region: str) -> str:
+        return seller_connection_marketplace(
+            region=region,
+            default_marketplace=cfg.default_marketplace,
+        )
+
     def _env_overview(self, cfg: Settings) -> AmazonConnectionOverview:
+        region = (cfg.sp_api_region or "na").strip().lower() or "na"
         return AmazonConnectionOverview(
             status="NOT_CONNECTED",
             connection_status="not_connected",
             persisted=False,
-            marketplace=cfg.default_marketplace,
+            environment="PRODUCTION",
+            marketplace=self._connection_marketplace(cfg, region),
             application=cfg.sp_api_application_name,
-            region=cfg.sp_api_region,
+            region=region,
             credentials_configured=self._credentials_ready(cfg),
             last_test_at=None,
             organization_id=str(self._org_id()),
@@ -273,7 +282,7 @@ class AmazonConnectionService:
             provider="SP_API",
             environment=environment,
             region=row.region,
-            marketplace=cfg.default_marketplace,
+            marketplace=self._connection_marketplace(cfg, row.region),
             application=cfg.sp_api_application_name,
             credentials_configured=self._credentials_ready(cfg),
             selling_partner_id=row.selling_partner_id,
@@ -290,17 +299,24 @@ class AmazonConnectionService:
         self,
         *,
         provider: str = "SP_API",
-        environment: str = "SANDBOX",
+        environment: str | None = None,
     ) -> AmazonConnectionOverview:
         cfg = self._cfg()
         if not persistence_enabled():
             return self._env_overview(cfg)
         with session_scope() as session:
             repo = AmazonConnectionRepository(session)
-            row = repo.get(self._org_id(), provider=provider, environment=environment)
-            if row is None:
-                return self._env_overview(cfg)
-            return self._from_row(row, cfg)
+            if environment:
+                row = repo.get(self._org_id(), provider=provider, environment=environment)
+                if row is None:
+                    return self._env_overview(cfg)
+                return self._from_row(row, cfg)
+            production = repo.get(self._org_id(), provider=provider, environment="PRODUCTION")
+            if production is not None:
+                return self._from_row(production, cfg)
+            # Connect Amazon is PRODUCTION. Do not surface leftover SANDBOX
+            # Test Connection rows on the seller-authorization card.
+            return self._env_overview(cfg)
 
     def create_connection(
         self,
@@ -378,17 +394,24 @@ class AmazonConnectionService:
                 status="pending_authorization",
                 application_id=application_id or None,
             )
+        fields: dict[str, Any] = {}
         if row.status != "pending_authorization":
-            updated = repo.update(self._org_id(), row.id, status="pending_authorization")
-            if updated is None:
-                raise PersistenceError("Amazon connection was not found.")
-            return updated
-        return row
+            fields["status"] = "pending_authorization"
+        if region and row.region != region:
+            fields["region"] = region
+        if application_id and row.application_id != application_id:
+            fields["application_id"] = application_id
+        if not fields:
+            return row
+        updated = repo.update(self._org_id(), row.id, **fields)
+        if updated is None:
+            raise PersistenceError("Amazon connection was not found.")
+        return updated
 
     def start_authorization(
         self,
         *,
-        environment: ConnectionEnvironment = "SANDBOX",
+        environment: ConnectionEnvironment = "PRODUCTION",
         provider: SpApiProvider = "SP_API",
     ) -> AmazonAuthorizationStart:
         """Create hashed OAuth state and return a Seller Central consent URL.
@@ -404,9 +427,11 @@ class AmazonConnectionService:
             raise SpApiConfigurationError("Amazon application is not configured.")
         raw_state, state_hash = new_oauth_state()
         expires_at = oauth_state_expiry(ttl_seconds=cfg.sp_api_oauth_state_ttl_seconds)
+        region = (cfg.sp_api_region or "na").strip().lower() or "na"
+        marketplace = self._connection_marketplace(cfg, region)
         origin = seller_central_consent_origin(
-            marketplace=cfg.default_marketplace,
-            region=cfg.sp_api_region,
+            marketplace=marketplace,
+            region=region,
             override=cfg.sp_api_oauth_consent_base_url,
         )
         authorization_url = build_seller_central_consent_url(
@@ -422,7 +447,7 @@ class AmazonConnectionService:
                     session,
                     provider=provider,
                     environment=environment,
-                    region=cfg.sp_api_region,
+                    region=region,
                     application_id=application_id,
                 )
                 AmazonOAuthStateRepository(session).create(
@@ -886,7 +911,9 @@ class AmazonConnectionService:
     async def test_sp_api(self) -> AmazonConnectionTestResult:
         cfg = self._cfg()
         tested_at = datetime.now(UTC)
-        snapshot = self._seller_handshake_snapshot(provider="SP_API", environment="SANDBOX")
+        snapshot = self._seller_handshake_snapshot(provider="SP_API", environment="PRODUCTION")
+        if snapshot is None:
+            snapshot = self._seller_handshake_snapshot(provider="SP_API", environment="SANDBOX")
         if snapshot is not None:
             result = await self._validator().validate(
                 organization_id=self._org_id(),

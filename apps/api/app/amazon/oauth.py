@@ -51,6 +51,22 @@ SELLER_CENTRAL_ORIGINS_BY_REGION: dict[str, str] = {
     "fe": "https://sellercentral.amazon.co.jp",
 }
 
+CONNECTION_MARKETPLACE_BY_REGION: dict[str, str] = {
+    "na": "amazon.com",
+    "us": "amazon.com",
+    "eu": "amazon.in",
+    "fe": "amazon.co.jp",
+}
+
+
+def seller_connection_marketplace(*, region: str, default_marketplace: str) -> str:
+    """Display/consent marketplace for a connection region. Not seller identity ingest."""
+    mapped = CONNECTION_MARKETPLACE_BY_REGION.get((region or "").strip().lower())
+    if mapped:
+        return mapped
+    fallback = default_marketplace.strip().lower()
+    return fallback or "amazon.com"
+
 
 def generate_oauth_state() -> str:
     """Return a URL-safe raw state token with at least 128 bits of entropy.

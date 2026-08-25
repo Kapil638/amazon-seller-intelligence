@@ -90,6 +90,8 @@ def _seed_pending_validation(
     provider: DevelopmentSecretProvider,
     status: str = "pending_validation",
     organization_id=None,
+    environment: str = "SANDBOX",
+    region: str = "eu",
 ) -> tuple[object, str]:
     org_id = organization_id or current_organization_id()
     with session_scope() as session:
@@ -97,13 +99,13 @@ def _seed_pending_validation(
         row = repo.create(
             organization_id=org_id,
             provider="SP_API",
-            environment="SANDBOX",
-            region="eu",
+            environment=environment,
+            region=region,
             status=status,
         )
         reference = build_asi_secret_reference(
             provider="SP_API",
-            environment="SANDBOX",
+            environment=environment,
             organization_id=org_id,
             connection_id=row.id,
         )
@@ -162,9 +164,13 @@ def test_sp_api_base_url_uses_connection_environment() -> None:
 @pytest.mark.asyncio
 async def test_successful_seller_validation_marks_connected(caplog) -> None:
     service, provider = _service()
-    connection_id, reference = _seed_pending_validation(provider=provider)
+    connection_id, reference = _seed_pending_validation(
+        provider=provider,
+        environment="PRODUCTION",
+        region="na",
+    )
     with caplog.at_level("DEBUG"):
-        result = await service.validate_seller_connection()
+        result = await service.validate_seller_connection(environment="PRODUCTION")
     assert result.valid is True
     assert result.connection_status == "connected"
     assert result.selling_partner_id == SELLING_PARTNER_ID
@@ -363,7 +369,7 @@ def test_validation_modules_do_not_import_ingest_or_intelligence() -> None:
 
 def test_post_test_validates_pending_seller_grant(client) -> None:
     service, provider = _service()
-    _seed_pending_validation(provider=provider)
+    _seed_pending_validation(provider=provider, environment="PRODUCTION", region="na")
     app.dependency_overrides[get_amazon_connection_service] = lambda: service
     try:
         tested = client.post(TEST_URL, json={})

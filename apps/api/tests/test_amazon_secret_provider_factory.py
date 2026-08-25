@@ -90,7 +90,28 @@ def test_production_selection_does_not_fallback_to_development() -> None:
         reset_secret_provider()
 
 
-def test_secret_provider_contract_remains_unchanged() -> None:
+def test_factory_development_file_store_survives_reset(tmp_path) -> None:
+    reset_secret_provider()
+    try:
+        store = tmp_path / "amazon-development-secrets.json"
+        settings = Settings(
+            amazon_secret_backend="development",
+            amazon_development_secret_store=str(store),
+            sp_api_sandbox_refresh_token=None,
+            default_organization_id=DEFAULT_DEVELOPMENT_ORGANIZATION_ID,
+        )
+        first = SecretProviderFactory().create(settings)
+        reference = (
+            f"asi/amazon/SP_API/PRODUCTION/{DEFAULT_DEVELOPMENT_ORGANIZATION_ID}/"
+            "22222222-2222-2222-2222-222222222222"
+        )
+        first.put_secret(reference, SecretStr(REFRESH_TOKEN))
+        reset_secret_provider()
+        second = SecretProviderFactory().create(settings)
+        assert second.get_secret(reference).get_secret_value() == REFRESH_TOKEN
+        _assert_no_secrets(repr(second))
+    finally:
+        reset_secret_provider()
     required = ("put_secret", "get_secret", "exists", "delete_secret")
     for name in required:
         assert hasattr(SecretProvider, name)

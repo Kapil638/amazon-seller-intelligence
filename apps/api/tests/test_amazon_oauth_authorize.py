@@ -90,6 +90,11 @@ def test_consent_url_is_marketplace_driven_and_contains_state() -> None:
 
     origin = seller_central_consent_origin(marketplace="amazon.in", region="eu")
     assert origin == "https://sellercentral.amazon.in"
+    us_origin = seller_central_consent_origin(marketplace="amazon.com", region="na")
+    assert us_origin == "https://sellercentral.amazon.com"
+    from app.amazon.oauth import seller_connection_marketplace
+
+    assert seller_connection_marketplace(region="na", default_marketplace="amazon.in") == "amazon.com"
     overridden = seller_central_consent_origin(
         marketplace="amazon.com",
         region="na",
@@ -205,7 +210,7 @@ def test_authorize_does_not_mark_connected_or_pending_validation() -> None:
     assert result.connection_status == "pending_authorization"
     with session_scope() as session:
         row = AmazonConnectionRepository(session).get(
-            current_organization_id(), provider="SP_API", environment="SANDBOX"
+            current_organization_id(), provider="SP_API", environment="PRODUCTION"
         )
         assert row is not None
         assert row.status == "pending_authorization"
@@ -229,7 +234,7 @@ def test_authorize_does_not_use_other_organization_connection() -> None:
     assert result.organization_id != str(other_org)
     with session_scope() as session:
         repo = AmazonConnectionRepository(session)
-        current = repo.get(current_organization_id(), provider="SP_API", environment="SANDBOX")
+        current = repo.get(current_organization_id(), provider="SP_API", environment="PRODUCTION")
         other = repo.get(other_org, provider="SP_API", environment="SANDBOX")
         assert current is not None
         assert other is not None

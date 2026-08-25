@@ -35,7 +35,7 @@ class AmazonConnectionAuthorizeRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    environment: ConnectionEnvironment = "SANDBOX"
+    environment: ConnectionEnvironment = "PRODUCTION"
 
 
 def _http_error(exc: Exception) -> HTTPException:

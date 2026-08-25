@@ -24,6 +24,8 @@ dist/
 !.env.example
 
 # Local / generated
+.data/
+*.amazon-development-secrets.json
 *.pyc
 Amazon Seller Co-Pilot.pdf
 uploads/

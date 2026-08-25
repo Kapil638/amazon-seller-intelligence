@@ -1,10 +1,18 @@
 # Amazon Seller Intelligence — Change Summary
 
-**Date:** 24 August 2026  
-**Scope:** Cursor → Claude handover at Milestone 12B.1D  
+**Date:** 25 August 2026  
+**Scope:** Cursor → Claude handover at Milestone 12B.1D, plus local Production Connect Amazon (US) follow-up  
 **Status:** Historical log. Latest Amazon implementation is 12B.1D. Next is 12B.2.
 
 This document records what was built and updated. It is a change log, not a product spec.
+
+---
+
+## 25 August 2026 — Production Connect Amazon (US)
+
+Local Connect Amazon now targets Production / NA / amazon.com. Development SecretProvider persists seller refresh tokens to a gitignored file so uvicorn reload does not cause `secret_access_failed`. Connection UI: **Validate connection** after Allow; **Connect Amazon again** if the grant cannot be read. No ingest. 12B.2 not started.
+
+Full session note: [checkpoints/2026-08-25-production-connect-amazon.md](checkpoints/2026-08-25-production-connect-amazon.md).
 
 ---
 

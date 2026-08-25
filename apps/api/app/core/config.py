@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     sp_api_lwa_client_id: SecretStr | None = None
     sp_api_lwa_client_secret: SecretStr | None = None
     sp_api_sandbox_refresh_token: SecretStr | None = None
-    sp_api_region: str = "eu"
+    sp_api_region: str = "na"
     sp_api_sandbox_base_url: str = ""
     sp_api_production_base_url: str = ""
     sp_api_lwa_token_url: str = "https://api.amazon.com/auth/o2/token"
@@ -103,6 +103,13 @@ class Settings(BaseSettings):
             "SecretProvider backend. development is the default live backend. "
             "production is reserved and fails closed until a cloud provider is implemented. "
             "Do not put cloud credentials here."
+        ),
+    )
+    amazon_development_secret_store: str = Field(
+        default=".data/amazon-development-secrets.json",
+        description=(
+            "Local file for DevelopmentSecretProvider seller secrets. "
+            "Empty disables file persistence (in-memory only). Never a database path."
         ),
     )
 

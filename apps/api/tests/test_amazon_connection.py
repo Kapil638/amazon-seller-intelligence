@@ -91,8 +91,10 @@ def test_overview_is_config_based_and_does_not_call_amazon() -> None:
     overview = service.overview()
     assert overview.status == "NOT_CONNECTED"
     assert overview.provider == "SP_API"
-    assert overview.environment == "SANDBOX"
-    assert overview.marketplace == "amazon.in"
+    assert overview.environment == "PRODUCTION"
+    assert overview.marketplace == (
+        "amazon.com" if overview.region.lower() in {"na", "us"} else "amazon.in"
+    )
     assert overview.application == "EWise"
     assert overview.credentials_configured is False
     assert overview.last_test_at is None
@@ -200,8 +202,10 @@ def test_get_connection_does_not_call_amazon(client) -> None:
     body = response.json()
     assert body["status"] == "NOT_CONNECTED"
     assert body["provider"] == "SP_API"
-    assert body["environment"] == "SANDBOX"
-    assert body["marketplace"] == "amazon.in"
+    assert body["environment"] == "PRODUCTION"
+    assert body["marketplace"] == (
+        "amazon.com" if str(body["region"]).lower() in {"na", "us"} else "amazon.in"
+    )
     assert body["application"] == "EWise"
     assert body["credentials_configured"] is False
     assert body["ads_api"]["status"] == "NOT_CONNECTED"

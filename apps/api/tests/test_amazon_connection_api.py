@@ -89,8 +89,8 @@ def _assert_public(payload: object) -> None:
 def test_get_overview_returns_persisted_metadata(client) -> None:
     AmazonConnectionService().create_connection(
         provider="SP_API",
-        environment="SANDBOX",
-        region="eu",
+        environment="PRODUCTION",
+        region="na",
         selling_partner_id="A1SELLERID",
     )
     response = client.get(CONNECTION_URL)
@@ -100,10 +100,10 @@ def test_get_overview_returns_persisted_metadata(client) -> None:
     assert body["connection_status"] == "not_connected"
     assert body["persisted"] is True
     assert body["provider"] == "SP_API"
-    assert body["environment"] == "SANDBOX"
-    assert body["region"] == "eu"
+    assert body["environment"] == "PRODUCTION"
+    assert body["region"] == "na"
     assert body["selling_partner_id"] == "A1SELLERID"
-    assert body["marketplace"] == "amazon.in"
+    assert body["marketplace"] == "amazon.com"
     assert body["application"] == "EWise"
     assert body["ads_api"]["status"] == "NOT_CONNECTED"
     assert "token_reference" not in body
@@ -118,7 +118,7 @@ def test_get_overview_falls_back_when_no_row(client) -> None:
     assert body["connection_status"] == "not_connected"
     assert body["persisted"] is False
     assert body["provider"] == "SP_API"
-    assert body["environment"] == "SANDBOX"
+    assert body["environment"] == "PRODUCTION"
     assert body["selling_partner_id"] is None
     assert body["last_test_at"] is None
     _assert_public(body)
@@ -171,7 +171,8 @@ def test_post_connection_test_does_not_persist_connected(client) -> None:
     assert tested.status_code == 200
     assert tested.json()["status"] == "CONNECTED"
     body = overview.json()
-    assert body["persisted"] is True
+    assert body["persisted"] is False
+    assert body["environment"] == "PRODUCTION"
     assert body["status"] == "NOT_CONNECTED"
     assert body["connection_status"] == "not_connected"
     with session_scope() as session:
@@ -211,8 +212,8 @@ def test_secret_fields_cannot_be_returned(client) -> None:
             AmazonConnection(
                 organization_id=current_organization_id(),
                 provider="SP_API",
-                environment="SANDBOX",
-                region="eu",
+                environment="PRODUCTION",
+                region="na",
                 status="not_connected",
                 token_reference="asi:dev:must-not-appear",
             )

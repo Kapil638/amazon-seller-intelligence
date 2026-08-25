@@ -89,7 +89,7 @@ class AmazonSpApiSandboxClient:
         user_agent: str | None = None,
     ) -> None:
         cfg = settings or get_settings()
-        self._region = (region or cfg.sp_api_region or "eu").strip().lower()
+        self._region = (region or cfg.sp_api_region or "na").strip().lower()
         self._base_url = base_url or sandbox_base_url(self._region, cfg.sp_api_sandbox_base_url)
         self._timeout = timeout_seconds if timeout_seconds is not None else cfg.sp_api_timeout_seconds
         self._user_agent = user_agent or cfg.sp_api_user_agent

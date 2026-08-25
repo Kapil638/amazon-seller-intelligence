@@ -1235,7 +1235,7 @@ function isSellerCentralAuthorizationUrl(value: string): boolean {
 }
 
 export async function authorizeAmazonConnection(
-  environment: AmazonConnectionEnvironment = "SANDBOX",
+  environment: AmazonConnectionEnvironment = "PRODUCTION",
 ): Promise<AmazonAuthorizationStart> {
   const result = await amazonConnectionRequest<AmazonAuthorizationStart>("/connection/authorize", {
     method: "POST",

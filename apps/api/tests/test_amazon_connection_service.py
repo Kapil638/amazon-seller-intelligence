@@ -76,8 +76,8 @@ def test_persisted_connection_is_returned_when_available() -> None:
     service = AmazonConnectionService()
     created = service.create_connection(
         provider="SP_API",
-        environment="SANDBOX",
-        region="eu",
+        environment="PRODUCTION",
+        region="na",
         selling_partner_id="A1SELLERID",
     )
     overview = service.overview()
@@ -85,21 +85,35 @@ def test_persisted_connection_is_returned_when_available() -> None:
     assert overview.connection_status == "not_connected"
     assert overview.status == "NOT_CONNECTED"
     assert overview.provider == "SP_API"
-    assert overview.environment == "SANDBOX"
-    assert overview.region == "eu"
+    assert overview.environment == "PRODUCTION"
+    assert overview.region == "na"
     assert overview.selling_partner_id == "A1SELLERID"
     assert overview.organization_id == str(created.organization_id)
     dumped = public_model_dump(overview)
     _assert_public(dumped)
 
 
-def test_no_persisted_connection_falls_back_to_sandbox_environment_view() -> None:
+def test_overview_ignores_sandbox_authorization_rows() -> None:
+    service = AmazonConnectionService()
+    service.create_connection(
+        provider="SP_API",
+        environment="SANDBOX",
+        region="eu",
+        status="pending_authorization",
+    )
+    overview = service.overview()
+    assert overview.persisted is False
+    assert overview.environment == "PRODUCTION"
+    assert overview.connection_status == "not_connected"
+
+
+def test_no_persisted_connection_falls_back_to_production_environment_view() -> None:
     service = AmazonConnectionService()
     overview = service.overview()
     assert overview.persisted is False
     assert overview.connection_status == "not_connected"
     assert overview.status == "NOT_CONNECTED"
-    assert overview.environment == "SANDBOX"
+    assert overview.environment == "PRODUCTION"
     assert overview.provider == "SP_API"
     assert overview.last_test_at is None
     assert overview.selling_partner_id is None
@@ -122,7 +136,8 @@ async def test_sandbox_test_success_does_not_mark_connection_connected() -> None
     result = await service.test_sp_api()
     assert result.status == "CONNECTED"
     overview = service.overview()
-    assert overview.persisted is True
+    assert overview.persisted is False
+    assert overview.environment == "PRODUCTION"
     assert overview.status == "NOT_CONNECTED"
     assert overview.connection_status == "not_connected"
     with session_scope() as session:
@@ -151,7 +166,7 @@ def test_organization_isolation_is_preserved() -> None:
     fallback = service.overview()
     assert fallback.persisted is False
     assert fallback.selling_partner_id is None
-    created = service.create_connection(provider="SP_API", environment="SANDBOX", region="eu")
+    created = service.create_connection(provider="SP_API", environment="PRODUCTION", region="na")
     overview = service.overview()
     assert overview.persisted is True
     assert overview.organization_id == str(current_organization_id())

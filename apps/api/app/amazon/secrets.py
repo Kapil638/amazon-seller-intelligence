@@ -23,8 +23,11 @@ Never log, print, or repr secret material.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Protocol, runtime_checkable
 from uuid import UUID
@@ -227,12 +230,23 @@ def _allows_sandbox_env_fallback(reference: str, organization_id: UUID) -> bool:
     return parts[4].lower() == str(organization_id).lower()
 
 
-class DevelopmentSecretProvider:
-    """Local SecretProvider: in-memory map plus sandbox .env fallback.
+def _store_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
 
-    Does not create token_reference rows, does not change connection status,
-    and is not seller authorization. App LWA client_id/client_secret stay in
-    process settings and are never stored here.
+
+class DevelopmentSecretProvider:
+    """Local SecretProvider: file-backed map plus sandbox .env fallback.
+
+    File persistence is development-only so uvicorn reload does not drop
+    seller refresh tokens. Production backend stays fail-closed. This is not
+    a database table, not seller authorization, and not a production vault.
+    App LWA client_id/client_secret stay in process settings and are never
+    stored here.
     """
 
     def __init__(
@@ -240,6 +254,7 @@ class DevelopmentSecretProvider:
         *,
         sandbox_refresh_token: SecretStr | None = None,
         default_organization_id: UUID | None = None,
+        store_path: str | Path | None = None,
     ) -> None:
         self._lock = Lock()
         self._values: dict[str, SecretStr] = {}
@@ -247,6 +262,9 @@ class DevelopmentSecretProvider:
         self._default_organization_id = (
             default_organization_id or DEFAULT_DEVELOPMENT_ORGANIZATION_ID
         )
+        self._store_path = _store_path(store_path)
+        if self._store_path is not None:
+            self._values = self._read_store()
 
     def __repr__(self) -> str:
         return secret_provider_repr(backend=AMAZON_SECRET_BACKEND_DEVELOPMENT)
@@ -262,6 +280,7 @@ class DevelopmentSecretProvider:
         key = validate_secret_reference(reference)
         with self._lock:
             self._values[key] = value
+            self._write_store_locked()
 
     def get_secret(self, reference: str) -> SecretStr:
         key = validate_secret_reference(reference)
@@ -285,11 +304,58 @@ class DevelopmentSecretProvider:
         key = validate_secret_reference(reference)
         with self._lock:
             self._values.pop(key, None)
+            self._write_store_locked()
 
     def _env_sandbox_token(self, reference: str) -> SecretStr | None:
         if not _allows_sandbox_env_fallback(reference, self._default_organization_id):
             return None
         return _secret_or_none(self._sandbox_refresh_token)
+
+    def _read_store(self) -> dict[str, SecretStr]:
+        path = self._store_path
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE) from exc
+        if not isinstance(payload, dict):
+            raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE)
+        loaded: dict[str, SecretStr] = {}
+        for raw_key, raw_value in payload.items():
+            if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+                raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE)
+            try:
+                key = validate_secret_reference(raw_key)
+            except InvalidSecretReferenceError as exc:
+                raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE) from exc
+            secret = SecretStr(raw_value)
+            if _secret_or_none(secret) is None:
+                raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE)
+            loaded[key] = secret
+        return loaded
+
+    def _write_store_locked(self) -> None:
+        path = self._store_path
+        if path is None:
+            return
+        snapshot = {
+            key: value.get_secret_value()
+            for key, value in self._values.items()
+            if _secret_or_none(value) is not None
+        }
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            os.replace(tmp_path, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE) from exc
 
 
 _PROVIDER: SecretProvider | None = None
@@ -321,6 +387,7 @@ class SecretProviderFactory:
             return DevelopmentSecretProvider(
                 sandbox_refresh_token=cfg.sp_api_sandbox_refresh_token,
                 default_organization_id=cfg.default_organization_id,
+                store_path=cfg.amazon_development_secret_store,
             )
         if backend == AMAZON_SECRET_BACKEND_PRODUCTION:
             raise SecretAccessError(PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE)

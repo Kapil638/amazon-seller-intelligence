@@ -8,6 +8,7 @@ os.environ["SP_API_SANDBOX_ENABLED"] = "false"
 os.environ["SP_API_LWA_CLIENT_ID"] = ""
 os.environ["SP_API_LWA_CLIENT_SECRET"] = ""
 os.environ["SP_API_SANDBOX_REFRESH_TOKEN"] = ""
+os.environ["AMAZON_DEVELOPMENT_SECRET_STORE"] = ""
 
 from collections.abc import Generator
 
@@ -48,6 +49,7 @@ def _force_mock_provider() -> Generator[None, None, None]:
     os.environ["SP_API_LWA_CLIENT_ID"] = ""
     os.environ["SP_API_LWA_CLIENT_SECRET"] = ""
     os.environ["SP_API_SANDBOX_REFRESH_TOKEN"] = ""
+    os.environ["AMAZON_DEVELOPMENT_SECRET_STORE"] = ""
     get_settings.cache_clear()
     get_product_provider.cache_clear()
     get_ai_provider.cache_clear()
