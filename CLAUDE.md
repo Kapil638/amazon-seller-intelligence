@@ -14,6 +14,8 @@ It is not an autonomous Amazon bot. It does not write to Amazon. It does not inv
 
 Latest completed Amazon milestone: **12B.1D — Seller Connection Validation Using SP-API**.
 
+Local Production Connect Amazon (US Professional seller, Draft/Production EWise app) was **proven live on 25 August 2026**. That is an operator checkpoint on top of 12B.1D, not a new ingest milestone. See `docs/checkpoints/2026-08-25-production-connect-amazon.md`.
+
 Completed and stable:
 
 - Marketplace intelligence via Rainforest (ASIN lookup, competitor search)
@@ -25,14 +27,14 @@ Completed and stable:
 - SecretProvider foundation (12B.1B)
 - Seller authorization through LWA token exchange + opaque `token_reference` (12B.1C through 12B.1C.5)
 - Seller validation handshake via `GET /sellers/v1/marketplaceParticipations` (12B.1D)
+- Live Production seller grant: LWA authorization-code exchange → SecretProvider refresh token → `pending_validation` → Validate connection → `connected` (Production / NA / amazon.com, 25 August 2026)
 
 Not started:
 
-- 12B.2 canonical seller identity / marketplace ingestion
+- 12B.2 canonical seller identity / marketplace ingestion (architecture validation exists; implementation not started)
 - Listings, orders, inventory, reports, finances ingest
 - Ads API (that is **12C**, not 12B.2)
 - Skills implementation
-- Live end-to-end seller grant against a real Amazon consent (code exists; Amazon-side + HTTPS still incomplete)
 
 ## Architecture Principles
 
@@ -92,11 +94,13 @@ If a number cannot be calculated from inputs, leave it unknown. Do not ask the L
 - Database stores metadata + opaque `token_reference` only.
 - Never expose `token_reference`, tokens, LWA secrets, or authorization codes in API JSON, frontend, Copilot, logs, or exceptions.
 - `AMAZON_SECRET_BACKEND=production` must fail closed until a real production backend exists.
-- Sandbox LWA + sandbox refresh token are for **Test Connection**.
-- Draft/Production application id + LWA client id/secret are for **Connect Amazon**.
+- Sandbox LWA + sandbox refresh token are for **Test Connection** only.
+- Draft/Production application id + LWA client id/secret are for **Connect Amazon** and seller authorization.
 - Do not mix those credential sets.
 - Sandbox Test Connection is not seller authorization and must not persist `connected` from the env-token path.
 - Mark a seller `connected` only after 12B.1D validation succeeds.
+- `DevelopmentSecretProvider` may persist seller refresh tokens to a **gitignored local file** so uvicorn reload does not drop the grant. Default path: `.data/amazon-development-secrets.json` (`AMAZON_DEVELOPMENT_SECRET_STORE`). Empty store path keeps in-memory-only behaviour. This is not Postgres, not a production vault, and not frontend/Copilot/EvidenceEnvelope.
+- Do not commit `apps/api/.env` or the development secret-store file.
 - Process-level HTTP/access logs may still include callback query strings unless redacted at server/proxy level. Application logs must not log OAuth codes/tokens.
 
 ## Database / Snapshot Rules
@@ -119,46 +123,56 @@ If a number cannot be calculated from inputs, leave it unknown. Do not ask the L
 | 12B.1B SecretProvider foundation | Completed |
 | 12B.1C Seller authorization | Implemented through 12B.1C.5 |
 | 12B.1D Seller connection validation | Completed |
-| 12B.2 Canonical seller identity | **Next. Not started.** |
+| Production Connect Amazon (US live grant) | Proven 25 August 2026 (not a new ingest slice) |
+| 12B.2 Canonical seller identity | **Next. Not started.** Architecture validation: `docs/AI_HANDOVER/12B2_CANONICAL_SELLER_IDENTITY_ARCHITECTURE_VALIDATION.md` |
 
 Authorization path:
 
 ```text
-POST /authorize → hashed OAuth state → Seller Central consent
-  → GET /callback → LWA authorization-code exchange → put_secret(refresh)
-  → bind token_reference → pending_validation
-  → POST /connection/test (handshake) → connected | degraded | error/requires_reauth
+POST /authorize (PRODUCTION) → hashed OAuth state → Seller Central consent
+ → GET /callback → LWA authorization-code exchange → put_secret(refresh)
+ → bind token_reference → pending_validation
+ → POST /connection/test (Validate connection handshake)
+ → GET /sellers/v1/marketplaceParticipations
+ → connected | degraded | error/requires_reauth
 ```
 
-OAuth callback does **not** call SP-API. Handshake is a separate `POST /connection/test`.
+OAuth callback does **not** call SP-API. Handshake is a separate `POST /connection/test`. **Pending validation** after Seller Central Allow is expected. Connected requires the handshake.
 
-Local Connect Amazon currently uses a **SANDBOX** connection row by default. A live seller handshake needs a **PRODUCTION** row and production Sellers host.
+Connect Amazon defaults (verified in code):
+
+- `POST /connection/authorize` defaults to **PRODUCTION**.
+- Frontend calls `authorizeAmazonConnection("PRODUCTION")`.
+- Default `SP_API_REGION` is **`na`**.
+- NA/US connection display/consent marketplace is **`amazon.com`** (not listing-catalog identity).
+- GET `/connection` prefers the **PRODUCTION** row. Leftover SANDBOX Test Connection rows must not override the seller-authorization card.
+- Handshake tries the PRODUCTION token-backed row first, then SANDBOX.
+- Production Sellers host is derived from region (`sellingpartnerapi-na.amazon.com` for `na`).
 
 ## Known Limitations
 
-1. Live seller authorization has not been fully proven end-to-end against a real seller grant.
+1. A live US Professional Production grant was validated on 25 August 2026. That does **not** mean seller business data is ingested.
 2. Website OAuth Login URI handling is still incomplete.
-3. Amazon Draft app Login URI / Redirect URI must match real HTTPS routes exactly. localhost is not suitable for the live Amazon round-trip.
+3. Amazon Draft app Login URI / Redirect URI must match real HTTPS routes exactly. localhost is not suitable for the live Amazon round-trip. Tunnel hostnames are ephemeral unless a named tunnel is used.
 4. Sandbox and Draft/Production credentials are deliberately separate.
-5. Connect Amazon has SANDBOX/default-environment behaviour in local development.
-6. ASI listing default marketplace may display `amazon.in` while a test seller may be Amazon.com. Do not confuse ASI marketplace default with connected seller marketplace participation.
-7. `getMarketplaceParticipations` may omit `sellingPartnerId`. Validation can still succeed from participation.
-8. No canonical seller identity / marketplace tables yet (12B.2).
-9. No seller business-data ingestion.
-10. No Ads API.
-11. Rainforest remains active and must not be removed.
-12. Rainforest vs SP-API ASIN comparison is not done (after 12B.3 listing adapter).
-13. Uvicorn/access logs may expose callback query strings.
-14. Production SecretProvider backend is not implemented.
+5. Listing intelligence `supported_marketplaces` remains **`amazon.in`**. Connection display `amazon.com` is the authorized seller’s connection marketplace, not a listing-engine default. Do not confuse the two.
+6. `getMarketplaceParticipations` may omit `sellingPartnerId`. Validation can still succeed from participation. Callback `selling_partner_id` is not used as the tenant key and is currently discarded for tenancy.
+7. No canonical seller identity / marketplace tables yet (12B.2). Handshake marketplace lists are not persisted as canonical rows.
+8. No seller business-data ingestion (listings, orders, inventory, reports, finances).
+9. No Ads API.
+10. Rainforest remains active and must not be removed.
+11. Rainforest vs SP-API ASIN comparison is not done (after 12B.3 listing adapter).
+12. Uvicorn/access logs may expose callback query strings.
+13. Production SecretProvider cloud backend is not implemented. The gitignored development secret file is local-only.
 
 ## Current Test Baseline
 
-Verified 24 August 2026, no live Amazon in tests:
+Verified 25 August 2026, no live Amazon in tests:
 
-- Backend: `cd apps/api && uv run pytest` → **620 passed**
-- Frontend: `cd apps/web && npm test` → **33 passed** (3 files)
+- Backend: `cd apps/api && uv run pytest` → **624 passed**
+- Frontend: `cd apps/web && npm test` → **35 passed** (3 files)
 
-Do not add live Amazon calls to automated tests. `conftest.py` clears SP-API env.
+Do not add live Amazon calls to automated tests. `conftest.py` clears SP-API env and pins listing `DEFAULT_MARKETPLACE=amazon.in` so a local US Connect Amazon `.env` cannot fail listing/profit tests.
 
 ## Milestone Naming Rules
 
@@ -193,7 +207,7 @@ Expected scope:
 
 Do not start listings ingest, orders, Ads, Copilot Amazon tools, or Skills as 12B.2.
 
-First Claude action: produce a repository understanding / architecture validation report. Do not implement immediately.
+Architecture-validation report is already written: `docs/AI_HANDOVER/12B2_CANONICAL_SELLER_IDENTITY_ARCHITECTURE_VALIDATION.md`. Do **not** implement 12B.2 until the user explicitly starts that slice (12B.2A first).
 
 ## Explicit Do-Not-Change Rules
 
@@ -209,4 +223,4 @@ First Claude action: produce a repository understanding / architecture validatio
 - Do not introduce agents/LangGraph/CrewAI without explicit architecture approval.
 - Do not perform live Amazon calls in automated tests.
 - Do not modify Copilot behaviour, Skills, or intelligence engines unless a later approved milestone says so.
-- Do not start 12B.2 until the handover architecture-validation report is done, unless the user explicitly starts that slice.
+- Do not start 12B.2 implementation until the user explicitly starts that slice. The architecture-validation report is already written.
