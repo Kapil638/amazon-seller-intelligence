@@ -27,6 +27,7 @@ from app.amazon.oauth import (
 from app.amazon.oauth_callback import (
     AuthorizationCodeReceived,
     is_amazon_access_denied,
+    normalize_selling_partner_id,
     wrap_authorization_code,
 )
 from app.amazon.sandbox import GET_MARKETPLACE_PARTICIPATIONS, AmazonSpApiSandboxClient
@@ -128,6 +129,7 @@ class _SellerConnectionSnapshot:
     region: str
     token_reference: str | None
     status: str
+    selling_partner_id: str | None
 
 
 class AdsApiConnectionPlaceholder(BaseModel):
@@ -503,9 +505,13 @@ class AmazonConnectionService:
     ) -> AuthorizationCodeReceived:
         """Validate state, exchange the authorization code, store the refresh token.
 
-        Organization is ASI context plus the hashed state row. `selling_partner_id`
-        is ignored for tenancy. Does not call SP-API or mark the connection connected.
+        Organization is ASI context plus the hashed state row. Amazon's Website
+        Authorization Workflow includes `selling_partner_id` on every redirect;
+        it is captured as seller-account metadata onto the connection row, but
+        it is never used for tenancy, org identity, or authorization. Does not
+        call SP-API or mark the connection connected.
         """
+        normalized_selling_partner_id = normalize_selling_partner_id(selling_partner_id)
         del selling_partner_id
         del error_description
         self._require_persistence()
@@ -545,7 +551,9 @@ class AmazonConnectionService:
             )
             if not isinstance(pending, _PendingLwaExchange):
                 return pending
-            return self._store_refresh_token_from_authorization_code(pending, _result)
+            return self._store_refresh_token_from_authorization_code(
+                pending, _result, selling_partner_id=normalized_selling_partner_id
+            )
         finally:
             del held_code
             del raw_state
@@ -686,9 +694,85 @@ class AmazonConnectionService:
         self,
         pending: _PendingLwaExchange,
         result: Callable[..., AuthorizationCodeReceived],
+        *,
+        selling_partner_id: str | None = None,
     ) -> AuthorizationCodeReceived:
         connection_id = pending.connection_id
         org_id = self._org_id()
+
+        if not selling_partner_id:
+            # Fail closed. Amazon's Website Authorization Workflow guarantees
+            # `selling_partner_id` on every redirect for a self-authorized
+            # app; its absence here (missing, or rejected by normalization as
+            # invalid — oversized, token-shaped, control characters, etc.) is
+            # not a normal omission to tolerate. Proceeding would exchange a
+            # grant for an unverified seller and could overwrite the active
+            # secret behind this connection's deterministic reference. No
+            # Amazon call, no SecretProvider access, no identity/status
+            # change occurs — applies equally to first authorization,
+            # reauthorization, reconnect, and concurrent attempts, since none
+            # of that logic is reached before this return. The rejected value
+            # itself is never included in the log line, the result, or any
+            # exception — only connection_id.
+            self._mark_callback_error(connection_id, "seller_identity_missing")
+            logger.info(
+                "amazon oauth callback rejected reason=seller_identity_missing connection_id=%s",
+                connection_id,
+            )
+            return result(
+                connection_id=str(connection_id),
+                connection_status="pending_authorization",
+                outcome="invalid",
+                notice="error",
+                reason="seller_identity_missing",
+                authorization_code_present=True,
+            )
+
+        # Identity conflict is checked next, using only values already known
+        # (the callback-supplied identifier and the connection's own current
+        # selling_partner_id) — before the LWA code is ever exchanged and
+        # before SecretProvider is touched. The active secret reference is
+        # derived from (org, connection), not from seller identity, so a
+        # conflicting reauthorization must never reach put_secret: doing so
+        # would silently replace the prior seller's grant at that reference
+        # while the database still names the prior seller, an unsafe
+        # credential/identity mismatch.
+        with session_scope() as session:
+            current = AmazonConnectionRepository(session).get_by_id(org_id, connection_id)
+        if current is None:
+            self._mark_callback_error(connection_id, "token_bind_failed")
+            logger.info(
+                "amazon oauth callback failed reason=token_bind_failed connection_id=%s",
+                connection_id,
+            )
+            return result(
+                connection_id=str(connection_id),
+                connection_status="pending_authorization",
+                outcome="invalid",
+                notice="error",
+                reason="token_bind_failed",
+                authorization_code_present=True,
+            )
+        existing_selling_partner_id = (current.selling_partner_id or "").strip() or None
+        if (
+            selling_partner_id
+            and existing_selling_partner_id
+            and selling_partner_id != existing_selling_partner_id
+        ):
+            self._mark_callback_error(connection_id, "identity_conflict")
+            logger.info(
+                "amazon oauth callback rejected reason=identity_conflict connection_id=%s",
+                connection_id,
+            )
+            return result(
+                connection_id=str(connection_id),
+                connection_status="pending_authorization",
+                outcome="invalid",
+                notice="error",
+                reason="identity_conflict",
+                authorization_code_present=True,
+            )
+
         try:
             grant = self._lwa().exchange_authorization_code(pending.authorization_code)
         except SpApiConfigurationError:
@@ -736,6 +820,57 @@ class AmazonConnectionService:
 
         refresh = grant.refresh_token
         del grant
+
+        # Atomic identity claim — the invariant-enforcing step. This single
+        # conditional UPDATE is the only thing allowed to change
+        # selling_partner_id, and it must complete, successfully, strictly
+        # before this attempt is allowed to touch SecretProvider at all. Two
+        # concurrent callbacks with different identifiers can never both
+        # claim: the database serializes concurrent writers of the same row,
+        # so whichever commits second re-evaluates against the already-
+        # updated value and affects zero rows. See
+        # AmazonConnectionRepository.claim_identity_for_authorization for why
+        # this holds on SQLite and PostgreSQL alike, and the 12B.2A
+        # concurrency report for the rejected alternatives.
+        try:
+            with session_scope() as session:
+                claimed = AmazonConnectionRepository(session).claim_identity_for_authorization(
+                    org_id, connection_id, selling_partner_id=selling_partner_id
+                )
+        except (PersistenceError, TypeError, IntegrityError):
+            del refresh
+            self._mark_callback_error(connection_id, "token_bind_failed")
+            logger.info(
+                "amazon oauth callback failed reason=token_bind_failed connection_id=%s",
+                connection_id,
+            )
+            return result(
+                connection_id=str(connection_id),
+                connection_status="pending_authorization",
+                outcome="invalid",
+                notice="error",
+                reason="token_bind_failed",
+                authorization_code_present=True,
+            )
+        if not claimed:
+            # Lost the identity claim (or the connection vanished). No secret
+            # was ever written for this attempt — SecretProvider was never
+            # touched, so there is nothing to clean up.
+            del refresh
+            self._mark_callback_error(connection_id, "identity_conflict")
+            logger.info(
+                "amazon oauth callback rejected reason=identity_conflict connection_id=%s",
+                connection_id,
+            )
+            return result(
+                connection_id=str(connection_id),
+                connection_status="pending_authorization",
+                outcome="invalid",
+                notice="error",
+                reason="identity_conflict",
+                authorization_code_present=True,
+            )
+
         reference = build_asi_secret_reference(
             provider=pending.provider,
             environment=pending.environment,
@@ -749,6 +884,12 @@ class AmazonConnectionService:
                 secrets.put_secret(reference, refresh)
                 stored = True
             except (SecretAccessError, InvalidSecretReferenceError, TypeError):
+                # The identity claim above is deliberately left in place: this
+                # connection's identity was legitimately won by this attempt,
+                # and reverting it would let a different seller claim the slot
+                # after a merely transient storage failure. The same seller
+                # retrying (or Connect Amazon again) will match the already-
+                # claimed identifier and proceed normally.
                 self._mark_callback_error(connection_id, "secret_storage_failed")
                 logger.info(
                     "amazon oauth callback failed reason=secret_storage_failed connection_id=%s",
@@ -778,13 +919,34 @@ class AmazonConnectionService:
                     )
             except (PersistenceError, TypeError, InvalidSecretReferenceError, IntegrityError):
                 if stored:
-                    try:
-                        secrets.delete_secret(reference)
-                    except (SecretAccessError, InvalidSecretReferenceError, TypeError):
-                        logger.warning(
-                            "amazon oauth callback secret cleanup failed connection_id=%s",
-                            connection_id,
+                    # The bind+update above ran in one transaction; on failure
+                    # session_scope() rolled it back, so this attempt's own
+                    # write to `token_reference` was undone regardless. A
+                    # fresh read now tells us whether anything is legitimately
+                    # relying on this reference already — either a
+                    # pre-existing grant from before this attempt, or a
+                    # concurrent same-seller attempt that won and committed
+                    # while this one was failing. Only delete when nothing is:
+                    # deleting an orphan no one has bound yet is harmless
+                    # cleanup, but deleting a reference something else already
+                    # depends on would destroy a still-valid grant with no way
+                    # to recover it (put_secret already overwrote whatever was
+                    # there before we ever reached this point).
+                    with session_scope() as session:
+                        post_failure = AmazonConnectionRepository(session).get_by_id(
+                            org_id, connection_id
                         )
+                    reference_already_relied_on = bool(
+                        post_failure is not None and (post_failure.token_reference or "").strip()
+                    )
+                    if not reference_already_relied_on:
+                        try:
+                            secrets.delete_secret(reference)
+                        except (SecretAccessError, InvalidSecretReferenceError, TypeError):
+                            logger.warning(
+                                "amazon oauth callback secret cleanup failed connection_id=%s",
+                                connection_id,
+                            )
                 self._mark_callback_error(connection_id, "token_bind_failed")
                 logger.info(
                     "amazon oauth callback failed reason=token_bind_failed connection_id=%s",
@@ -853,6 +1015,7 @@ class AmazonConnectionService:
                 region=row.region,
                 token_reference=row.token_reference,
                 status=row.status,
+                selling_partner_id=row.selling_partner_id,
             )
 
     def _apply_seller_validation(

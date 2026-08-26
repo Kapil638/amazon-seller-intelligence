@@ -168,7 +168,7 @@ def test_successful_token_exchange_stores_refresh_token_only() -> None:
         assert connection.status == "pending_validation"
         assert connection.status != "connected"
         assert connection.authorized_at is not None
-        assert connection.selling_partner_id is None
+        assert connection.selling_partner_id == "A3FHEXAMPLEYWS"
         expected = build_asi_secret_reference(
             provider="SP_API",
             environment="SANDBOX",
@@ -190,10 +190,481 @@ def test_successful_token_exchange_stores_refresh_token_only() -> None:
     assert ACCESS_TOKEN not in stored.get_secret_value()
 
 
+_FAIL_CLOSED_INVALID_IDENTITIES = {
+    "token_shaped": "Atzr|this-looks-like-a-refresh-token",
+    "oversized": "A" * 65,
+    "whitespace_only": "   ",
+    "control_character": "A3FHEXAMPLE\x00WS",
+}
+
+
+def _assert_fails_closed_on_first_authorization(
+    service: AmazonConnectionService, raw: str, *, selling_partner_id: str | None
+) -> None:
+    """Shared assertions for every missing/invalid-identity, first-authorization case.
+
+    `service` must be built with `_GuardLwa` (the default for `_service()`), so
+    if the implementation regresses and attempts an exchange, the test fails
+    immediately via `_GuardLwa`'s AssertionError rather than silently passing.
+    """
+    result = service.complete_authorization_callback(
+        state=raw,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id=selling_partner_id,
+    )
+    assert result.outcome == "invalid"
+    assert result.notice == "error"
+    assert result.reason == "seller_identity_missing"
+    assert result.connection_status == "pending_authorization"
+    assert result.connection_status != "pending_validation"
+    assert result.connection_status != "connected"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id is None
+        assert connection.token_reference is None
+        assert connection.status == "pending_authorization"
+        assert connection.last_error_code == "seller_identity_missing"
+    if selling_partner_id:
+        assert selling_partner_id not in str(result)
+
+
+def test_missing_selling_partner_id_fails_closed_on_first_authorization() -> None:
+    service, raw = _start(_service())
+    _assert_fails_closed_on_first_authorization(service, raw, selling_partner_id=None)
+
+
+def test_token_shaped_selling_partner_id_fails_closed() -> None:
+    service, raw = _start(_service())
+    _assert_fails_closed_on_first_authorization(
+        service, raw, selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["token_shaped"]
+    )
+
+
+def test_oversized_selling_partner_id_fails_closed() -> None:
+    service, raw = _start(_service())
+    _assert_fails_closed_on_first_authorization(
+        service, raw, selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["oversized"]
+    )
+
+
+def test_whitespace_selling_partner_id_fails_closed() -> None:
+    service, raw = _start(_service())
+    _assert_fails_closed_on_first_authorization(
+        service, raw, selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["whitespace_only"]
+    )
+
+
+def test_control_character_selling_partner_id_fails_closed() -> None:
+    service, raw = _start(_service())
+    _assert_fails_closed_on_first_authorization(
+        service, raw, selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["control_character"]
+    )
+
+
+def test_missing_selling_partner_id_during_reauthorization_preserves_existing_grant() -> None:
+    """stored identity: seller A, active grant: seller A. callback identity: absent."""
+    service, provider = _success_service()
+    _, raw_first = _start(service)
+    first = service.complete_authorization_callback(
+        state=raw_first, spapi_oauth_code=TEST_CODE, selling_partner_id="ORIGINALSPID001"
+    )
+    assert first.outcome == "token_stored"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        original_reference = connection.token_reference
+    original_secret = provider.get_secret(original_reference).get_secret_value()
+    assert original_secret == REFRESH_TOKEN
+
+    reauth_service, raw_second = _start(_service(secret_provider=provider))
+    result = reauth_service.complete_authorization_callback(
+        state=raw_second, spapi_oauth_code=TEST_CODE, selling_partner_id=None
+    )
+    assert result.outcome == "invalid"
+    assert result.reason == "seller_identity_missing"
+    assert result.connection_status == "pending_authorization"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "ORIGINALSPID001"
+        assert connection.token_reference == original_reference
+        assert connection.last_error_code == "seller_identity_missing"
+    # Byte-for-byte: the active seller-A secret was never touched.
+    assert provider.get_secret(original_reference).get_secret_value() == original_secret
+
+
+def test_invalid_selling_partner_id_during_reauthorization_preserves_existing_grant() -> None:
+    service, provider = _success_service()
+    _, raw_first = _start(service)
+    first = service.complete_authorization_callback(
+        state=raw_first, spapi_oauth_code=TEST_CODE, selling_partner_id="ORIGINALSPID001"
+    )
+    assert first.outcome == "token_stored"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        original_reference = connection.token_reference
+    original_secret = provider.get_secret(original_reference).get_secret_value()
+
+    reauth_service, raw_second = _start(_service(secret_provider=provider))
+    result = reauth_service.complete_authorization_callback(
+        state=raw_second,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["token_shaped"],
+    )
+    assert result.outcome == "invalid"
+    assert result.reason == "seller_identity_missing"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "ORIGINALSPID001"
+        assert connection.token_reference == original_reference
+    assert provider.get_secret(original_reference).get_secret_value() == original_secret
+
+
+def test_concurrent_valid_and_missing_callbacks_cannot_create_mixed_state() -> None:
+    """connection initially identity-empty. callback A: valid seller A.
+    callback B: missing identity. Deterministic, single-threaded: the fail-
+    closed check requires no database interaction to decide, so no barrier or
+    thread is needed to force a specific order — B's rejection is guaranteed
+    by construction, regardless of whether it runs before or after A."""
+    service, provider = _success_service()
+    _, raw_a = _start(service)
+    valid = service.complete_authorization_callback(
+        state=raw_a, spapi_oauth_code=TEST_CODE, selling_partner_id="RACEVALIDSELLER"
+    )
+    assert valid.outcome == "token_stored"
+
+    missing_service, raw_b = _start(_service(secret_provider=provider))
+    missing = missing_service.complete_authorization_callback(
+        state=raw_b, spapi_oauth_code=TEST_CODE, selling_partner_id=None
+    )
+    assert missing.outcome == "invalid"
+    assert missing.reason == "seller_identity_missing"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        # Active identity and secret both belong to seller A; B never touched either.
+        assert connection.selling_partner_id == "RACEVALIDSELLER"
+        assert connection.token_reference is not None
+        assert provider.get_secret(connection.token_reference).get_secret_value() == REFRESH_TOKEN
+
+
+def test_concurrent_same_seller_and_missing_callbacks_preserve_valid_grant() -> None:
+    """stored identity: seller A. callback A: valid seller A.
+    callback B: missing/invalid identity."""
+    service, provider = _success_service()
+    _, raw_first = _start(service)
+    first = service.complete_authorization_callback(
+        state=raw_first, spapi_oauth_code=TEST_CODE, selling_partner_id="STABLESELLERID"
+    )
+    assert first.outcome == "token_stored"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        reference = connection.token_reference
+
+    reauth_service, raw_reauth = _start(_service(secret_provider=provider))
+    reauth = reauth_service.complete_authorization_callback(
+        state=raw_reauth, spapi_oauth_code=TEST_CODE, selling_partner_id=None
+    )
+    assert reauth.outcome == "invalid"
+    assert reauth.reason == "seller_identity_missing"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "STABLESELLERID"
+        assert connection.token_reference == reference
+        assert provider.get_secret(reference).get_secret_value() == REFRESH_TOKEN
+
+
+def test_fail_closed_logs_and_result_contain_no_secret_material(caplog) -> None:
+    service, raw = _start(_service())
+    with caplog.at_level("DEBUG"):
+        result = service.complete_authorization_callback(
+            state=raw,
+            spapi_oauth_code=TEST_CODE,
+            selling_partner_id=_FAIL_CLOSED_INVALID_IDENTITIES["token_shaped"],
+        )
+    assert result.reason == "seller_identity_missing"
+    combined_log = "\n".join(record.getMessage() for record in caplog.records)
+    for value in (str(result), combined_log):
+        _assert_no_token_material(value)
+        assert _FAIL_CLOSED_INVALID_IDENTITIES["token_shaped"] not in value
+        assert TEST_CODE not in value
+        assert raw not in value
+
+
+def test_oauth_state_cannot_be_replayed_after_fail_closed_rejection() -> None:
+    service, raw = _start(_service())
+    first = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id=None
+    )
+    assert first.reason == "seller_identity_missing"
+    second = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
+    assert second.outcome == "invalid"
+    assert second.reason == "oauth_state_consumed"
+
+
+def test_callback_same_seller_reauthorization_refreshes_grant() -> None:
+    """Stored SPID: seller-A. Callback SPID: seller-A. Must not be treated as a conflict."""
+    service, provider = _success_service()
+    _, raw_first = _start(service)
+    first = service.complete_authorization_callback(
+        state=raw_first,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id="SAMESELLERID01",
+    )
+    assert first.reason == "token_stored"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "SAMESELLERID01"
+        first_reference = connection.token_reference
+
+    _, raw_second = _start(service)
+    second = service.complete_authorization_callback(
+        state=raw_second,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id="SAMESELLERID01",
+    )
+    assert second.outcome == "token_stored"
+    assert second.reason == "token_stored"
+    assert second.connection_status == "pending_validation"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "SAMESELLERID01"
+        assert connection.status == "pending_validation"
+        assert connection.last_error_code is None
+        # The reference (org, connection)-derived pointer is stable; the grant
+        # behind it was safely refreshed.
+        assert connection.token_reference == first_reference
+    assert provider.get_secret(first_reference).get_secret_value() == REFRESH_TOKEN
+
+
+def test_callback_identity_conflict_preserves_active_grant_secret(caplog) -> None:
+    """Regression for the fixed defect: a conflicting reauthorization must never
+    reach `put_secret`, so the active credential can never be silently replaced
+    while the database still names the prior seller.
+    """
+    service, provider = _success_service()
+    _, raw_first = _start(service)
+    first = service.complete_authorization_callback(
+        state=raw_first,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id="ORIGINALSPID001",
+    )
+    assert first.outcome == "token_stored"
+    assert first.reason == "token_stored"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        original_reference = connection.token_reference
+        assert connection.selling_partner_id == "ORIGINALSPID001"
+    assert original_reference is not None
+    assert provider.get_secret(original_reference).get_secret_value() == REFRESH_TOKEN
+
+    class _MustNotExchangeLwa:
+        def exchange_authorization_code(self, authorization_code: SecretStr) -> LwaAuthorizationGrant:
+            raise AssertionError(
+                "an identity-conflicting callback must be rejected before the "
+                "authorization code is ever exchanged, so a different seller's "
+                "refresh token is never requested for a claimed connection"
+            )
+
+    different_seller_service, _shared_provider = _success_service(
+        lwa=_MustNotExchangeLwa(), secrets=provider
+    )
+    assert _shared_provider is provider
+    _, raw_second = _start(different_seller_service)
+    with caplog.at_level("DEBUG"):
+        second = different_seller_service.complete_authorization_callback(
+            state=raw_second,
+            spapi_oauth_code=TEST_CODE,
+            selling_partner_id="DIFFERENTSPID002",
+        )
+    # 4. result reports identity_conflict
+    assert second.outcome == "invalid"
+    assert second.notice == "error"
+    assert second.reason == "identity_conflict"
+    assert second.connection_status == "pending_authorization"
+    assert second.connection_status != "connected"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        # 5. database still contains seller-A
+        assert connection.selling_partner_id == "ORIGINALSPID001"
+        # 6. existing token_reference is unchanged
+        assert connection.token_reference == original_reference
+        # 10. connection does not transition toward connected
+        assert connection.status == "pending_authorization"
+        assert connection.status != "connected"
+        assert connection.last_error_code == "identity_conflict"
+    # 7. the secret stored at that reference remains the prior test grant
+    # 8. seller-B's refresh token is not present in the active secret store
+    #    (it was never requested at all — see _MustNotExchangeLwa above)
+    assert provider.get_secret(original_reference).get_secret_value() == REFRESH_TOKEN
+    # 9. no secret or seller identifier appears in logs or response output
+    combined_log = "\n".join(record.getMessage() for record in caplog.records)
+    for value in (str(second), combined_log):
+        assert "ORIGINALSPID001" not in value
+        assert "DIFFERENTSPID002" not in value
+        _assert_no_token_material(value)
+
+
+def test_service_losing_the_atomic_claim_never_touches_secrets(caplog) -> None:
+    """Deterministically simulates the exact race window the atomic claim
+    exists to close: this attempt's pre-check passes (identity is still
+    unclaimed), but — in the window before its own claim executes — a
+    concurrent authorization for a DIFFERENT seller commits first. A
+    controlled fake forces this interleaving deterministically (no threads,
+    no sleeps): the fake LWA, when exchanged, directly performs the
+    concurrent winner's claim before returning this attempt's grant. This
+    attempt's own claim must then fail, and it must never call put_secret.
+    """
+    service, provider = _success_service()
+    _, raw = _start(service)
+
+    class _ConcurrentWinnerDuringExchangeLwa:
+        def exchange_authorization_code(self, authorization_code: SecretStr) -> LwaAuthorizationGrant:
+            with session_scope() as session:
+                connection = AmazonConnectionRepository(session).get(
+                    current_organization_id(), provider="SP_API", environment="SANDBOX"
+                )
+                assert connection is not None
+                won = AmazonConnectionRepository(session).claim_identity_for_authorization(
+                    current_organization_id(),
+                    connection.id,
+                    selling_partner_id="CONCURRENTWINNERID",
+                )
+                assert won is True, "test setup: the simulated concurrent winner must succeed"
+            return LwaAuthorizationGrant(
+                access_token=SecretStr(ACCESS_TOKEN),
+                refresh_token=SecretStr("Atzr|test-losing-attempt-refresh-token"),
+                token_type="bearer",
+                expires_in=3600,
+            )
+
+    concurrent_service, _shared_provider = _success_service(
+        lwa=_ConcurrentWinnerDuringExchangeLwa(), secrets=provider
+    )
+    with caplog.at_level("DEBUG"):
+        result = concurrent_service.complete_authorization_callback(
+            state=raw,
+            spapi_oauth_code=TEST_CODE,
+            selling_partner_id="MYOWNATTEMPTID",
+        )
+    assert result.outcome == "invalid"
+    assert result.notice == "error"
+    assert result.reason == "identity_conflict"
+    assert result.connection_status == "pending_authorization"
+    assert result.connection_status != "connected"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        # The concurrent winner's identity stands; this attempt never touched it.
+        assert connection.selling_partner_id == "CONCURRENTWINNERID"
+        # No secret was ever written by anyone in this scenario.
+        assert connection.token_reference is None
+        reference = build_asi_secret_reference(
+            provider="SP_API",
+            environment="SANDBOX",
+            organization_id=connection.organization_id,
+            connection_id=connection.id,
+        )
+    assert provider.exists(reference) is False
+    combined_log = "\n".join(record.getMessage() for record in caplog.records)
+    for value in (str(result), combined_log):
+        assert "CONCURRENTWINNERID" not in value
+        assert "MYOWNATTEMPTID" not in value
+        _assert_no_token_material(value)
+
+
+def test_service_winning_the_atomic_claim_with_same_seller_proceeds_normally() -> None:
+    """Mirror of the test above for the benign case: a concurrent claim for
+    the SAME seller commits first, and this attempt must still succeed
+    (same-seller races are not conflicts)."""
+    service, provider = _success_service()
+    _, raw = _start(service)
+
+    class _ConcurrentSameSellerDuringExchangeLwa:
+        def exchange_authorization_code(self, authorization_code: SecretStr) -> LwaAuthorizationGrant:
+            with session_scope() as session:
+                connection = AmazonConnectionRepository(session).get(
+                    current_organization_id(), provider="SP_API", environment="SANDBOX"
+                )
+                assert connection is not None
+                won = AmazonConnectionRepository(session).claim_identity_for_authorization(
+                    current_organization_id(),
+                    connection.id,
+                    selling_partner_id="SHAREDSELLERRACE",
+                )
+                assert won is True
+            return LwaAuthorizationGrant(
+                access_token=SecretStr(ACCESS_TOKEN),
+                refresh_token=SecretStr(REFRESH_TOKEN),
+                token_type="bearer",
+                expires_in=3600,
+            )
+
+    concurrent_service, _shared_provider = _success_service(
+        lwa=_ConcurrentSameSellerDuringExchangeLwa(), secrets=provider
+    )
+    result = concurrent_service.complete_authorization_callback(
+        state=raw,
+        spapi_oauth_code=TEST_CODE,
+        selling_partner_id="SHAREDSELLERRACE",
+    )
+    assert result.outcome == "token_stored"
+    assert result.reason == "token_stored"
+    assert result.connection_status == "pending_validation"
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).get(
+            current_organization_id(), provider="SP_API", environment="SANDBOX"
+        )
+        assert connection is not None
+        assert connection.selling_partner_id == "SHAREDSELLERRACE"
+        assert connection.status == "pending_validation"
+        assert connection.token_reference is not None
+        assert provider.get_secret(connection.token_reference).get_secret_value() == REFRESH_TOKEN
+
+
 def test_callback_accepts_oauth_code_alias() -> None:
     service, _provider = _success_service()
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.outcome == "token_stored"
     assert result.authorization_code_present is True
     assert result.connection_status == "pending_validation"
@@ -222,7 +693,9 @@ def test_lwa_http_is_mocked_and_does_not_call_sp_api() -> None:
     provider = DevelopmentSecretProvider()
     service = _service(settings=settings, lwa_token_service=lwa, secret_provider=provider)
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.outcome == "token_stored"
     assert len(captured) == 1
     form = parse_qs(captured[0].content.decode("utf-8"))
@@ -285,7 +758,9 @@ def test_expired_state_rejected() -> None:
 def test_consumed_state_rejected() -> None:
     service, provider = _success_service()
     _, raw = _start(service)
-    first = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    first = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert first.outcome == "token_stored"
     second = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
     assert second.outcome == "invalid"
@@ -373,7 +848,9 @@ def test_authorization_code_and_tokens_are_not_logged(caplog) -> None:
 def test_invalid_authorization_code_does_not_store_tokens() -> None:
     service, provider = _success_service(lwa=_AuthFailLwa())
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.outcome == "invalid"
     assert result.notice == "error"
     assert result.reason == "lwa_authentication"
@@ -400,7 +877,9 @@ def test_invalid_authorization_code_does_not_store_tokens() -> None:
 def test_amazon_lwa_unavailable_does_not_store_tokens() -> None:
     service, provider = _success_service(lwa=_UnavailableLwa())
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.reason == "lwa_unavailable"
     assert result.connection_status == "pending_authorization"
     with session_scope() as session:
@@ -423,7 +902,9 @@ def test_amazon_lwa_unavailable_does_not_store_tokens() -> None:
 def test_secret_provider_failure_does_not_bind_reference() -> None:
     service, provider = _success_service(secrets=_FailingSecrets())
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.reason == "secret_storage_failed"
     assert result.connection_status == "pending_authorization"
     with session_scope() as session:
@@ -451,7 +932,9 @@ def test_bind_failure_deletes_orphan_secret(monkeypatch) -> None:
     provider = DevelopmentSecretProvider()
     service, _ = _success_service(secrets=provider)
     _, raw = _start(service)
-    result = service.complete_authorization_callback(state=raw, spapi_oauth_code=TEST_CODE)
+    result = service.complete_authorization_callback(
+        state=raw, spapi_oauth_code=TEST_CODE, selling_partner_id="A3FHEXAMPLEYWS"
+    )
     assert result.reason == "token_bind_failed"
     assert result.connection_status == "pending_authorization"
     with session_scope() as session:

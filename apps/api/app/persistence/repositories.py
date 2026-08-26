@@ -4,7 +4,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.amazon.secrets import InvalidSecretReferenceError, parse_asi_amazon_secret_reference
@@ -30,7 +31,10 @@ from app.persistence.models import (
     AdvertisingModel,
     AdvertisingSnapshot,
     AmazonConnection,
+    AmazonIngestionRun,
+    AmazonMarketplaceParticipation,
     AmazonOAuthState,
+    AmazonSellerAccount,
 )
 
 
@@ -1063,6 +1067,56 @@ class AmazonConnectionRepository:
         self.session.flush()
         return row
 
+    def claim_identity_for_authorization(
+        self,
+        organization_id: UUID,
+        connection_id: UUID,
+        *,
+        selling_partner_id: str | None,
+    ) -> bool:
+        """Atomically claim this connection for an OAuth callback attempt.
+
+        This is the sole race-closing step for concurrent callbacks against
+        the same connection: it must run, and must be the only thing that can
+        change `selling_partner_id`, strictly before any SecretProvider call
+        for this attempt. Two concurrent callbacks with different identifiers
+        can never both succeed here, because a single `UPDATE ... WHERE ...`
+        is atomic with respect to concurrent writers of the same row — the
+        database serializes conflicting writes and re-evaluates the WHERE
+        clause against the live, just-committed state. This is a basic
+        guarantee of any ACID-compliant relational database (SQLite and
+        PostgreSQL alike); it does not depend on `SELECT ... FOR UPDATE` or
+        any other backend-specific locking feature.
+
+        Returns True if this call may proceed to exchange/store a grant.
+        Returns False if another identifier is already on record — the
+        caller must not touch SecretProvider at all in that case.
+
+        Raises TypeError for a missing/blank `selling_partner_id`. There is
+        no successful-authorization case where this should be called without
+        one: a missing identifier must fail closed at the caller, before this
+        method is ever reached, not be silently tolerated here. Accepting a
+        falsy value that "trivially claims" merely because the connection
+        exists is exactly the bypass this method exists to prevent.
+        """
+        if not (selling_partner_id or "").strip():
+            raise TypeError("Amazon connection identity claim requires a non-empty selling_partner_id.")
+        statement = (
+            update(AmazonConnection)
+            .where(
+                AmazonConnection.organization_id == organization_id,
+                AmazonConnection.id == connection_id,
+                or_(
+                    AmazonConnection.selling_partner_id.is_(None),
+                    AmazonConnection.selling_partner_id == selling_partner_id,
+                ),
+            )
+            .values(selling_partner_id=selling_partner_id, updated_at=datetime.now(UTC))
+        )
+        outcome = self.session.execute(statement)
+        self.session.flush()
+        return outcome.rowcount == 1
+
     def clear_token_reference(
         self,
         organization_id: UUID,
@@ -1229,6 +1283,272 @@ class AmazonOAuthStateRepository:
             select(AmazonOAuthState)
             .where(AmazonOAuthState.organization_id == organization_id)
             .order_by(AmazonOAuthState.created_at.asc(), AmazonOAuthState.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+
+class SellerAccountOwnershipConflict(Exception):
+    """A `selling_partner_id` is already owned by a different organization.
+
+    12B.2A V1 rule: one canonical `selling_partner_id` belongs to exactly one
+    organization. Never carries the owning organization's id — callers must
+    not disclose it.
+    """
+
+
+class AmazonSellerAccountRepository:
+    """Org-scoped canonical Amazon seller accounts. 12B.2A schema foundation.
+
+    One organization may own multiple seller accounts. One `selling_partner_id`
+    may be owned by only one organization (V1). Never stores tokens or
+    `token_reference`; those remain on `amazon_connections`.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_or_reconcile(
+        self,
+        *,
+        organization_id: UUID,
+        selling_partner_id: str,
+        display_store_name: str | None = None,
+    ) -> AmazonSellerAccount:
+        """Reconcile an existing account for this org, or create a new one.
+
+        Raises SellerAccountOwnershipConflict without disclosing the owning
+        organization if `selling_partner_id` already belongs to another org.
+        """
+        spid = (selling_partner_id or "").strip()
+        if not spid:
+            raise TypeError("Amazon seller account requires a non-empty selling_partner_id.")
+        existing = self.session.scalars(
+            select(AmazonSellerAccount).where(AmazonSellerAccount.selling_partner_id == spid)
+        ).first()
+        if existing is not None:
+            if existing.organization_id != organization_id:
+                raise SellerAccountOwnershipConflict(
+                    "This Amazon seller account is already connected to another organization."
+                )
+            if display_store_name:
+                existing.display_store_name = display_store_name
+            existing.last_seen_at = datetime.now(UTC)
+            self.session.flush()
+            return existing
+        row = AmazonSellerAccount(
+            organization_id=organization_id,
+            selling_partner_id=spid,
+            display_store_name=display_store_name,
+        )
+        self.session.add(row)
+        try:
+            self.session.flush()
+        except IntegrityError as exc:
+            self.session.rollback()
+            raise SellerAccountOwnershipConflict(
+                "This Amazon seller account is already connected to another organization."
+            ) from exc
+        return row
+
+    def get_by_id(self, organization_id: UUID, seller_account_id: UUID) -> AmazonSellerAccount | None:
+        return self.session.scalars(
+            select(AmazonSellerAccount).where(
+                AmazonSellerAccount.organization_id == organization_id,
+                AmazonSellerAccount.id == seller_account_id,
+            )
+        ).first()
+
+    def list_for_org(self, organization_id: UUID) -> list[AmazonSellerAccount]:
+        statement: Select[tuple[AmazonSellerAccount]] = (
+            select(AmazonSellerAccount)
+            .where(AmazonSellerAccount.organization_id == organization_id)
+            .order_by(AmazonSellerAccount.created_at.asc(), AmazonSellerAccount.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+
+class AmazonMarketplaceParticipationRepository:
+    """Org-scoped marketplace participation rows. Marketplace id is canonical identity.
+
+    Display domain (e.g. `amazon.com`) is never used as identity or uniqueness.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create_or_reconcile(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_id: str,
+        region: str,
+        connection_id: UUID | None = None,
+        name: str | None = None,
+        country_code: str | None = None,
+        default_currency_code: str | None = None,
+        default_language_code: str | None = None,
+        domain_name: str | None = None,
+        store_name: str | None = None,
+        is_participating: bool = True,
+        has_suspended_listings: bool = False,
+    ) -> AmazonMarketplaceParticipation:
+        seller_account = self.session.get(AmazonSellerAccount, seller_account_id)
+        if seller_account is None or seller_account.organization_id != organization_id:
+            raise TypeError(
+                "Amazon marketplace participation cannot bind a seller account from another organization."
+            )
+        if connection_id is not None:
+            connection = self.session.get(AmazonConnection, connection_id)
+            if connection is None or connection.organization_id != organization_id:
+                raise TypeError(
+                    "Amazon marketplace participation cannot bind a connection from another organization."
+                )
+        existing = self.session.scalars(
+            select(AmazonMarketplaceParticipation).where(
+                AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+                AmazonMarketplaceParticipation.marketplace_id == marketplace_id,
+            )
+        ).first()
+        now = datetime.now(UTC)
+        if existing is not None:
+            existing.name = name or existing.name
+            existing.country_code = country_code or existing.country_code
+            existing.default_currency_code = default_currency_code or existing.default_currency_code
+            existing.default_language_code = default_language_code or existing.default_language_code
+            existing.domain_name = domain_name or existing.domain_name
+            existing.store_name = store_name or existing.store_name
+            existing.region = region
+            existing.is_participating = is_participating
+            existing.has_suspended_listings = has_suspended_listings
+            existing.is_active = True
+            existing.last_seen_at = now
+            if connection_id is not None:
+                existing.connection_id = connection_id
+            self.session.flush()
+            return existing
+        row = AmazonMarketplaceParticipation(
+            organization_id=organization_id,
+            seller_account_id=seller_account_id,
+            connection_id=connection_id,
+            marketplace_id=marketplace_id,
+            name=name,
+            country_code=country_code,
+            default_currency_code=default_currency_code,
+            default_language_code=default_language_code,
+            domain_name=domain_name,
+            region=region,
+            is_participating=is_participating,
+            has_suspended_listings=has_suspended_listings,
+            store_name=store_name,
+            is_active=True,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_for_seller_account(
+        self, organization_id: UUID, seller_account_id: UUID
+    ) -> list[AmazonMarketplaceParticipation]:
+        statement: Select[tuple[AmazonMarketplaceParticipation]] = (
+            select(AmazonMarketplaceParticipation)
+            .where(
+                AmazonMarketplaceParticipation.organization_id == organization_id,
+                AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+            )
+            .order_by(AmazonMarketplaceParticipation.marketplace_id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+
+class AmazonIngestionRunRepository:
+    """Org- and seller-account-scoped ingestion-run lifecycle records.
+
+    Foundation only. Creating rows here does not perform SP-API ingestion.
+    """
+
+    _VALID_STATUSES = frozenset({"started", "succeeded", "partial", "failed", "timed_out"})
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def start(
+        self,
+        *,
+        organization_id: UUID,
+        domain: str,
+        region: str,
+        environment: str,
+        connection_id: UUID | None = None,
+        seller_account_id: UUID | None = None,
+        request_correlation_id: str | None = None,
+    ) -> AmazonIngestionRun:
+        if seller_account_id is not None:
+            seller_account = self.session.get(AmazonSellerAccount, seller_account_id)
+            if seller_account is None or seller_account.organization_id != organization_id:
+                raise TypeError(
+                    "Amazon ingestion run cannot bind a seller account from another organization."
+                )
+        if connection_id is not None:
+            connection = self.session.get(AmazonConnection, connection_id)
+            if connection is None or connection.organization_id != organization_id:
+                raise TypeError("Amazon ingestion run cannot bind a connection from another organization.")
+        row = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            seller_account_id=seller_account_id,
+            domain=domain,
+            region=region,
+            environment=environment,
+            status="started",
+            request_correlation_id=request_correlation_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def complete(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        status: str,
+        records_received: int = 0,
+        records_accepted: int = 0,
+        records_rejected: int = 0,
+        retry_count: int = 0,
+        failure_class: str | None = None,
+        pagination_complete: bool = True,
+    ) -> AmazonIngestionRun | None:
+        if status not in self._VALID_STATUSES:
+            raise TypeError(f"Unsupported Amazon ingestion run status: {status!r}")
+        row = self.get_by_id(organization_id, run_id)
+        if row is None:
+            return None
+        row.status = status
+        row.completed_at = datetime.now(UTC)
+        row.records_received = records_received
+        row.records_accepted = records_accepted
+        row.records_rejected = records_rejected
+        row.retry_count = retry_count
+        row.failure_class = failure_class
+        row.pagination_complete = pagination_complete
+        self.session.flush()
+        return row
+
+    def get_by_id(self, organization_id: UUID, run_id: UUID) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun).where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+            )
+        ).first()
+
+    def list_for_org(self, organization_id: UUID) -> list[AmazonIngestionRun]:
+        statement: Select[tuple[AmazonIngestionRun]] = (
+            select(AmazonIngestionRun)
+            .where(AmazonIngestionRun.organization_id == organization_id)
+            .order_by(AmazonIngestionRun.started_at.asc(), AmazonIngestionRun.id.asc())
         )
         return list(self.session.scalars(statement).all())
 

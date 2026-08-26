@@ -200,6 +200,36 @@ async def test_successful_seller_validation_marks_connected(caplog) -> None:
 
 
 @pytest.mark.asyncio
+async def test_identity_conflict_between_callback_and_validation_is_not_reconciled() -> None:
+    service, provider = _service()
+    connection_id, reference = _seed_pending_validation(provider=provider)
+    with session_scope() as session:
+        AmazonConnectionRepository(session).update(
+            current_organization_id(),
+            connection_id,
+            selling_partner_id="CALLBACKCAPTUREDID",
+        )
+    result = await service.validate_seller_connection()
+    assert result.valid is False
+    assert result.reason == "identity_conflict"
+    assert result.connection_status == "pending_validation"
+    assert result.selling_partner_id is None
+    _assert_no_secrets(result)
+    with session_scope() as session:
+        stored = AmazonConnectionRepository(session).get_by_id(
+            current_organization_id(), connection_id
+        )
+        assert stored is not None
+        # Last known-good identity (captured earlier, e.g. at OAuth callback) is
+        # preserved; the disagreeing Sellers API value is not reconciled in.
+        assert stored.selling_partner_id == "CALLBACKCAPTUREDID"
+        assert stored.status == "pending_validation"
+        assert stored.status != "connected"
+        assert stored.last_error_code == "identity_conflict"
+        assert stored.token_reference == reference
+
+
+@pytest.mark.asyncio
 async def test_test_connection_uses_secret_provider_and_sellers_path() -> None:
     captured: list[httpx.Request] = []
 

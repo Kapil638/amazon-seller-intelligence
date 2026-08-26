@@ -564,3 +564,149 @@ class AmazonOAuthState(Base):
 
     organization: Mapped[Organization] = relationship()
     connection: Mapped[AmazonConnection] = relationship()
+
+
+class AmazonSellerAccount(Base):
+    """Canonical Amazon selling partner. 12B.2A schema foundation; no ingest.
+
+    V1 product constraint: one `selling_partner_id` is owned by exactly one
+    ASI organization (global uniqueness below). One organization may own
+    multiple seller accounts. Never stores refresh/access tokens or
+    `token_reference`; those remain on `amazon_connections` behind
+    SecretProvider.
+    """
+
+    __tablename__ = "amazon_seller_accounts"
+    __table_args__ = (
+        UniqueConstraint(
+            "selling_partner_id",
+            name="uq_amazon_seller_accounts_selling_partner_id",
+        ),
+        Index("ix_amazon_seller_accounts_org", "organization_id"),
+        CheckConstraint(
+            "status IN ('active', 'identity_incomplete', 'disconnected')",
+            name="ck_amazon_seller_accounts_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    selling_partner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_store_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+
+
+class AmazonMarketplaceParticipation(Base):
+    """Seller's Amazon marketplace membership. Marketplace id is canonical identity.
+
+    Display domain (e.g. `amazon.com`) is descriptive metadata only, never a
+    uniqueness or identity key. Idempotent upsert target for 12B.2B+.
+    """
+
+    __tablename__ = "amazon_marketplace_participations"
+    __table_args__ = (
+        UniqueConstraint(
+            "seller_account_id",
+            "marketplace_id",
+            name="uq_amazon_marketplace_participations_seller_marketplace",
+        ),
+        Index("ix_amazon_marketplace_participations_org", "organization_id"),
+        Index(
+            "ix_amazon_marketplace_participations_seller_active",
+            "seller_account_id",
+            "is_active",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    seller_account_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_seller_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    connection_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_connections.id", ondelete="SET NULL"), nullable=True
+    )
+    marketplace_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    default_currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    default_language_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    domain_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    region: Mapped[str] = mapped_column(String(8), nullable=False)
+    is_participating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    has_suspended_listings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    store_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    seller_account: Mapped[AmazonSellerAccount] = relationship()
+
+
+class AmazonIngestionRun(Base):
+    """Reusable SP-API ingestion-attempt record. Foundation only.
+
+    12B.2A creates this table so later ingestion slices have a scoped,
+    idempotent run ledger to write to. No worker, scheduler, or live SP-API
+    ingestion call is authorized by this table's existence.
+    """
+
+    __tablename__ = "amazon_ingestion_runs"
+    __table_args__ = (
+        Index("ix_amazon_ingestion_runs_org", "organization_id"),
+        Index("ix_amazon_ingestion_runs_seller_account", "seller_account_id"),
+        CheckConstraint(
+            "status IN ('started', 'succeeded', 'partial', 'failed', 'timed_out')",
+            name="ck_amazon_ingestion_runs_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    connection_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_connections.id", ondelete="SET NULL"), nullable=True
+    )
+    seller_account_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_seller_accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(8), nullable=False)
+    environment: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    request_correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    records_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    records_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    records_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pagination_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    organization: Mapped[Organization] = relationship()
