@@ -214,11 +214,19 @@ def test_existing_0008_database_upgrades_to_0009_preserving_data(disposable_engi
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
+        # Starting from empty, this runs the full 0001-0008 chain. 0001's
+        # upgrade() deterministically bootstraps one default-organization row
+        # (see migrations/versions/0001_m10_persistence.py) whenever it runs
+        # online against a database that doesn't already have it — which is
+        # exactly this case. The pre-upgrade organization count below is
+        # therefore that bootstrap row plus this test's own fixture row, not
+        # the fixture row alone.
         command.upgrade(cfg, "0008_amazon_oauth_states")
 
     org_id = uuid4()
+    org_name = "Disposable Postgres Test Org"
     with Session(disposable_engine) as session:
-        session.add(Organization(id=org_id, name="Disposable Postgres Test Org"))
+        session.add(Organization(id=org_id, name=org_name))
         session.add(
             AmazonConnection(
                 organization_id=org_id,
@@ -233,6 +241,18 @@ def test_existing_0008_database_upgrades_to_0009_preserving_data(disposable_engi
     with disposable_engine.connect() as conn:
         connections_before = conn.execute(text("SELECT COUNT(*) FROM amazon_connections")).scalar()
         organizations_before = conn.execute(text("SELECT COUNT(*) FROM organizations")).scalar()
+        # Expect the 0001 default-organization bootstrap row plus this test's
+        # own fixture row — asserted explicitly so a future change to either
+        # fails loudly here instead of silently invalidating the assumption
+        # this test's invariant is built on.
+        assert organizations_before == 2, (
+            "expected 0001's default-organization bootstrap row plus this "
+            f"test's own fixture row; got {organizations_before}"
+        )
+        preserved_name_before = conn.execute(
+            text("SELECT name FROM organizations WHERE id = :id"), {"id": org_id}
+        ).scalar()
+        assert preserved_name_before == org_name
 
     with _alembic_environment(url):
         command.upgrade(cfg, "0009_amazon_seller_identity")
@@ -242,10 +262,18 @@ def test_existing_0008_database_upgrades_to_0009_preserving_data(disposable_engi
         connections_after = conn.execute(text("SELECT COUNT(*) FROM amazon_connections")).scalar()
         organizations_after = conn.execute(text("SELECT COUNT(*) FROM organizations")).scalar()
         seller_accounts_after = conn.execute(text("SELECT COUNT(*) FROM amazon_seller_accounts")).scalar()
+        preserved_name_after = conn.execute(
+            text("SELECT name FROM organizations WHERE id = :id"), {"id": org_id}
+        ).scalar()
 
     assert current == "0009_amazon_seller_identity"
     assert connections_after == connections_before == 1
-    assert organizations_after == organizations_before == 1
+    # The real invariant: the upgrade must not create, delete, or duplicate
+    # any row — not that the count equals a specific hard-coded number.
+    assert organizations_after == organizations_before
+    # Identity/content, not just aggregate count: the exact fixture row must
+    # still exist, unmodified, by its own id.
+    assert preserved_name_after == preserved_name_before == org_name
     assert seller_accounts_after == 0
 
 
