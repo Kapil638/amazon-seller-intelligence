@@ -8,31 +8,41 @@ read both docstrings below before touching either:
    database already stamped at 0008. This is real coverage of 0009, but it
    is NOT a test that the full migration chain applies cleanly from zero.
 
-2. `test_full_migration_chain_from_empty_database_currently_fails_at_0002` —
-   a diagnostic that pins a genuine, PRE-EXISTING defect (not introduced by
-   0009): `alembic upgrade head` from a truly empty database fails partway
-   through, at 0002, because `migrations/versions/0001_m10_persistence.py`
-   calls `Base.metadata.create_all(bind)`, which creates every table
-   *currently* defined on the live `Base` metadata object — including tables
-   added by migrations written years after 0001 (and this file's own new
-   12B.2A tables). `0002_scoring_profiles.py` then tries to
-   `op.create_table` a table 0001 already created and fails with
-   "table already exists". This has apparently never been exercised in
-   practice: real databases were bootstrapped some other way (see
-   `docs/AI_HANDOVER/04_DATABASE_AND_MIGRATIONS.md` for the proposed
-   remediation), then migrated incrementally one revision at a time.
+2. `test_full_migration_chain_from_empty_sqlite_fails_only_on_postgres_only_types` —
+   as of 12B.2A.1, `migrations/versions/0001_m10_persistence.py` was
+   rewritten to create only its reconstructed, historically-accurate
+   baseline schema via deterministic `op.create_table`/`op.create_index`
+   calls (see that file's own docstring for the git-history reconstruction),
+   instead of calling `Base.metadata.create_all(bind)` against the live,
+   ever-growing model metadata. That resolved the collision with `0002` that
+   previously made a genuine `alembic upgrade head` from an empty database
+   fail (see `docs/AI_HANDOVER/19_DATABASE_DEPLOYMENT_HARDENING_ARCHITECTURE_REVIEW.md`
+   for the full investigation and repair).
 
-   This repository has no established convention for tracking known-failing
-   tests (no `xfail`/`skip` usage anywhere in the suite), so this is
-   deliberately NOT marked `xfail` — introducing that convention here would
-   be an unrelated process change. Instead it is a normal, passing
-   regression test that asserts the CURRENT failure mode precisely (via
-   `pytest.raises`), so it pins the bug rather than hiding it. When `0001`
-   is eventually remediated, this test must be rewritten to assert success,
-   not deleted.
+   Running the real chain against SQLite specifically still cannot succeed,
+   for an unrelated, pre-existing, and expected reason: `0001` (and `0002`,
+   `0004`, `0005`, `0006`) use `sqlalchemy.dialects.postgresql.JSONB`
+   directly, which has no SQLite-compatible rendering at all (unlike
+   `postgresql.UUID`, which SQLAlchemy degrades gracefully for DDL). These
+   migrations have only ever targeted PostgreSQL — SQLite is not, and was
+   never, a supported migration target; the `Guid`/`JsonPayload` dialect-
+   aware ORM types used for the *pytest* database (via `Base.metadata
+   .create_all()`) are a separate, application-level concern from what the
+   raw migration files declare. This test pins that expected boundary
+   precisely, so a regression back to the *old* collision (still at 0002)
+   would be caught, but the still-correct, still-expected JSONB-on-SQLite
+   failure is not mistaken for a bug.
 
-Neither test ever touches the configured `DATABASE_URL`: it is overridden
-for the duration of each test and restored in a `finally` block.
+   The real proof that zero-to-head now works end-to-end belongs to
+   PostgreSQL, not SQLite — see `apps/api/tests/postgres/` (disposable,
+   opt-in) and `tests/test_migration_chain_matches_orm_metadata.py` (a
+   dependency-free static check using Alembic's offline `--sql` mode,
+   which compiles every migration for the PostgreSQL dialect without a real
+   connection and confirms no collisions and no drift against the live ORM
+   models).
+
+Neither test in this file ever touches the configured `DATABASE_URL`: it is
+overridden for the duration of each test and restored in a `finally` block.
 """
 
 from __future__ import annotations
@@ -45,7 +55,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import CompileError
 
 from app.core.config import get_settings
 from app.persistence.models import Base
@@ -78,8 +88,9 @@ def test_alembic_has_a_single_head() -> None:
 
 def test_migration_0009_upgrades_and_downgrades_in_isolation_from_0008(tmp_path) -> None:
     """Proves 0009 itself is correct. Does NOT prove the full chain applies from
-    zero — see `test_full_migration_chain_from_empty_database_currently_fails_at_0002`
-    for that, and the module docstring for why the two are not interchangeable.
+    zero — see `test_full_migration_chain_from_empty_sqlite_fails_only_on_postgres_only_types`
+    and `tests/test_migration_chain_matches_orm_metadata.py` for that, and the
+    module docstring for why the three are not interchangeable.
     """
     db_path = tmp_path / "migration_0009.sqlite3"
     sqlite_url = f"sqlite:///{db_path}"
@@ -170,15 +181,12 @@ def test_migration_0009_upgrades_and_downgrades_in_isolation_from_0008(tmp_path)
         get_settings.cache_clear()
 
 
-def test_full_migration_chain_from_empty_database_currently_fails_at_0002(tmp_path) -> None:
-    """Diagnostic, not a 0009 defect: `alembic upgrade head` from a genuinely
-    empty database currently fails at 0002 for a pre-existing reason unrelated
-    to this migration. See the module docstring for the full explanation and
-    `docs/AI_HANDOVER/04_DATABASE_AND_MIGRATIONS.md` for the proposed fix.
-
-    This test intentionally asserts the CURRENT failing behavior so a future
-    fix to `0001_m10_persistence.py` is forced to touch this test (and can
-    then flip it to assert success) rather than the regression going unnoticed.
+def test_full_migration_chain_from_empty_sqlite_fails_only_on_postgres_only_types(tmp_path) -> None:
+    """12B.2A.1: the 0001/0002 collision is fixed — this must NOT fail at
+    0002 (or with "already exists") any more. It still cannot complete on
+    SQLite, but only because 0001 now reaches its (correct, Postgres-only)
+    `JSONB` columns — proving the chain progressed past the old failure
+    point rather than resurfacing it. See the module docstring.
     """
     db_path = tmp_path / "migration_from_zero.sqlite3"
     sqlite_url = f"sqlite:///{db_path}"
@@ -187,11 +195,12 @@ def test_full_migration_chain_from_empty_database_currently_fails_at_0002(tmp_pa
     get_settings.cache_clear()
     try:
         cfg = _alembic_config(sqlite_url)
-        with pytest.raises(OperationalError) as excinfo:
+        with pytest.raises(CompileError) as excinfo:
             command.upgrade(cfg, "head")
         message = str(excinfo.value)
-        assert "scoring_profiles" in message
-        assert "already exists" in message
+        assert "already exists" not in message
+        assert "scoring_profiles" not in message
+        assert "JSONB" in message
     finally:
         if previous_database_url is None:
             os.environ.pop("DATABASE_URL", None)

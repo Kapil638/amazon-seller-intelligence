@@ -1,0 +1,151 @@
+name: Backend database CI
+
+# 12B.2A.1 — greenfield addition; no CI existed in this repository before.
+#
+# Uses only a disposable, ephemeral PostgreSQL *service container* scoped to
+# each job's lifetime — never reachable outside the job, never the
+# developer's configured database (which does not exist in this environment
+# at all). No deployment, publishing, or production credentials are used or
+# required anywhere in this workflow.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "apps/api/**"
+      - ".github/workflows/backend-database-ci.yml"
+
+jobs:
+  fresh-install-migration:
+    name: Fresh PostgreSQL — zero-to-head migration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_fresh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_fresh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade head (from empty database)
+        working-directory: apps/api
+        run: uv run alembic upgrade head
+      - name: Confirm single head and expected revision
+        working-directory: apps/api
+        run: |
+          uv run alembic heads | tee /tmp/heads.txt
+          grep -q "0009_amazon_seller_identity (head)" /tmp/heads.txt
+          uv run alembic current | tee /tmp/current.txt
+          grep -q "0009_amazon_seller_identity" /tmp/current.txt
+
+  existing-database-upgrade:
+    name: Existing PostgreSQL (0008) — upgrade to 0009
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0008 (simulates an existing pre-12B.2A database)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0008_amazon_oauth_states
+      - name: alembic upgrade to 0009 (the real 12B.2A upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0009_amazon_seller_identity
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0009_amazon_seller_identity"
+
+  postgres-identity-concurrency:
+    name: PostgreSQL — OAuth identity concurrency validation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_concurrency
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Deliberately NOT the application DATABASE_URL — this job never sets
+      # that variable, so the disposable-Postgres guard's "resembles the
+      # configured database" check trivially passes (there is no configured
+      # database in this job at all).
+      ASI_ALLOW_DISPOSABLE_POSTGRES: "1"
+      POSTGRES_DISPOSABLE_TEST_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_concurrency
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: Run disposable-PostgreSQL deployment and concurrency suite
+        working-directory: apps/api
+        run: uv run pytest tests/postgres/ -v
+
+  backend-test-suite-and-drift-check:
+    name: Backend test suite + migration/model drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: Run backend test suite (SQLite, offline)
+        working-directory: apps/api
+        run: uv run pytest -q
+      - name: Migration/model drift check (no database required)
+        working-directory: apps/api
+        run: uv run pytest tests/test_migration_chain_matches_orm_metadata.py -v
