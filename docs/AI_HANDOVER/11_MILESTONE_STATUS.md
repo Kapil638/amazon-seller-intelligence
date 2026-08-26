@@ -27,7 +27,8 @@ Historical slice docs remain in `docs/milestone-11/` and `docs/milestone-12/`. T
 | 12B.1C Seller authorization | **Implemented through 12B.1C.5** |
 | 12B.1C.3 Frontend Connect Amazon | Implemented (no separate slice markdown historically) |
 | 12B.1D Seller connection validation | **Completed** (latest Amazon implementation) |
-| 12B.2 Canonical seller identity + marketplace ingest | **Next. Not started.** |
+| 12B.2A Canonical seller identity schema foundation | **Completed** (schema + migration `0009` + OAuth callback identity capture; not wired to live ingest) |
+| 12B.2 Canonical seller identity + marketplace ingest (remainder) | **Next. Not started.** |
 | 12B.3 Listings / seller product adapter | Not started |
 | 12B.4–12B.9 | Not started |
 | 12C Ads API | Not started |

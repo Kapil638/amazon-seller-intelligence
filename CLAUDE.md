@@ -28,10 +28,11 @@ Completed and stable:
 - Seller authorization through LWA token exchange + opaque `token_reference` (12B.1C through 12B.1C.5)
 - Seller validation handshake via `GET /sellers/v1/marketplaceParticipations` (12B.1D)
 - Live Production seller grant: LWA authorization-code exchange → SecretProvider refresh token → `pending_validation` → Validate connection → `connected` (Production / NA / amazon.com, 25 August 2026)
+- 12B.2A canonical seller identity schema foundation: `amazon_seller_accounts`, `amazon_marketplace_participations`, `amazon_ingestion_runs` (migration `0009`), plus OAuth callback capture of Amazon's `selling_partner_id` onto `amazon_connections.selling_partner_id` with identity-conflict detection. Schema and capture only — no marketplace ingestion, no canonical-account creation wired to live traffic yet.
 
 Not started:
 
-- 12B.2 canonical seller identity / marketplace ingestion (architecture validation exists; implementation not started)
+- 12B.2B+ marketplace-participation normalization/reconciliation and ingestion wiring (schema exists from 12B.2A; not yet populated by any live path)
 - Listings, orders, inventory, reports, finances ingest
 - Ads API (that is **12C**, not 12B.2)
 - Skills implementation
@@ -109,8 +110,9 @@ If a number cannot be calculated from inputs, leave it unknown. Do not ask the L
 - Soft-delete analysis history; do not destroy underlying rows.
 - Amazon connection tables are authorization metadata, not seller business data.
 - Do not add refresh/access token columns to business or connection tables.
-- Current Alembic head: `0008_amazon_oauth_states` (single head). Chain: `0001` … `0006_advertising_models` → `0007_amazon_connections` → `0008_amazon_oauth_states`.
-- Do not invent migrations. Do not create seller-account/marketplace/listing tables until 12B.2+.
+- Current Alembic head: `0009_amazon_seller_identity` (single head). Chain: `0001` … `0006_advertising_models` → `0007_amazon_connections` → `0008_amazon_oauth_states` → `0009_amazon_seller_identity`.
+- `0009_amazon_seller_identity` adds schema only (`amazon_seller_accounts`, `amazon_marketplace_participations`, `amazon_ingestion_runs`, 12B.2A). No SP-API ingestion, sync worker, or Copilot/EvidenceEnvelope wiring is authorized by this table's existence.
+- Do not invent further migrations. Do not build listing/order/inventory tables until their approved slice.
 
 ## Current Amazon Integration Status
 
@@ -124,7 +126,8 @@ If a number cannot be calculated from inputs, leave it unknown. Do not ask the L
 | 12B.1C Seller authorization | Implemented through 12B.1C.5 |
 | 12B.1D Seller connection validation | Completed |
 | Production Connect Amazon (US live grant) | Proven 25 August 2026 (not a new ingest slice) |
-| 12B.2 Canonical seller identity | **Next. Not started.** Architecture validation: `docs/AI_HANDOVER/12B2_CANONICAL_SELLER_IDENTITY_ARCHITECTURE_VALIDATION.md` |
+| 12B.2A Canonical seller identity schema foundation | Schema + migration `0009` + callback identity capture implemented. Not yet wired to any live seller-account/participation creation. |
+| 12B.2 Canonical seller identity (remaining: normalization, ingestion) | **Next. Not started.** Architecture validation: `docs/AI_HANDOVER/12B2_CANONICAL_SELLER_IDENTITY_ARCHITECTURE_VALIDATION.md` |
 
 Authorization path:
 
@@ -156,8 +159,8 @@ Connect Amazon defaults (verified in code):
 3. Amazon Draft app Login URI / Redirect URI must match real HTTPS routes exactly. localhost is not suitable for the live Amazon round-trip. Tunnel hostnames are ephemeral unless a named tunnel is used.
 4. Sandbox and Draft/Production credentials are deliberately separate.
 5. Listing intelligence `supported_marketplaces` remains **`amazon.in`**. Connection display `amazon.com` is the authorized seller’s connection marketplace, not a listing-engine default. Do not confuse the two.
-6. `getMarketplaceParticipations` may omit `sellingPartnerId`. Validation can still succeed from participation. Callback `selling_partner_id` is not used as the tenant key and is currently discarded for tenancy.
-7. No canonical seller identity / marketplace tables yet (12B.2). Handshake marketplace lists are not persisted as canonical rows.
+6. Amazon's Website Authorization Workflow **requires** `selling_partner_id` on the OAuth callback redirect for a self-authorized app. A successful callback (code present, not denied) whose `selling_partner_id` is missing, blank, oversized, token-shaped, or contains control characters now **fails closed**: no LWA exchange, no `SecretProvider` access, no `token_reference` bind, no identity change, no transition toward `pending_validation`/`connected` — reason `seller_identity_missing`. This applies identically to first authorization, reauthorization, reconnect, and concurrent attempts; it does not change the unrelated `access_denied` path. The rejected value is never logged, returned, or included in an exception. It is never invented, hashed, derived, or inferred from any other field (marketplace id, org id, connection id, application id, token reference, OAuth state, region, or the Sellers API response). The captured identifier is never used as the tenant key, org identifier, or authorization grant. `getMarketplaceParticipations`'s `sellingPartnerId` remains **secondary confirmation only** during validation — it is no longer a substitute for a missing callback identity on a successful Website Authorization callback; the old "permit and leave identity unset" fallback for a missing/invalid callback identifier no longer exists. A sequential identity check runs before the authorization code is exchanged and before `put_secret` is ever called, so an obviously conflicting reauthorization never reaches the active secret. The invariant is additionally enforced under **concurrent** callbacks for the same connection via `AmazonConnectionRepository.claim_identity_for_authorization` — a single atomic conditional `UPDATE` that must succeed before this attempt may touch SecretProvider at all, and that now raises `TypeError` rather than trivially succeeding if ever called with a missing identifier; two concurrent callbacks with different identifiers can never both win it (this holds on SQLite and PostgreSQL identically — it relies on universal single-statement UPDATE atomicity, not `SELECT ... FOR UPDATE` or any backend-specific locking). If callback and validation ever disagree, or the callback identifier disagrees with what's already on the connection (sequentially or concurrently), neither identity nor the active secret is overwritten; the connection is marked `identity_conflict` and automatic reconciliation stops.
+7. `amazon_seller_accounts` / `amazon_marketplace_participations` / `amazon_ingestion_runs` exist as schema (12B.2A, migration `0009`) but are not yet populated by any live path. Handshake marketplace lists are still not persisted as canonical rows.
 8. No seller business-data ingestion (listings, orders, inventory, reports, finances).
 9. No Ads API.
 10. Rainforest remains active and must not be removed.
@@ -167,9 +170,9 @@ Connect Amazon defaults (verified in code):
 
 ## Current Test Baseline
 
-Verified 25 August 2026, no live Amazon in tests:
+Verified 26 August 2026, no live Amazon in tests:
 
-- Backend: `cd apps/api && uv run pytest` → **624 passed**
+- Backend: `cd apps/api && uv run pytest` → **664 passed**
 - Frontend: `cd apps/web && npm test` → **35 passed** (3 files)
 
 Do not add live Amazon calls to automated tests. `conftest.py` clears SP-API env and pins listing `DEFAULT_MARKETPLACE=amazon.in` so a local US Connect Amazon `.env` cannot fail listing/profit tests.

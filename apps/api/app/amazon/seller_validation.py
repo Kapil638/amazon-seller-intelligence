@@ -46,6 +46,7 @@ INVALID_REFRESH_MESSAGE = "Amazon seller authorization is no longer valid."
 SECRET_ACCESS_MESSAGE = "Amazon seller credentials could not be retrieved."
 UNAVAILABLE_MESSAGE = "Amazon SP-API is temporarily unavailable."
 IDENTITY_UNAVAILABLE_MESSAGE = "Amazon seller marketplace participation was not found."
+IDENTITY_CONFLICT_MESSAGE = "Amazon seller identity could not be confirmed."
 
 SellersClientFactory = Callable[..., AmazonSpApiSellersClient]
 
@@ -57,6 +58,8 @@ class SellerValidationTarget(Protocol):
     environment: str
     region: str
     token_reference: str | None
+    status: str
+    selling_partner_id: str | None
 
 
 class SellerMarketplace(BaseModel):
@@ -257,6 +260,28 @@ class AmazonSellerValidationService:
         selling_partner_id = (parsed.selling_partner_id or "").strip() or None
         if selling_partner_id and len(selling_partner_id) > 64:
             selling_partner_id = None
+        existing_selling_partner_id = (connection.selling_partner_id or "").strip() or None
+        if (
+            selling_partner_id
+            and existing_selling_partner_id
+            and selling_partner_id != existing_selling_partner_id
+        ):
+            # Sellers API returned an identifier that disagrees with the one already
+            # on record for this connection (e.g. captured at OAuth callback). Do not
+            # silently overwrite either identity or move the connection to connected;
+            # preserve the last known-good state and stop automatic reconciliation.
+            logger.info(
+                "amazon seller validation rejected reason=identity_conflict connection_id=%s",
+                connection.id,
+            )
+            return SellerValidationResult(
+                valid=False,
+                selling_partner_id=None,
+                marketplaces=marketplaces,
+                connection_status=connection.status,
+                reason="identity_conflict",
+                message=IDENTITY_CONFLICT_MESSAGE,
+            )
         if not marketplaces:
             logger.info(
                 "amazon seller validation failed reason=seller_identity_unavailable connection_id=%s",
