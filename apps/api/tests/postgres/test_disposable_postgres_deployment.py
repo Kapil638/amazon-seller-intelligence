@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -29,6 +30,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.persistence.models import AmazonConnection, Base, Organization
 from app.persistence.repositories import AmazonConnectionRepository
 from tests.postgres import _guard
@@ -43,6 +45,32 @@ def _alembic_config(url: str) -> Config:
     cfg.set_main_option("script_location", str(API_ROOT / "migrations"))
     cfg.set_main_option("sqlalchemy.url", url)
     return cfg
+
+
+@contextmanager
+def _alembic_environment(url: str):
+    """`migrations/env.py` always overrides `Config.sqlalchemy.url` with
+    whatever `DATABASE_URL` currently resolves to via
+    `app.persistence.database.sqlalchemy_database_url()` — including the
+    `DATABASE_URL = "sqlite://"` that `apps/api/tests/conftest.py` sets at
+    collection time for the *entire* `tests/` tree, this file included.
+    Without this, every `alembic.command.*` call below would silently run
+    against SQLite instead of the disposable PostgreSQL instance, regardless
+    of what is set directly on the `Config` object — exactly the gotcha
+    already solved this same way in `tests/test_amazon_seller_identity_
+    schema.py`.
+    """
+    previous = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = url
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous
+        get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -75,7 +103,8 @@ def disposable_engine():
 def test_empty_postgres_upgrades_cleanly_to_0009(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     with disposable_engine.connect() as conn:
         current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -86,7 +115,8 @@ def test_empty_postgres_upgrades_cleanly_to_0009(disposable_engine) -> None:
 def test_empty_postgres_upgrade_produces_expected_schema(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
@@ -144,7 +174,8 @@ def test_empty_postgres_upgrade_produces_expected_schema(disposable_engine) -> N
 def test_empty_postgres_upgrade_matches_orm_metadata_exactly(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     inspector = inspect(disposable_engine)
     reflected_tables = set(inspector.get_table_names()) - {"alembic_version"}
@@ -164,8 +195,9 @@ def test_empty_postgres_upgrade_matches_orm_metadata_exactly(disposable_engine) 
 def test_downgrade_0009_to_0008_is_clean(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
-    command.downgrade(cfg, "0008_amazon_oauth_states")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
+        command.downgrade(cfg, "0008_amazon_oauth_states")
 
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
@@ -181,7 +213,8 @@ def test_downgrade_0009_to_0008_is_clean(disposable_engine) -> None:
 def test_existing_0008_database_upgrades_to_0009_preserving_data(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "0008_amazon_oauth_states")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0008_amazon_oauth_states")
 
     org_id = uuid4()
     with Session(disposable_engine) as session:
@@ -201,7 +234,8 @@ def test_existing_0008_database_upgrades_to_0009_preserving_data(disposable_engi
         connections_before = conn.execute(text("SELECT COUNT(*) FROM amazon_connections")).scalar()
         organizations_before = conn.execute(text("SELECT COUNT(*) FROM organizations")).scalar()
 
-    command.upgrade(cfg, "0009_amazon_seller_identity")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0009_amazon_seller_identity")
 
     with disposable_engine.connect() as conn:
         current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -270,7 +304,8 @@ def test_concurrent_claims_with_different_identifiers_use_real_postgres_serializ
 ) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     for _ in range(10):
         with disposable_engine.begin() as conn:
@@ -316,7 +351,8 @@ def test_concurrent_claims_with_different_identifiers_use_real_postgres_serializ
 def test_claim_rejects_missing_identity_against_real_postgres(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     org_id, connection_id = _seed_connection(disposable_engine)
     with Session(disposable_engine) as session:
@@ -334,7 +370,8 @@ def test_claim_rejects_missing_identity_against_real_postgres(disposable_engine)
 def test_concurrent_claim_logs_contain_no_secret_material(disposable_engine, caplog) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    command.upgrade(cfg, "head")
+    with _alembic_environment(url):
+        command.upgrade(cfg, "head")
 
     org_id, connection_id = _seed_connection(disposable_engine)
     barrier = threading.Barrier(2)
