@@ -59,5 +59,16 @@ def skip_reason() -> str | None:
 
 
 def disposable_url() -> str:
-    """Only call after confirming `skip_reason() is None`."""
-    return os.environ["POSTGRES_DISPOSABLE_TEST_URL"].strip()
+    """Only call after confirming `skip_reason() is None`.
+
+    Returns the URL normalized to the psycopg3 driver this project actually
+    depends on (`psycopg[binary]`, not `psycopg2` — see
+    `app.persistence.database.sqlalchemy_database_url`, which every other
+    part of the application already routes through for exactly this
+    reason). A bare `postgresql://` scheme makes SQLAlchemy default to the
+    `psycopg2` DBAPI, which is not installed anywhere in this project.
+    """
+    from app.persistence.database import sqlalchemy_database_url
+
+    raw = os.environ["POSTGRES_DISPOSABLE_TEST_URL"].strip()
+    return sqlalchemy_database_url(raw)
