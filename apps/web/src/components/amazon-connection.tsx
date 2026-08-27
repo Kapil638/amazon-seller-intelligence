@@ -120,6 +120,21 @@ function attentionState(
       destructive: true,
     };
   }
+  if (status === "error" && lastErrorCode === "identity_missing") {
+    return {
+      label: "Reauthorization required",
+      description:
+        "Amazon seller identity is not available for this connection. Connect Amazon again to restore access.",
+      destructive: true,
+    };
+  }
+  if (status === "error" && lastErrorCode === "identity_conflict") {
+    return {
+      label: "Needs attention",
+      description: "Amazon seller identity could not be confirmed for this connection.",
+      destructive: true,
+    };
+  }
   if (status === "degraded") {
     return {
       label: "Needs attention",
@@ -201,6 +216,7 @@ function failureClassLabel(code: string | null): string {
       "A temporary internal error prevented saving marketplace data. This will retry on the next Test connection.",
     identity_missing: "Amazon did not return a seller identifier during this synchronization attempt.",
     malformed_participations: "Amazon returned marketplace data ASI could not parse.",
+    empty_snapshot: "Amazon returned no marketplace data to synchronize this time.",
   };
   if (code && known[code]) {
     return known[code];

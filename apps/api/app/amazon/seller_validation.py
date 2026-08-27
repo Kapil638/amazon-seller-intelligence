@@ -47,6 +47,7 @@ SECRET_ACCESS_MESSAGE = "Amazon seller credentials could not be retrieved."
 UNAVAILABLE_MESSAGE = "Amazon SP-API is temporarily unavailable."
 IDENTITY_UNAVAILABLE_MESSAGE = "Amazon seller marketplace participation was not found."
 IDENTITY_CONFLICT_MESSAGE = "Amazon seller identity could not be confirmed."
+IDENTITY_MISSING_MESSAGE = "Amazon seller identity is not available for this connection. Connect Amazon again to restore access."
 
 SellersClientFactory = Callable[..., AmazonSpApiSellersClient]
 
@@ -318,30 +319,24 @@ class AmazonSellerValidationService:
             for marketplace_id, country_code in participating_marketplaces(parsed.payload or [])
         ]
         participations = _normalize_participations(parsed.payload or [])
-        selling_partner_id = (parsed.selling_partner_id or "").strip() or None
-        if selling_partner_id and len(selling_partner_id) > 64:
-            selling_partner_id = None
-        existing_selling_partner_id = (connection.selling_partner_id or "").strip() or None
-        if (
-            selling_partner_id
-            and existing_selling_partner_id
-            and selling_partner_id != existing_selling_partner_id
-        ):
-            # Sellers API returned an identifier that disagrees with the one already
-            # on record for this connection (e.g. captured at OAuth callback). Do not
-            # silently overwrite either identity or move the connection to connected;
-            # preserve the last known-good state and stop automatic reconciliation.
+
+        # `getMarketplaceParticipations` does not define a `sellingPartnerId`
+        # field on its response — the official schema's `payload` is a plain
+        # `MarketplaceParticipationList`. The only authoritative seller
+        # identity is the one captured during the OAuth callback and already
+        # persisted on this connection row. Never infer identity from store
+        # name, marketplace id, domain, or token, and never expect Amazon to
+        # supply it again here.
+        stored_selling_partner_id = (connection.selling_partner_id or "").strip() or None
+        if not stored_selling_partner_id:
             logger.info(
-                "amazon seller validation rejected reason=identity_conflict connection_id=%s",
+                "amazon seller validation rejected reason=identity_missing connection_id=%s",
                 connection.id,
             )
-            return SellerValidationResult(
-                valid=False,
-                selling_partner_id=None,
-                marketplaces=marketplaces,
-                connection_status=connection.status,
-                reason="identity_conflict",
-                message=IDENTITY_CONFLICT_MESSAGE,
+            return self._failed(
+                connection_status="error",
+                reason="identity_missing",
+                message=IDENTITY_MISSING_MESSAGE,
             )
         if not marketplaces:
             logger.info(
@@ -361,7 +356,7 @@ class AmazonSellerValidationService:
         )
         return SellerValidationResult(
             valid=True,
-            selling_partner_id=selling_partner_id,
+            selling_partner_id=stored_selling_partner_id,
             marketplaces=marketplaces,
             participations=participations,
             connection_status="connected",

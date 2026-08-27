@@ -212,6 +212,21 @@ const degradedOverview: AmazonConnectionOverview = {
   last_error_code: "sp_api_unavailable",
 };
 
+// 12B.2B live-sync remediation: the stored, OAuth-captured identity was
+// absent (or a defensive equality check disagreed with it) — must render as
+// needing attention/reauthorization, never as a healthy connection.
+const identityMissingOverview: AmazonConnectionOverview = {
+  ...connectedOverview,
+  connection_status: "error",
+  last_error_code: "identity_missing",
+};
+
+const identityConflictOverview: AmazonConnectionOverview = {
+  ...connectedOverview,
+  connection_status: "error",
+  last_error_code: "identity_conflict",
+};
+
 // A response from before the 12B.2B deploy: the new fields are entirely
 // absent, not merely null/empty.
 const legacyOverview: AmazonConnectionOverview = {
@@ -724,6 +739,28 @@ describe("Amazon Connection page", () => {
       });
       expect(screen.getByText(/temporarily unavailable/)).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Test Connection" })).toBeInTheDocument();
+    });
+
+    it("renders Reauthorization required when the stored seller identity is missing", async () => {
+      vi.mocked(fetchAmazonConnection).mockResolvedValue(identityMissingOverview);
+      render(<AmazonConnection />);
+      await waitFor(() => {
+        expect(screen.getByText("Reauthorization required")).toBeInTheDocument();
+      });
+      expect(screen.getByText(/identity is not available for this connection/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Connect Amazon" })).toBeInTheDocument();
+      // A missing identity must never read as a healthy, synchronized connection.
+      expect(screen.queryByText(/participation synchronized successfully/)).not.toBeInTheDocument();
+    });
+
+    it("renders Needs attention for a stored-vs-result identity mismatch, without total-failure language", async () => {
+      vi.mocked(fetchAmazonConnection).mockResolvedValue(identityConflictOverview);
+      render(<AmazonConnection />);
+      await waitFor(() => {
+        expect(screen.getByText("Needs attention")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Amazon seller identity could not be confirmed for this connection.")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Error", level: 2 })).toBeInTheDocument();
     });
 
     it("renders safely when the backend response predates 12B.2B and omits the new fields", async () => {
