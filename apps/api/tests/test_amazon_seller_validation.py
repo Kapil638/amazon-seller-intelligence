@@ -200,6 +200,84 @@ async def test_successful_seller_validation_marks_connected(caplog) -> None:
 
 
 @pytest.mark.asyncio
+async def test_successful_validation_reconciles_canonical_seller_identity(caplog) -> None:
+    """12B.2B — a successful handshake now populates the canonical tables."""
+    from app.persistence.repositories import (
+        AmazonIngestionRunRepository,
+        AmazonMarketplaceParticipationRepository,
+        AmazonSellerAccountRepository,
+    )
+
+    service, provider = _service()
+    connection_id, _ = _seed_pending_validation(
+        provider=provider,
+        environment="PRODUCTION",
+        region="na",
+    )
+    with caplog.at_level("DEBUG"):
+        result = await service.validate_seller_connection(environment="PRODUCTION")
+    assert result.valid is True
+    assert result.participations[0].marketplace_id == "ATVPDKIKX0DER"
+    assert result.participations[0].is_participating is True
+    org_id = current_organization_id()
+    with session_scope() as session:
+        account = AmazonSellerAccountRepository(session).get_by_selling_partner_id(
+            org_id, SELLING_PARTNER_ID
+        )
+        assert account is not None
+        assert account.display_store_name == "BestSellerStore"
+        rows = AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
+            org_id, account.id
+        )
+        assert len(rows) == 1
+        assert rows[0].marketplace_id == "ATVPDKIKX0DER"
+        runs = AmazonIngestionRunRepository(session).list_for_connection(org_id, connection_id)
+        assert len(runs) == 1
+        assert runs[0].status == "succeeded"
+    _assert_no_secrets(result, caplog.text)
+
+
+@pytest.mark.asyncio
+async def test_ownership_conflict_fails_closed_and_does_not_reveal_owner() -> None:
+    """12B.2B — a globally-owned selling_partner_id must not report connected."""
+    from uuid import uuid4
+
+    from app.persistence.models import Organization
+    from app.persistence.repositories import AmazonSellerAccountRepository
+
+    other_org = uuid4()
+    with session_scope() as session:
+        session.add(Organization(id=other_org, name="Other"))
+        AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=other_org, selling_partner_id=SELLING_PARTNER_ID
+        )
+    service, provider = _service()
+    connection_id, reference = _seed_pending_validation(
+        provider=provider,
+        environment="PRODUCTION",
+        region="na",
+    )
+    result = await service.validate_seller_connection(environment="PRODUCTION")
+    assert result.valid is False
+    assert result.reason == "ownership_conflict"
+    assert result.connection_status == "error"
+    assert result.selling_partner_id is None
+    assert str(other_org) not in str(result)
+    with session_scope() as session:
+        stored = AmazonConnectionRepository(session).get_by_id(
+            current_organization_id(), connection_id
+        )
+        assert stored is not None
+        assert stored.status == "error"
+        assert stored.status != "connected"
+        assert stored.last_error_code == "ownership_conflict"
+        assert str(other_org) not in str(stored.selling_partner_id)
+        # The grant itself was genuinely validated by Amazon; the secret is
+        # not revoked just because canonical reconciliation was rejected.
+        assert stored.token_reference == reference
+
+
+@pytest.mark.asyncio
 async def test_identity_conflict_between_callback_and_validation_is_not_reconciled() -> None:
     service, provider = _service()
     connection_id, reference = _seed_pending_validation(provider=provider)

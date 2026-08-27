@@ -1428,6 +1428,27 @@ export type AmazonAdsConnectionPlaceholder = {
   status: "NOT_CONNECTED";
 };
 
+export type AmazonSellerMarketplace = {
+  marketplace_id: string;
+  name: string | null;
+  country_code: string | null;
+  domain_name: string | null;
+  is_participating: boolean;
+  has_suspended_listings: boolean;
+  is_active: boolean;
+  last_seen_at: string;
+};
+
+export type AmazonIngestionRunStatus = "started" | "succeeded" | "partial" | "failed" | "timed_out";
+
+export type AmazonIngestionStatus = {
+  status: AmazonIngestionRunStatus;
+  started_at: string;
+  completed_at: string | null;
+  records_accepted: number;
+  failure_class: string | null;
+};
+
 export type AmazonConnectionOverview = {
   status: AmazonConnectionStatus;
   connection_status: AmazonConnectionLifecycleStatus;
@@ -1445,6 +1466,12 @@ export type AmazonConnectionOverview = {
   last_error_code: string | null;
   last_test_at: string | null;
   organization_id: string;
+  // 12B.2B additions. Optional: a response from before this deploy will not
+  // include them, and the UI must render safely without them.
+  seller_account_id?: string | null;
+  seller_account_display_name?: string | null;
+  marketplaces?: AmazonSellerMarketplace[];
+  latest_ingestion?: AmazonIngestionStatus | null;
   ads_api: AmazonAdsConnectionPlaceholder;
 };
 

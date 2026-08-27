@@ -1340,14 +1340,39 @@ class AmazonSellerAccountRepository:
             selling_partner_id=spid,
             display_store_name=display_store_name,
         )
-        self.session.add(row)
         try:
-            self.session.flush()
+            # A SAVEPOINT (`begin_nested()`), not a full `session.rollback()`.
+            # On PostgreSQL, an uncaught error inside a transaction leaves
+            # the *whole* transaction aborted — no further statement can run
+            # on it until a rollback. A savepoint isolates that failure to
+            # just this attempted INSERT: on IntegrityError, SQLAlchemy
+            # issues `ROLLBACK TO SAVEPOINT`, undoing only this insert and
+            # leaving the outer transaction (and anything the caller already
+            # did on this same session before calling this method) fully
+            # intact and usable for the re-read and reconciliation below.
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
         except IntegrityError as exc:
-            self.session.rollback()
-            raise SellerAccountOwnershipConflict(
-                "This Amazon seller account is already connected to another organization."
-            ) from exc
+            # The unique-constraint loser here could be this same
+            # organization's own concurrent reconciliation attempt racing
+            # itself (benign — the two initial SELECTs above both saw no
+            # row yet), not necessarily a different organization. Re-read
+            # the now-committed winner and classify by its actual owner
+            # rather than assuming every insert failure is a genuine
+            # cross-organization conflict.
+            winner = self.session.scalars(
+                select(AmazonSellerAccount).where(AmazonSellerAccount.selling_partner_id == spid)
+            ).first()
+            if winner is None or winner.organization_id != organization_id:
+                raise SellerAccountOwnershipConflict(
+                    "This Amazon seller account is already connected to another organization."
+                ) from exc
+            if display_store_name:
+                winner.display_store_name = display_store_name
+            winner.last_seen_at = datetime.now(UTC)
+            self.session.flush()
+            return winner
         return row
 
     def get_by_id(self, organization_id: UUID, seller_account_id: UUID) -> AmazonSellerAccount | None:
@@ -1355,6 +1380,19 @@ class AmazonSellerAccountRepository:
             select(AmazonSellerAccount).where(
                 AmazonSellerAccount.organization_id == organization_id,
                 AmazonSellerAccount.id == seller_account_id,
+            )
+        ).first()
+
+    def get_by_selling_partner_id(
+        self, organization_id: UUID, selling_partner_id: str
+    ) -> AmazonSellerAccount | None:
+        spid = (selling_partner_id or "").strip()
+        if not spid:
+            return None
+        return self.session.scalars(
+            select(AmazonSellerAccount).where(
+                AmazonSellerAccount.organization_id == organization_id,
+                AmazonSellerAccount.selling_partner_id == spid,
             )
         ).first()
 
@@ -1443,8 +1481,43 @@ class AmazonMarketplaceParticipationRepository:
             store_name=store_name,
             is_active=True,
         )
-        self.session.add(row)
-        self.session.flush()
+        try:
+            # SAVEPOINT, not a full rollback — see AmazonSellerAccountRepository
+            # .create_or_reconcile for why: isolates a failed INSERT without
+            # aborting the outer transaction this method's caller (the
+            # reconciliation service, upserting many participations in one
+            # transaction) is still in the middle of.
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            # Same principle as the seller-account race: the loser of this
+            # unique-constraint race (seller_account_id, marketplace_id) is
+            # necessarily this same seller account's own concurrent
+            # reconciliation attempt — participations are never shared
+            # across organizations — so reconcile into the winner instead
+            # of surfacing a spurious failure.
+            winner = self.session.scalars(
+                select(AmazonMarketplaceParticipation).where(
+                    AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+                    AmazonMarketplaceParticipation.marketplace_id == marketplace_id,
+                )
+            ).one()
+            winner.name = name or winner.name
+            winner.country_code = country_code or winner.country_code
+            winner.default_currency_code = default_currency_code or winner.default_currency_code
+            winner.default_language_code = default_language_code or winner.default_language_code
+            winner.domain_name = domain_name or winner.domain_name
+            winner.store_name = store_name or winner.store_name
+            winner.region = region
+            winner.is_participating = is_participating
+            winner.has_suspended_listings = has_suspended_listings
+            winner.is_active = True
+            winner.last_seen_at = now
+            if connection_id is not None:
+                winner.connection_id = connection_id
+            self.session.flush()
+            return winner
         return row
 
     def list_for_seller_account(
@@ -1459,6 +1532,40 @@ class AmazonMarketplaceParticipationRepository:
             .order_by(AmazonMarketplaceParticipation.marketplace_id.asc())
         )
         return list(self.session.scalars(statement).all())
+
+    def deactivate_missing(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        seen_marketplace_ids: set[str],
+    ) -> int:
+        """Mark rows absent from the latest complete snapshot as inactive.
+
+        Only call this after a successful, complete reconciliation pass for
+        this seller account — never after a malformed, partial, or failed
+        response, since absence there is not evidence the seller actually
+        left that marketplace. `is_active` tracks presence in the most
+        recent complete snapshot; it is independent of Amazon's own
+        `is_participating` flag, which is preserved as-is on every row.
+        """
+        rows = self.session.scalars(
+            select(AmazonMarketplaceParticipation).where(
+                AmazonMarketplaceParticipation.organization_id == organization_id,
+                AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+                AmazonMarketplaceParticipation.is_active.is_(True),
+            )
+        ).all()
+        now = datetime.now(UTC)
+        deactivated = 0
+        for row in rows:
+            if row.marketplace_id not in seen_marketplace_ids:
+                row.is_active = False
+                row.last_seen_at = now
+                deactivated += 1
+        if deactivated:
+            self.session.flush()
+        return deactivated
 
 
 class AmazonIngestionRunRepository:
@@ -1484,14 +1591,20 @@ class AmazonIngestionRunRepository:
         request_correlation_id: str | None = None,
     ) -> AmazonIngestionRun:
         if seller_account_id is not None:
-            seller_account = self.session.get(AmazonSellerAccount, seller_account_id)
-            if seller_account is None or seller_account.organization_id != organization_id:
+            # Org-scoped lookup, not a Python-level equality against a
+            # separately-loaded row: the WHERE clause enforces ownership in
+            # SQL itself, so this can never be defeated by a stale identity-
+            # map entry or by comparing values of differing representations.
+            seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+                organization_id, seller_account_id
+            )
+            if seller_account is None:
                 raise TypeError(
                     "Amazon ingestion run cannot bind a seller account from another organization."
                 )
         if connection_id is not None:
-            connection = self.session.get(AmazonConnection, connection_id)
-            if connection is None or connection.organization_id != organization_id:
+            connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+            if connection is None:
                 raise TypeError("Amazon ingestion run cannot bind a connection from another organization.")
         row = AmazonIngestionRun(
             organization_id=organization_id,
@@ -1549,6 +1662,19 @@ class AmazonIngestionRunRepository:
             select(AmazonIngestionRun)
             .where(AmazonIngestionRun.organization_id == organization_id)
             .order_by(AmazonIngestionRun.started_at.asc(), AmazonIngestionRun.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def list_for_connection(
+        self, organization_id: UUID, connection_id: UUID
+    ) -> list[AmazonIngestionRun]:
+        statement: Select[tuple[AmazonIngestionRun]] = (
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.connection_id == connection_id,
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
         )
         return list(self.session.scalars(statement).all())
 

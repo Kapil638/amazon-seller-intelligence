@@ -206,6 +206,121 @@ def test_get_cannot_read_other_organization_connection(client) -> None:
     _assert_public(body)
 
 
+def test_connection_overview_exposes_canonical_marketplaces_after_test(client) -> None:
+    """12B.2B — GET /connection surfaces reconciled seller identity, additively."""
+    import json
+    from pathlib import Path
+
+    import httpx
+    from pydantic import SecretStr
+
+    from app.amazon.secrets import DevelopmentSecretProvider, build_asi_secret_reference
+    from app.amazon.seller_validation import AmazonSellerValidationService
+    from app.amazon.sellers import MARKETPLACE_PARTICIPATIONS_PATH
+
+    fixtures = Path(__file__).parent / "fixtures" / "sp_api"
+    payload = json.loads((fixtures / "get_marketplace_participations.sandbox.json").read_text())
+    payload["sellingPartnerId"] = "A3FHEXAMPLEYWS"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.amazon.com":
+            return httpx.Response(200, json={"access_token": "Atza|x", "token_type": "bearer", "expires_in": 3600})
+        assert request.url.path == MARKETPLACE_PARTICIPATIONS_PATH
+        return httpx.Response(200, json=payload)
+
+    settings = Settings(
+        sp_api_lwa_client_id=SecretStr("amzn1.application-oa2-client.test"),
+        sp_api_lwa_client_secret=SecretStr("test-lwa-client-secret-value"),
+        sp_api_lwa_token_url="https://api.amazon.com/auth/o2/token",
+        sp_api_application_name="EWise",
+        default_marketplace="amazon.in",
+        sp_api_region="na",
+        cors_origins=["http://localhost:3000"],
+    )
+    provider = DevelopmentSecretProvider()
+    service = AmazonConnectionService(
+        settings=settings,
+        secret_provider=provider,
+        seller_validator=AmazonSellerValidationService(
+            settings=settings,
+            secret_provider=provider,
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    with session_scope() as session:
+        row = AmazonConnectionRepository(session).create(
+            organization_id=current_organization_id(),
+            provider="SP_API",
+            environment="PRODUCTION",
+            region="na",
+            status="pending_validation",
+        )
+        reference = build_asi_secret_reference(
+            provider="SP_API",
+            environment="PRODUCTION",
+            organization_id=current_organization_id(),
+            connection_id=row.id,
+        )
+        AmazonConnectionRepository(session).bind_token_reference(current_organization_id(), row.id, reference)
+    provider.put_secret(reference, SecretStr("Atzr|test-refresh-token"))
+
+    app.dependency_overrides[get_amazon_connection_service] = lambda: service
+    try:
+        tested = client.post(TEST_URL, json={})
+        overview = client.get(CONNECTION_URL)
+    finally:
+        app.dependency_overrides.pop(get_amazon_connection_service, None)
+
+    assert tested.status_code == 200
+    assert tested.json()["status"] == "CONNECTED"
+    body = overview.json()
+    assert body["connection_status"] == "connected"
+    assert body["seller_account_id"] is not None
+    assert body["seller_account_display_name"] == "BestSellerStore"
+    assert body["marketplaces"][0]["marketplace_id"] == "ATVPDKIKX0DER"
+    assert body["marketplaces"][0]["is_participating"] is True
+    assert body["latest_ingestion"]["status"] == "succeeded"
+    _assert_public(body)
+
+
+def test_connection_overview_degrades_when_seller_identity_tables_are_missing(client) -> None:
+    """12B.2B regression — a pre-0009 database (e.g. the configured Supabase
+    instance, which is deliberately kept on 0008) must not crash GET /connection.
+    The 12B.2A canonical tables are dropped here to reproduce that exact schema.
+    """
+    from sqlalchemy import text
+
+    from app.persistence.database import get_engine
+    from app.persistence.models import Base
+
+    with session_scope() as session:
+        AmazonConnectionRepository(session).create(
+            organization_id=current_organization_id(),
+            provider="SP_API",
+            environment="PRODUCTION",
+            region="na",
+            status="connected",
+            selling_partner_id="A1SELLERID",
+        )
+    engine = get_engine()
+    assert engine is not None
+    for table_name in ("amazon_marketplace_participations", "amazon_ingestion_runs", "amazon_seller_accounts"):
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+    try:
+        response = client.get(CONNECTION_URL)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["connection_status"] == "connected"
+        assert body["selling_partner_id"] == "A1SELLERID"
+        assert body["seller_account_id"] is None
+        assert body["marketplaces"] == []
+        assert body["latest_ingestion"] is None
+        _assert_public(body)
+    finally:
+        Base.metadata.create_all(engine)
+
+
 def test_secret_fields_cannot_be_returned(client) -> None:
     with session_scope() as session:
         session.add(

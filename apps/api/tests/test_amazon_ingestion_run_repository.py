@@ -114,6 +114,51 @@ def test_partial_failure_can_be_represented() -> None:
         assert updated.pagination_complete is False
 
 
+def test_list_for_connection_is_scoped_and_ordered_latest_first() -> None:
+    from datetime import UTC, datetime
+
+    from app.persistence.repositories import AmazonConnectionRepository
+
+    org_id = current_organization_id()
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).create(
+            organization_id=org_id, provider="SP_API", environment="PRODUCTION", region="na"
+        )
+        other_connection = AmazonConnectionRepository(session).create(
+            organization_id=org_id, provider="SP_API", environment="SANDBOX", region="na"
+        )
+        connection_id = connection.id
+        other_connection_id = other_connection.id
+    with session_scope() as session:
+        repo = AmazonIngestionRunRepository(session)
+        first = repo.start(
+            organization_id=org_id, domain="d", region="na", environment="PRODUCTION",
+            connection_id=connection_id,
+        )
+        first_id = first.id
+        # `started_at` is a database-generated timestamp with only
+        # second-level resolution on SQLite; two rows created back-to-back
+        # inside one test can legitimately tie. Backdate this one explicitly
+        # so the assertion below is deterministic rather than depending on
+        # the (intentionally unordered, UUID-based) id tie-break that
+        # `list_for_connection` falls back on for genuine ties.
+        first.started_at = datetime(2020, 1, 1, tzinfo=UTC)
+    with session_scope() as session:
+        repo = AmazonIngestionRunRepository(session)
+        second = repo.start(
+            organization_id=org_id, domain="d", region="na", environment="PRODUCTION",
+            connection_id=connection_id,
+        )
+        second_id = second.id
+        repo.start(
+            organization_id=org_id, domain="d", region="na", environment="SANDBOX",
+            connection_id=other_connection_id,
+        )
+    with session_scope() as session:
+        runs = AmazonIngestionRunRepository(session).list_for_connection(org_id, connection_id)
+        assert [run.id for run in runs] == [second_id, first_id]
+
+
 def test_organization_a_cannot_retrieve_organization_b_ingestion_run() -> None:
     org_a = current_organization_id()
     org_b = uuid4()

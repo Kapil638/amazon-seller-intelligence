@@ -51,6 +51,43 @@ IDENTITY_CONFLICT_MESSAGE = "Amazon seller identity could not be confirmed."
 SellersClientFactory = Callable[..., AmazonSpApiSellersClient]
 
 
+def _normalize_participations(
+    payload: list,
+) -> list[NormalizedMarketplaceParticipation]:
+    """Build the typed, normalized collection for reconciliation.
+
+    Preserves every entry Amazon returned, including non-participating and
+    suspended marketplaces — `participating_marketplaces()` filters those
+    out for the (unrelated) connection-status gate, but 12B.2B reconciliation
+    must not silently drop them. Entries with a blank marketplace id after
+    stripping are malformed and are skipped; only a count is logged, never
+    the payload itself.
+    """
+    normalized: list[NormalizedMarketplaceParticipation] = []
+    skipped = 0
+    for item in payload:
+        marketplace_id = (item.marketplace.id or "").strip()
+        if not marketplace_id:
+            skipped += 1
+            continue
+        normalized.append(
+            NormalizedMarketplaceParticipation(
+                marketplace_id=marketplace_id,
+                name=(item.marketplace.name or "").strip() or None,
+                country_code=(item.marketplace.country_code or "").strip() or None,
+                default_currency_code=(item.marketplace.default_currency_code or "").strip() or None,
+                default_language_code=(item.marketplace.default_language_code or "").strip() or None,
+                domain_name=(item.marketplace.domain_name or "").strip() or None,
+                store_name=(item.store_name or "").strip() or None,
+                is_participating=item.participation.is_participating,
+                has_suspended_listings=item.participation.has_suspended_listings,
+            )
+        )
+    if skipped:
+        logger.info("amazon seller validation skipped malformed participations count=%s", skipped)
+    return normalized
+
+
 class SellerValidationTarget(Protocol):
     organization_id: UUID
     id: UUID
@@ -71,6 +108,28 @@ class SellerMarketplace(BaseModel):
     country_code: str
 
 
+class NormalizedMarketplaceParticipation(BaseModel):
+    """Typed, normalized participation for 12B.2B reconciliation.
+
+    Built field-by-field from the parsed Sellers response — never a raw
+    Amazon payload passthrough. Includes non-participating and suspended
+    entries, unlike `SellerMarketplace`/`participating_marketplaces()`,
+    which exist only to gate connection-status and stay unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    marketplace_id: str
+    name: str | None = None
+    country_code: str | None = None
+    default_currency_code: str | None = None
+    default_language_code: str | None = None
+    domain_name: str | None = None
+    store_name: str | None = None
+    is_participating: bool
+    has_suspended_listings: bool
+
+
 class SellerValidationResult(BaseModel):
     """Handshake result. Never includes tokens, credentials, or Amazon payloads."""
 
@@ -79,6 +138,7 @@ class SellerValidationResult(BaseModel):
     valid: bool
     selling_partner_id: str | None = None
     marketplaces: list[SellerMarketplace] = Field(default_factory=list)
+    participations: list[NormalizedMarketplaceParticipation] = Field(default_factory=list)
     connection_status: str
     reason: str
     operation: str = GET_MARKETPLACE_PARTICIPATIONS
@@ -257,6 +317,7 @@ class AmazonSellerValidationService:
             SellerMarketplace(marketplace_id=marketplace_id, country_code=country_code)
             for marketplace_id, country_code in participating_marketplaces(parsed.payload or [])
         ]
+        participations = _normalize_participations(parsed.payload or [])
         selling_partner_id = (parsed.selling_partner_id or "").strip() or None
         if selling_partner_id and len(selling_partner_id) > 64:
             selling_partner_id = None
@@ -302,6 +363,7 @@ class AmazonSellerValidationService:
             valid=True,
             selling_partner_id=selling_partner_id,
             marketplaces=marketplaces,
+            participations=participations,
             connection_status="connected",
             reason="validated",
         )
