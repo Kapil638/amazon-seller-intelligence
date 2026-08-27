@@ -117,6 +117,59 @@ def test_cross_organization_seller_account_binding_is_rejected() -> None:
             )
 
 
+def test_deactivate_missing_marks_absent_rows_inactive_and_preserves_them() -> None:
+    org_id = current_organization_id()
+    with session_scope() as session:
+        seller_account = AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=org_id, selling_partner_id="A1SELLERID"
+        )
+        repo = AmazonMarketplaceParticipationRepository(session)
+        repo.create_or_reconcile(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            marketplace_id="ATVPDKIKX0DER",
+            region="na",
+        )
+        repo.create_or_reconcile(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            marketplace_id="A2EUQ1WTGCTBG2",
+            region="na",
+        )
+        deactivated = repo.deactivate_missing(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            seen_marketplace_ids={"ATVPDKIKX0DER"},
+        )
+        assert deactivated == 1
+        rows = {row.marketplace_id: row for row in repo.list_for_seller_account(org_id, seller_account.id)}
+        assert rows["ATVPDKIKX0DER"].is_active is True
+        assert rows["A2EUQ1WTGCTBG2"].is_active is False
+        # Deactivation never deletes the row — the marketplace history remains queryable.
+        assert len(rows) == 2
+
+
+def test_deactivate_missing_is_a_no_op_when_nothing_is_absent() -> None:
+    org_id = current_organization_id()
+    with session_scope() as session:
+        seller_account = AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=org_id, selling_partner_id="A1SELLERID"
+        )
+        repo = AmazonMarketplaceParticipationRepository(session)
+        repo.create_or_reconcile(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            marketplace_id="ATVPDKIKX0DER",
+            region="na",
+        )
+        deactivated = repo.deactivate_missing(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            seen_marketplace_ids={"ATVPDKIKX0DER"},
+        )
+        assert deactivated == 0
+
+
 def test_display_domain_is_not_used_as_identity() -> None:
     org_id = current_organization_id()
     with session_scope() as session:

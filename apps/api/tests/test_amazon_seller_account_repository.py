@@ -93,6 +93,24 @@ def test_organization_a_cannot_retrieve_organization_b_seller_account() -> None:
         assert repo.list_for_org(org_a) == []
 
 
+def test_get_by_selling_partner_id_is_organization_scoped() -> None:
+    org_a = current_organization_id()
+    org_b = uuid4()
+    with session_scope() as session:
+        session.add(Organization(id=org_b, name="Other"))
+        AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=org_a, selling_partner_id="A1SELLERID"
+        )
+    with session_scope() as session:
+        repo = AmazonSellerAccountRepository(session)
+        found = repo.get_by_selling_partner_id(org_a, "A1SELLERID")
+        assert found is not None
+        assert found.selling_partner_id == "A1SELLERID"
+        assert repo.get_by_selling_partner_id(org_b, "A1SELLERID") is None
+        assert repo.get_by_selling_partner_id(org_a, "") is None
+        assert repo.get_by_selling_partner_id(org_a, "UNKNOWNID") is None
+
+
 def test_seller_account_requires_non_empty_identifier() -> None:
     org_id = current_organization_id()
     with session_scope() as session:

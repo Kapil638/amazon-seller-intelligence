@@ -1358,6 +1358,19 @@ class AmazonSellerAccountRepository:
             )
         ).first()
 
+    def get_by_selling_partner_id(
+        self, organization_id: UUID, selling_partner_id: str
+    ) -> AmazonSellerAccount | None:
+        spid = (selling_partner_id or "").strip()
+        if not spid:
+            return None
+        return self.session.scalars(
+            select(AmazonSellerAccount).where(
+                AmazonSellerAccount.organization_id == organization_id,
+                AmazonSellerAccount.selling_partner_id == spid,
+            )
+        ).first()
+
     def list_for_org(self, organization_id: UUID) -> list[AmazonSellerAccount]:
         statement: Select[tuple[AmazonSellerAccount]] = (
             select(AmazonSellerAccount)
@@ -1460,6 +1473,40 @@ class AmazonMarketplaceParticipationRepository:
         )
         return list(self.session.scalars(statement).all())
 
+    def deactivate_missing(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        seen_marketplace_ids: set[str],
+    ) -> int:
+        """Mark rows absent from the latest complete snapshot as inactive.
+
+        Only call this after a successful, complete reconciliation pass for
+        this seller account — never after a malformed, partial, or failed
+        response, since absence there is not evidence the seller actually
+        left that marketplace. `is_active` tracks presence in the most
+        recent complete snapshot; it is independent of Amazon's own
+        `is_participating` flag, which is preserved as-is on every row.
+        """
+        rows = self.session.scalars(
+            select(AmazonMarketplaceParticipation).where(
+                AmazonMarketplaceParticipation.organization_id == organization_id,
+                AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+                AmazonMarketplaceParticipation.is_active.is_(True),
+            )
+        ).all()
+        now = datetime.now(UTC)
+        deactivated = 0
+        for row in rows:
+            if row.marketplace_id not in seen_marketplace_ids:
+                row.is_active = False
+                row.last_seen_at = now
+                deactivated += 1
+        if deactivated:
+            self.session.flush()
+        return deactivated
+
 
 class AmazonIngestionRunRepository:
     """Org- and seller-account-scoped ingestion-run lifecycle records.
@@ -1549,6 +1596,19 @@ class AmazonIngestionRunRepository:
             select(AmazonIngestionRun)
             .where(AmazonIngestionRun.organization_id == organization_id)
             .order_by(AmazonIngestionRun.started_at.asc(), AmazonIngestionRun.id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def list_for_connection(
+        self, organization_id: UUID, connection_id: UUID
+    ) -> list[AmazonIngestionRun]:
+        statement: Select[tuple[AmazonIngestionRun]] = (
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.connection_id == connection_id,
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
         )
         return list(self.session.scalars(statement).all())
 

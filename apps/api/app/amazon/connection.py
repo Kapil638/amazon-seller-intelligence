@@ -10,11 +10,16 @@ from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.orm import Session
 
 from app.amazon.ads_api import ADS_API_PROVIDER, ADS_API_STATUS
 from app.amazon.lwa import MISSING_CREDENTIALS_MESSAGE, credentials_configured
 from app.amazon.lwa_token import AmazonLwaTokenService
+from app.amazon.marketplace_reconciliation import (
+    AmazonMarketplaceReconciliationService,
+    ReconciliationOutcome,
+)
 from app.amazon.models import LwaAuthorizationGrant, MarketplaceParticipationsSandboxResult
 from app.amazon.oauth import (
     build_seller_central_consent_url,
@@ -39,7 +44,11 @@ from app.amazon.secrets import (
     build_asi_secret_reference,
     get_secret_provider,
 )
-from app.amazon.seller_validation import AmazonSellerValidationService, SellerValidationResult
+from app.amazon.seller_validation import (
+    IDENTITY_CONFLICT_MESSAGE,
+    AmazonSellerValidationService,
+    SellerValidationResult,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     PersistenceError,
@@ -52,7 +61,13 @@ from app.core.exceptions import (
 )
 from app.persistence.database import current_organization_id, persistence_enabled, session_scope
 from app.persistence.models import AmazonConnection
-from app.persistence.repositories import AmazonConnectionRepository, AmazonOAuthStateRepository
+from app.persistence.repositories import (
+    AmazonConnectionRepository,
+    AmazonIngestionRunRepository,
+    AmazonMarketplaceParticipationRepository,
+    AmazonOAuthStateRepository,
+    AmazonSellerAccountRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +154,33 @@ class AdsApiConnectionPlaceholder(BaseModel):
     status: Literal["NOT_CONNECTED"] = "NOT_CONNECTED"
 
 
+class SellerMarketplaceRead(BaseModel):
+    """Canonical marketplace-participation read row. UI display only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    marketplace_id: str
+    name: str | None = None
+    country_code: str | None = None
+    domain_name: str | None = None
+    is_participating: bool
+    has_suspended_listings: bool
+    is_active: bool
+    last_seen_at: datetime
+
+
+class AmazonIngestionStatusRead(BaseModel):
+    """Latest ingestion-run lifecycle summary. No payloads, no secrets."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    records_accepted: int
+    failure_class: str | None = None
+
+
 class AmazonConnectionOverview(BaseModel):
     """Sanitized connection view. Never includes tokens, secrets, or token_reference."""
 
@@ -160,6 +202,10 @@ class AmazonConnectionOverview(BaseModel):
     last_error_code: str | None = None
     last_test_at: datetime | None = None
     organization_id: str
+    seller_account_id: str | None = None
+    seller_account_display_name: str | None = None
+    marketplaces: list[SellerMarketplaceRead] = Field(default_factory=list)
+    latest_ingestion: AmazonIngestionStatusRead | None = None
     ads_api: AdsApiConnectionPlaceholder = Field(default_factory=AdsApiConnectionPlaceholder)
 
 
@@ -206,6 +252,7 @@ class AmazonConnectionService:
         lwa_token_service: LwaAuthorizationCodeExchanger | None = None,
         seller_validator: AmazonSellerValidationService | None = None,
         sp_api_transport: Any | None = None,
+        reconciliation_service: AmazonMarketplaceReconciliationService | None = None,
     ) -> None:
         self._settings = settings
         self._sandbox_client_factory = sandbox_client_factory
@@ -213,6 +260,7 @@ class AmazonConnectionService:
         self._lwa_token_service = lwa_token_service
         self._seller_validator = seller_validator
         self._sp_api_transport = sp_api_transport
+        self._reconciliation_service = reconciliation_service
 
     def _cfg(self) -> Settings:
         return self._settings or get_settings()
@@ -257,7 +305,69 @@ class AmazonConnectionService:
             ads_api=AdsApiConnectionPlaceholder(provider=ADS_API_PROVIDER, status=ADS_API_STATUS),
         )
 
-    def _from_row(self, row: AmazonConnection, cfg: Settings) -> AmazonConnectionOverview:
+    def _seller_account_read_state(
+        self, session: Session, row: AmazonConnection
+    ) -> tuple[str | None, str | None, list[SellerMarketplaceRead]]:
+        spid = (row.selling_partner_id or "").strip()
+        if not spid:
+            return None, None, []
+        try:
+            account = AmazonSellerAccountRepository(session).get_by_selling_partner_id(
+                row.organization_id, spid
+            )
+            if account is None:
+                return None, None, []
+            marketplaces = [
+                SellerMarketplaceRead(
+                    marketplace_id=participation.marketplace_id,
+                    name=participation.name,
+                    country_code=participation.country_code,
+                    domain_name=participation.domain_name,
+                    is_participating=participation.is_participating,
+                    has_suspended_listings=participation.has_suspended_listings,
+                    is_active=participation.is_active,
+                    last_seen_at=participation.last_seen_at,
+                )
+                for participation in AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
+                    row.organization_id, account.id
+                )
+            ]
+            return str(account.id), account.display_store_name, marketplaces
+        except (ProgrammingError, OperationalError):
+            # 12B.2A's canonical seller-identity tables (migration 0009) are not
+            # guaranteed to exist on every database this overview is read
+            # against — the configured Supabase database is deliberately kept
+            # on 0008 until that migration is separately authorized. Degrade to
+            # "no canonical data" rather than failing the whole overview.
+            session.rollback()
+            logger.warning(
+                "amazon connection overview seller-identity tables unavailable (pre-0009 schema)"
+            )
+            return None, None, []
+
+    def _latest_ingestion_read_state(
+        self, session: Session, row: AmazonConnection
+    ) -> AmazonIngestionStatusRead | None:
+        try:
+            runs = AmazonIngestionRunRepository(session).list_for_connection(row.organization_id, row.id)
+        except (ProgrammingError, OperationalError):
+            session.rollback()
+            logger.warning(
+                "amazon connection overview ingestion-run table unavailable (pre-0009 schema)"
+            )
+            return None
+        if not runs:
+            return None
+        latest = runs[0]
+        return AmazonIngestionStatusRead(
+            status=latest.status,
+            started_at=latest.started_at,
+            completed_at=latest.completed_at,
+            records_accepted=latest.records_accepted,
+            failure_class=latest.failure_class,
+        )
+
+    def _from_row(self, row: AmazonConnection, cfg: Settings, session: Session) -> AmazonConnectionOverview:
         environment: ConnectionEnvironment = "PRODUCTION" if row.environment == "PRODUCTION" else "SANDBOX"
         lifecycle: ConnectionLifecycleStatus
         if row.status in (
@@ -277,6 +387,10 @@ class AmazonConnectionService:
             row.id,
             row.status,
         )
+        seller_account_id, seller_account_display_name, marketplaces = self._seller_account_read_state(
+            session, row
+        )
+        latest_ingestion = self._latest_ingestion_read_state(session, row)
         return AmazonConnectionOverview(
             status="NOT_CONNECTED",
             connection_status=lifecycle,
@@ -294,6 +408,10 @@ class AmazonConnectionService:
             last_error_code=row.last_error_code,
             last_test_at=row.last_successful_validation_at,
             organization_id=str(row.organization_id),
+            seller_account_id=seller_account_id,
+            seller_account_display_name=seller_account_display_name,
+            marketplaces=marketplaces,
+            latest_ingestion=latest_ingestion,
             ads_api=AdsApiConnectionPlaceholder(provider=ADS_API_PROVIDER, status=ADS_API_STATUS),
         )
 
@@ -312,10 +430,10 @@ class AmazonConnectionService:
                 row = repo.get(self._org_id(), provider=provider, environment=environment)
                 if row is None:
                     return self._env_overview(cfg)
-                return self._from_row(row, cfg)
+                return self._from_row(row, cfg, session)
             production = repo.get(self._org_id(), provider=provider, environment="PRODUCTION")
             if production is not None:
-                return self._from_row(production, cfg)
+                return self._from_row(production, cfg, session)
             # Connect Amazon is PRODUCTION. Do not surface leftover SANDBOX
             # Test Connection rows on the seller-authorization card.
             return self._env_overview(cfg)
@@ -345,7 +463,7 @@ class AmazonConnectionService:
                     application_id=application_id,
                 )
                 logger.info("amazon connection created id=%s status=%s", row.id, row.status)
-                return self._from_row(row, cfg)
+                return self._from_row(row, cfg, session)
         except IntegrityError as exc:
             raise PersistenceError(
                 "An Amazon connection already exists for this organization, provider, and environment."
@@ -362,7 +480,7 @@ class AmazonConnectionService:
                 if row is None:
                     raise PersistenceError("Amazon connection was not found.")
                 logger.info("amazon connection updated id=%s status=%s", row.id, row.status)
-                return self._from_row(row, cfg)
+                return self._from_row(row, cfg, session)
         except TypeError as exc:
             raise PersistenceError("Invalid Amazon connection update.") from exc
 
@@ -989,6 +1107,11 @@ class AmazonConnectionService:
             transport=self._sp_api_transport,
         )
 
+    def _reconciler(self) -> AmazonMarketplaceReconciliationService:
+        if self._reconciliation_service is not None:
+            return self._reconciliation_service
+        return AmazonMarketplaceReconciliationService()
+
     def _seller_handshake_snapshot(
         self,
         *,
@@ -1022,7 +1145,15 @@ class AmazonConnectionService:
         self,
         snapshot: _SellerConnectionSnapshot,
         result: SellerValidationResult,
-    ) -> None:
+    ) -> bool:
+        """Persist the handshake outcome and reconcile canonical identity rows.
+
+        Returns `True` if a seller-identity ownership conflict was detected
+        during reconciliation. That case must fail closed: the connection is
+        written as `error`, never `connected`, and the owning organization
+        is never disclosed (the reconciliation layer never returns it, and
+        this method never receives or logs it).
+        """
         now = datetime.now(UTC)
         if result.revoke_secret and snapshot.token_reference:
             try:
@@ -1032,20 +1163,39 @@ class AmazonConnectionService:
                     "amazon seller validation secret cleanup failed connection_id=%s",
                     snapshot.id,
                 )
+
+        reconciliation: ReconciliationOutcome | None = None
+        if result.valid and result.selling_partner_id:
+            reconciliation = self._reconciler().reconcile(
+                organization_id=snapshot.organization_id,
+                connection_id=snapshot.id,
+                region=snapshot.region,
+                environment=snapshot.environment,
+                selling_partner_id=result.selling_partner_id,
+                participations=result.participations,
+            )
+        ownership_conflict = reconciliation is not None and reconciliation.reason == "ownership_conflict"
+        effective_valid = result.valid and not ownership_conflict
+
         with session_scope() as session:
             repo = AmazonConnectionRepository(session)
             fields: dict[str, Any] = {
-                "status": result.connection_status,
-                "last_error_code": None if result.valid else result.reason,
-                "last_error_at": None if result.valid else now,
+                "status": "error" if ownership_conflict else result.connection_status,
+                "last_error_code": "ownership_conflict" if ownership_conflict else (
+                    None if result.valid else result.reason
+                ),
+                "last_error_at": now if (ownership_conflict or not result.valid) else None,
             }
-            if result.valid:
+            if effective_valid:
                 fields["last_successful_validation_at"] = now
                 if result.selling_partner_id:
                     fields["selling_partner_id"] = result.selling_partner_id
+                if reconciliation is not None and reconciliation.succeeded:
+                    fields["last_successful_sync_at"] = now
             repo.update(snapshot.organization_id, snapshot.id, **fields)
             if result.revoke_secret:
                 repo.clear_token_reference(snapshot.organization_id, snapshot.id)
+        return ownership_conflict
 
     async def validate_seller_connection(
         self,
@@ -1068,7 +1218,16 @@ class AmazonConnectionService:
             organization_id=self._org_id(),
             connection=snapshot,
         )
-        self._apply_seller_validation(snapshot, result)
+        ownership_conflict = self._apply_seller_validation(snapshot, result)
+        if ownership_conflict:
+            return SellerValidationResult(
+                valid=False,
+                selling_partner_id=None,
+                marketplaces=result.marketplaces,
+                connection_status="error",
+                reason="ownership_conflict",
+                message=IDENTITY_CONFLICT_MESSAGE,
+            )
         return result
 
     async def test_sp_api(self) -> AmazonConnectionTestResult:
@@ -1082,17 +1241,18 @@ class AmazonConnectionService:
                 organization_id=self._org_id(),
                 connection=snapshot,
             )
-            self._apply_seller_validation(snapshot, result)
+            ownership_conflict = self._apply_seller_validation(snapshot, result)
+            effective_valid = result.valid and not ownership_conflict
             environment: ConnectionEnvironment = (
                 "PRODUCTION" if snapshot.environment == "PRODUCTION" else "SANDBOX"
             )
             return AmazonConnectionTestResult(
-                status="CONNECTED" if result.valid else "FAILED",
+                status="CONNECTED" if effective_valid else "FAILED",
                 environment=environment,
                 marketplace=cfg.default_marketplace,
                 operation=result.operation,
                 tested_at=tested_at,
-                message=result.message,
+                message=IDENTITY_CONFLICT_MESSAGE if ownership_conflict else result.message,
             )
         if not self._credentials_ready(cfg):
             logger.info("amazon connection test skipped reason=missing_credentials")
