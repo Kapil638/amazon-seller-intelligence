@@ -1,0 +1,61 @@
+{
+  "numberOfResults": 1,
+  "pagination": {},
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0300",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN30",
+          "productType": "ELECTRONICS",
+          "conditionType": "new_new",
+          "status": ["DISCOVERABLE"],
+          "itemName": "ASI Test Item With Active Issues",
+          "createdDate": "2026-01-01T00:00:00Z",
+          "lastUpdatedDate": "2026-08-25T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "199.99" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 10 }
+      ],
+      "issues": [
+        {
+          "code": "90220",
+          "message": "'size' is required but not supplied.",
+          "severity": "ERROR",
+          "attributeNames": ["size"],
+          "categories": ["MISSING_ATTRIBUTE", "LISTING"],
+          "marketplaceIds": ["ATVPDKIKX0DER"]
+        },
+        {
+          "code": "18027",
+          "message": "The main image contains text, logo, or a watermark that is not permitted for this product type.",
+          "severity": "ERROR",
+          "categories": ["INVALID_IMAGE", "LISTING"],
+          "enforcements": {
+            "actions": [{ "action": "SEARCH_SUPPRESSED" }],
+            "exemption": {
+              "status": "EXEMPT_UNTIL_EXPIRY_DATE",
+              "expiryDate": "2026-12-01T00:00:00Z"
+            }
+          },
+          "marketplaceIds": ["ATVPDKIKX0DER", "A2EUQ1WTGCTBG2"]
+        },
+        {
+          "code": "55112",
+          "message": "This attribute value may not reflect the most current product information.",
+          "severity": "INFO",
+          "categories": ["PRODUCT"],
+          "marketplaceIds": ["ATVPDKIKX0DER"]
+        }
+      ],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "ELECTRONICS" }
+      ]
+    }
+  ]
+}

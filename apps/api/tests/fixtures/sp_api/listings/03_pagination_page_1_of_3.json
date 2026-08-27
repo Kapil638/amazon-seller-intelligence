@@ -1,0 +1,58 @@
+{
+  "numberOfResults": 5,
+  "pagination": {
+    "nextToken": "ASI-FIXTURE-PAGE-TOKEN-2"
+  },
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0100",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN20",
+          "productType": "TOY",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Toy Item 1",
+          "createdDate": "2026-03-01T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "12.99" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 30 }
+      ],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "TOY" }
+      ]
+    },
+    {
+      "sku": "ASI-TEST-SKU-0101",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN21",
+          "productType": "TOY",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Toy Item 2",
+          "createdDate": "2026-03-02T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "14.99" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 8 }
+      ],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "TOY" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "numberOfResults": 2,
+  "pagination": {},
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0500-PARENT",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN50",
+          "productType": "SHIRT",
+          "status": [],
+          "itemName": "ASI Test Shirt (Parent)",
+          "createdDate": "2026-01-15T00:00:00Z",
+          "lastUpdatedDate": "2026-08-15T00:00:00Z"
+        }
+      ],
+      "offers": [],
+      "fulfillmentAvailability": [],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "SHIRT" }
+      ],
+      "relationships": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "relationships": [
+            {
+              "childSkus": ["ASI-TEST-SKU-0501-CHILD"],
+              "type": "VARIATION"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sku": "ASI-TEST-SKU-0501-CHILD",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN51",
+          "productType": "SHIRT",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Shirt (Child - Size M)",
+          "createdDate": "2026-01-15T00:00:00Z",
+          "lastUpdatedDate": "2026-08-15T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "24.99" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 40 }
+      ],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "SHIRT" }
+      ],
+      "relationships": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "relationships": [
+            {
+              "parentSkus": ["ASI-TEST-SKU-0500-PARENT"],
+              "variationTheme": { "attributes": ["size_name"], "theme": "SIZE_NAME" },
+              "type": "VARIATION"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "_fixture_note": "Represents the documented 429 Too Many Requests response body shape (ErrorList) for searchListingsItems. Per the official model, no Retry-After header is documented for this operation; only 'x-amzn-RequestId' is documented as a response header. Retry/backoff timing must be derived from ASI's own client-side rate limiting, not from a response header this operation does not define.",
+  "http_status": 429,
+  "response_headers": {
+    "x-amzn-RequestId": "ASI-FIXTURE-REQUEST-ID-429"
+  },
+  "response_body": {
+    "errors": [
+      {
+        "code": "QuotaExceeded",
+        "message": "You exceeded your quota for the requested resource.",
+        "details": ""
+      }
+    ]
+  }
+}

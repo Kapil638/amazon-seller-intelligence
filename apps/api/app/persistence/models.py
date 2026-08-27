@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -18,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -667,11 +669,57 @@ class AmazonMarketplaceParticipation(Base):
 
 
 class AmazonIngestionRun(Base):
-    """Reusable SP-API ingestion-attempt record. Foundation only.
+    """Reusable SP-API ingestion-attempt record. Extended for listings runs in 12B.3B.
 
     12B.2A creates this table so later ingestion slices have a scoped,
-    idempotent run ledger to write to. No worker, scheduler, or live SP-API
-    ingestion call is authorized by this table's existence.
+    idempotent run ledger to write to. 12B.3B extends it (`run_type`,
+    `marketplace_participation_id`, `pages_fetched`, `reported_total_results`,
+    `lease_owner`, `lease_expires_at`) so a future listings-sync slice can
+    reuse the same ledger rather than a parallel table. No worker,
+    scheduler, client, or live SP-API listings call is authorized by this
+    table's existence; the claim/lease *service* (acquire, heartbeat,
+    stale-recovery) is explicitly deferred to 12B.3D.
+
+    `reported_total_results` mirrors Amazon's `numberOfResults` from
+    `searchListingsItems`. Amazon documents a hard ceiling of 1000 items
+    that can actually be paginated through, regardless of how large
+    `numberOfResults` reports the true match count to be. The *absence* of
+    `nextToken` on the last page is therefore not sufficient on its own to
+    prove a listings snapshot is complete: a future reconciliation service
+    must also confirm `reported_total_results` did not exceed that ceiling
+    (or that `records_received` actually reached it) before treating
+    `pagination_complete=True` as license to deactivate missing SKUs.
+
+    `marketplace_participation_id` is `ON DELETE RESTRICT`, not `SET NULL`:
+    a `run_type='listings'` row's CHECK constraint
+    (`ck_amazon_ingestion_runs_listings_scope_required`) requires that
+    column to stay non-null for as long as `run_type='listings'` holds, so
+    `SET NULL` could never actually succeed for such a row — it would only
+    surface as a confusing CHECK-constraint failure at the moment of
+    deletion, with the FK metadata itself claiming a non-blocking action
+    that isn't the one that actually happens. `RESTRICT` makes the
+    enforced behavior match the declared behavior: a direct, legible
+    foreign-key violation instead of an indirect CHECK failure.
+
+    Lease semantics (12B.3B, schema only): the partial unique index
+    `uq_amazon_ingestion_runs_active_listings_scope` below treats *every*
+    `run_type='listings', status='started'` row as holding the scope,
+    regardless of whether `lease_expires_at` has already passed. This is
+    intentional, not an oversight — a partial index predicate is evaluated
+    against a row's own column values when that row is written, not
+    continuously against wall-clock time, so `lease_expires_at < now()`
+    cannot be expressed in the predicate at all (and would not do what it
+    looks like even if it compiled). A lease past `lease_expires_at` is
+    therefore **not** self-releasing. Recovering it requires a future
+    service (12B.3D) to run a transactional, race-safe reclaim — e.g. a
+    conditional `UPDATE amazon_ingestion_runs SET status = 'timed_out'
+    WHERE id = :id AND status = 'started' AND lease_expires_at < now()`,
+    checking the affected row count — that terminalizes the stale row
+    *before* any new claim attempt, so two recovery attempts can never both
+    believe they reclaimed the same row. "The scope is released once the
+    row reaches a terminal status" is the only guarantee this schema makes;
+    "an expired lease automatically unlocks the scope" is not true and must
+    not be asserted by any test or doc.
     """
 
     __tablename__ = "amazon_ingestion_runs"
@@ -681,6 +729,42 @@ class AmazonIngestionRun(Base):
         CheckConstraint(
             "status IN ('started', 'succeeded', 'partial', 'failed', 'timed_out')",
             name="ck_amazon_ingestion_runs_status",
+        ),
+        CheckConstraint(
+            "run_type IN ('marketplace_participations', 'listings')",
+            name="ck_amazon_ingestion_runs_run_type",
+        ),
+        CheckConstraint(
+            "run_type <> 'listings' OR "
+            "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
+            name="ck_amazon_ingestion_runs_listings_scope_required",
+        ),
+        # Single-writer guarantee (12B.3 product decision): at most one
+        # 'started' listings run may exist per (seller_account_id,
+        # marketplace_participation_id) at a time. This is the actual claim
+        # mechanism — a concurrent second INSERT into this scope fails on
+        # this constraint — not a separately-implemented lease service.
+        # Terminal statuses (succeeded/partial/failed/timed_out) fall
+        # outside the partial predicate, so the scope is never permanently
+        # locked: any transition out of 'started' frees it for reclaim. See
+        # the class docstring: this is a status-based release only, never
+        # an automatic, lease-expiry-based one.
+        Index(
+            "uq_amazon_ingestion_runs_active_listings_scope",
+            "seller_account_id",
+            "marketplace_participation_id",
+            unique=True,
+            postgresql_where=text("run_type = 'listings' AND status = 'started'"),
+            sqlite_where=text("run_type = 'listings' AND status = 'started'"),
+        ),
+        # Widens the PK into a composite unique key so amazon_seller_listings
+        # can hold a composite FK guaranteeing a listing's last ingestion
+        # run belongs to the same marketplace participation (see
+        # AmazonSellerListing's docstring).
+        UniqueConstraint(
+            "id",
+            "marketplace_participation_id",
+            name="uq_amazon_ingestion_runs_id_marketplace_participation",
         ),
     )
 
@@ -694,6 +778,10 @@ class AmazonIngestionRun(Base):
     seller_account_id: Mapped[UUID | None] = mapped_column(
         Guid(), ForeignKey("amazon_seller_accounts.id", ondelete="SET NULL"), nullable=True
     )
+    marketplace_participation_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=True
+    )
+    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="marketplace_participations")
     domain: Mapped[str] = mapped_column(String(64), nullable=False)
     region: Mapped[str] = mapped_column(String(8), nullable=False)
     environment: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -707,6 +795,142 @@ class AmazonIngestionRun(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pagination_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reported_total_results: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     organization: Mapped[Organization] = relationship()
+
+
+class AmazonSellerListing(Base):
+    """Canonical seller-owned listing (SKU) for one marketplace participation.
+
+    12B.3B schema foundation only — no SP-API client, reconciliation
+    service, read API, or UI reads/writes this table yet.
+
+    Ownership integrity: this table deliberately has no `organization_id`
+    or `seller_account_id` column. Ownership is derived exclusively through
+    `marketplace_participation_id` -> `amazon_marketplace_participations`
+    (which itself carries `organization_id` and `seller_account_id`). A
+    single source of truth makes contradictory ownership structurally
+    impossible, at the cost of requiring a join for seller-account-scoped
+    listing pages — an accepted tradeoff given expected per-seller SKU
+    volumes (hundreds to low thousands, not millions).
+
+    `status`/`offers`/`fulfillment_availability`/`issues`/`product_types`
+    store the shapes documented by the pinned `searchListingsItems`
+    contract (see `docs/AI_HANDOVER/12B3A_LISTINGS_ITEMS_API_CONTRACT_REPORT.md`).
+    Their internal shape is validated at the application layer (future
+    12B.3C parsing), not by a database CHECK constraint, matching how
+    `inputs_json`/`outputs_json`/`completeness` already work on
+    `ProfitSnapshot`/`AdvertisingSnapshot`.
+
+    Provenance integrity: `last_ingestion_run_id` uses a *composite*
+    foreign key — `(last_ingestion_run_id, marketplace_participation_id)`
+    -> `amazon_ingestion_runs(id, marketplace_participation_id)` — instead
+    of a plain single-column FK to `amazon_ingestion_runs.id`. This
+    guarantees the referenced run's `marketplace_participation_id` always
+    equals this row's own `marketplace_participation_id`, with no
+    duplicated organization/seller-account column needed: the same column
+    that already carries this listing's ownership is reused as the second
+    half of the composite key (`MATCH SIMPLE` semantics mean the
+    constraint is inert whenever `last_ingestion_run_id IS NULL`, which is
+    always true before a listing's first successful run). `ON DELETE
+    RESTRICT`, not `SET NULL`: nulling only `last_ingestion_run_id` while
+    leaving `marketplace_participation_id` alone would violate the
+    composite FK's own semantics, and nulling *both* is impossible because
+    `marketplace_participation_id` is `NOT NULL` here.
+
+    Deliberately NOT enforced at the database level: that the referenced
+    run has `run_type='listings'`. A composite FK can only compare the
+    referenced row's columns against *this row's own* column values — it
+    cannot pin the referenced side to a literal constant, so expressing
+    "must be a listings run" at the DB level would require a `PL/pgSQL`
+    trigger (a lookup + raise on every insert/update), which is
+    disproportionate schema complexity for this foundation slice. That
+    check is deferred to repository/service-layer validation when the
+    write path is built (12B.3D) — same-marketplace-participation
+    provenance is the invariant the schema protects; run-type provenance
+    is an application-layer invariant for now.
+    """
+
+    __tablename__ = "amazon_seller_listings"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace_participation_id",
+            "seller_sku",
+            name="uq_amazon_seller_listings_participation_sku",
+        ),
+        Index("ix_amazon_seller_listings_participation_asin", "marketplace_participation_id", "asin"),
+        Index("ix_amazon_seller_listings_participation_active", "marketplace_participation_id", "is_active"),
+        Index("ix_amazon_seller_listings_participation_buyable", "marketplace_participation_id", "is_buyable"),
+        Index(
+            "ix_amazon_seller_listings_participation_discoverable",
+            "marketplace_participation_id",
+            "is_discoverable",
+        ),
+        Index(
+            "ix_amazon_seller_listings_participation_issue_count",
+            "marketplace_participation_id",
+            "issue_count",
+        ),
+        Index(
+            "ix_amazon_seller_listings_participation_updated",
+            "marketplace_participation_id",
+            "amazon_last_updated_at",
+        ),
+        Index("ix_amazon_seller_listings_last_ingestion_run", "last_ingestion_run_id"),
+        CheckConstraint(
+            "highest_issue_severity IS NULL OR highest_issue_severity IN ('ERROR', 'WARNING', 'INFO')",
+            name="ck_amazon_seller_listings_highest_issue_severity",
+        ),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_seller_listings_last_ingestion_run_same_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    seller_sku: Mapped[str] = mapped_column(String(180), nullable=False)
+    asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    product_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    condition_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    item_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    main_image_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    amazon_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    amazon_last_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[list] = mapped_column(JsonPayload, nullable=False)
+    is_buyable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_discoverable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    offers: Mapped[list] = mapped_column(JsonPayload, nullable=False)
+    price_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    price_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    fulfillment_availability: Mapped[list] = mapped_column(JsonPayload, nullable=False)
+    issues: Mapped[list] = mapped_column(JsonPayload, nullable=False)
+    issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    highest_issue_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    product_types: Mapped[list] = mapped_column(JsonPayload, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # No inline ForeignKey() here: the actual constraint is the composite
+    # ForeignKeyConstraint in __table_args__ (last_ingestion_run_id,
+    # marketplace_participation_id) -> amazon_ingestion_runs(id,
+    # marketplace_participation_id) — see the class docstring.
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()
