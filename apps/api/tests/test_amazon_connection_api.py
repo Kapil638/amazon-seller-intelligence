@@ -218,9 +218,11 @@ def test_connection_overview_exposes_canonical_marketplaces_after_test(client) -
     from app.amazon.seller_validation import AmazonSellerValidationService
     from app.amazon.sellers import MARKETPLACE_PARTICIPATIONS_PATH
 
+    # Amazon's real getMarketplaceParticipations response defines no
+    # sellingPartnerId field at all — the connection's own OAuth-captured
+    # selling_partner_id (set below) is the only authoritative identity.
     fixtures = Path(__file__).parent / "fixtures" / "sp_api"
     payload = json.loads((fixtures / "get_marketplace_participations.sandbox.json").read_text())
-    payload["sellingPartnerId"] = "A3FHEXAMPLEYWS"
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.amazon.com":
@@ -254,6 +256,7 @@ def test_connection_overview_exposes_canonical_marketplaces_after_test(client) -
             environment="PRODUCTION",
             region="na",
             status="pending_validation",
+            selling_partner_id="A3FHEXAMPLEYWS",
         )
         reference = build_asi_secret_reference(
             provider="SP_API",

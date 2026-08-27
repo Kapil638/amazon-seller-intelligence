@@ -1,0 +1,49 @@
+{
+  "payload": [
+    {
+      "marketplace": {
+        "id": "ATVPDKIKX0DER",
+        "countryCode": "US",
+        "name": "Amazon.com",
+        "defaultCurrencyCode": "USD",
+        "defaultLanguageCode": "en_US",
+        "domainName": "www.amazon.com"
+      },
+      "storeName": "BestSellerStore",
+      "participation": {
+        "isParticipating": true,
+        "hasSuspendedListings": false
+      }
+    },
+    {
+      "marketplace": {
+        "id": "A2EUQ1WTGCTBG2",
+        "countryCode": "CA",
+        "name": "Amazon.ca",
+        "defaultCurrencyCode": "CAD",
+        "defaultLanguageCode": "en_CA",
+        "domainName": "www.amazon.ca"
+      },
+      "storeName": "BestSellerStore",
+      "participation": {
+        "isParticipating": false,
+        "hasSuspendedListings": false
+      }
+    },
+    {
+      "marketplace": {
+        "id": "A1AM78C64UM0Y8",
+        "countryCode": "MX",
+        "name": "Amazon.com.mx",
+        "defaultCurrencyCode": "MXN",
+        "defaultLanguageCode": "es_MX",
+        "domainName": "www.amazon.com.mx"
+      },
+      "storeName": "BestSellerStore",
+      "participation": {
+        "isParticipating": true,
+        "hasSuspendedListings": true
+      }
+    }
+  ]
+}

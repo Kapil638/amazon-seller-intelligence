@@ -14,11 +14,16 @@ from app.amazon.common import public_model_dump, reject_secret_fields
 from app.amazon.connection import AmazonConnectionService
 from app.amazon.models import MarketplaceParticipationsSandboxResult, SpApiSandboxProvenance
 from app.amazon.sandbox import GET_MARKETPLACE_PARTICIPATIONS
+from app.amazon.secrets import DevelopmentSecretProvider, build_asi_secret_reference
+from app.amazon.seller_validation import SellerValidationResult
 from app.core.config import Settings
 from app.core.exceptions import PersistenceError
 from app.persistence.database import current_organization_id, session_scope
 from app.persistence.models import AmazonConnection, Organization
-from app.persistence.repositories import AmazonConnectionRepository
+from app.persistence.repositories import (
+    AmazonConnectionRepository,
+    AmazonSellerAccountRepository,
+)
 
 SECRET_MARKERS = (
     "Atza|",
@@ -234,3 +239,75 @@ def test_repository_errors_are_handled() -> None:
     assert updated.status == "NOT_CONNECTED"
     assert service.delete_connection(connection_id) is True
     assert service.overview().persisted is False
+
+
+class _MismatchedIdentityValidator:
+    """Defensive-path stub: returns `valid=True` with a `selling_partner_id`
+    that disagrees with the connection's own stored identity. Amazon's real
+    getMarketplaceParticipations response cannot produce this (it defines no
+    such field at all — see AmazonSellerValidationService.validate), but the
+    explicit equality guard in AmazonConnectionService._apply_seller_validation
+    must still fail closed if it ever happened, e.g. via a future regression
+    that reintroduces an independent identity source."""
+
+    def __init__(self, selling_partner_id: str) -> None:
+        self._selling_partner_id = selling_partner_id
+
+    async def validate(self, *, organization_id, connection) -> SellerValidationResult:
+        return SellerValidationResult(
+            valid=True,
+            selling_partner_id=self._selling_partner_id,
+            marketplaces=[],
+            connection_status="connected",
+            reason="validated",
+        )
+
+
+@pytest.mark.asyncio
+async def test_identity_mismatch_between_stored_and_result_fails_closed() -> None:
+    """The connection's own persisted selling_partner_id is authoritative.
+    If a SellerValidationResult ever disagrees with it, reconciliation must
+    never run and the connection must fail closed — never appear connected."""
+    provider = DevelopmentSecretProvider()
+    service = AmazonConnectionService(
+        settings=_configured_settings(),
+        secret_provider=provider,
+        seller_validator=_MismatchedIdentityValidator("DIFFERENT_FROM_STORED"),
+    )
+    org_id = current_organization_id()
+    with session_scope() as session:
+        repo = AmazonConnectionRepository(session)
+        row = repo.create(
+            organization_id=org_id,
+            provider="SP_API",
+            environment="PRODUCTION",
+            region="na",
+            status="pending_validation",
+            selling_partner_id="STOREDSELLERID",
+        )
+        reference = build_asi_secret_reference(
+            provider="SP_API",
+            environment="PRODUCTION",
+            organization_id=org_id,
+            connection_id=row.id,
+        )
+        repo.bind_token_reference(org_id, row.id, reference)
+        connection_id = row.id
+    provider.put_secret(reference, SecretStr("Atzr|test-refresh-token"))
+
+    result = await service.test_sp_api()
+    assert result.status == "FAILED"
+    assert "DIFFERENT_FROM_STORED" not in str(result)
+    assert "STOREDSELLERID" not in str(result)
+
+    with session_scope() as session:
+        stored = AmazonConnectionRepository(session).get_by_id(org_id, connection_id)
+        assert stored is not None
+        assert stored.status == "error"
+        assert stored.status != "connected"
+        assert stored.last_error_code == "identity_conflict"
+        # The pre-existing stored identity is left untouched, not overwritten
+        # by the disagreeing result.
+        assert stored.selling_partner_id == "STOREDSELLERID"
+        # Reconciliation must never have been reached.
+        assert AmazonSellerAccountRepository(session).list_for_org(org_id) == []

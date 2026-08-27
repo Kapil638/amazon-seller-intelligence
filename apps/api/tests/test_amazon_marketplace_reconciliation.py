@@ -294,7 +294,43 @@ def test_missing_identity_is_rejected_before_any_write() -> None:
         assert AmazonIngestionRunRepository(session).list_for_org(org_id) == []
 
 
-def test_malformed_participations_are_rejected_before_any_write() -> None:
+def test_malformed_participations_reject_the_whole_snapshot_with_a_visible_failed_run() -> None:
+    """A response mixing valid and malformed entries must not be partially
+    reconciled — a malformed entry is not evidence the seller left any
+    marketplace, so the whole snapshot is rejected for absence/deactivation
+    safety. This must still be observable: a failed ingestion run is
+    recorded with `failure_class="malformed_participations"`, not silently
+    dropped as an INFO-only, unpersisted event."""
+    org_id = current_organization_id()
+    connection_id = _connection_id(org_id)
+    service = AmazonMarketplaceReconciliationService()
+
+    outcome = service.reconcile(
+        organization_id=org_id,
+        connection_id=connection_id,
+        region="na",
+        environment="PRODUCTION",
+        selling_partner_id="A1SELLERID",
+        participations=[_participation("ATVPDKIKX0DER"), _participation("   ")],
+    )
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_participations"
+    assert outcome.records_received == 2
+    assert outcome.records_rejected == 2
+    assert outcome.ingestion_run_id is not None
+    with session_scope() as session:
+        # No canonical writes at all — not even the one structurally valid entry.
+        assert AmazonSellerAccountRepository(session).list_for_org(org_id) == []
+        runs = AmazonIngestionRunRepository(session).list_for_org(org_id)
+        assert len(runs) == 1
+        assert runs[0].status == "failed"
+        assert runs[0].failure_class == "malformed_participations"
+        assert runs[0].records_received == 2
+        assert runs[0].records_accepted == 0
+        assert runs[0].records_rejected == 2
+
+
+def test_fully_malformed_snapshot_also_records_a_visible_failed_run() -> None:
     org_id = current_organization_id()
     connection_id = _connection_id(org_id)
     service = AmazonMarketplaceReconciliationService()
@@ -311,7 +347,116 @@ def test_malformed_participations_are_rejected_before_any_write() -> None:
     assert outcome.reason == "malformed_participations"
     with session_scope() as session:
         assert AmazonSellerAccountRepository(session).list_for_org(org_id) == []
-        assert AmazonIngestionRunRepository(session).list_for_org(org_id) == []
+        runs = AmazonIngestionRunRepository(session).list_for_org(org_id)
+        assert len(runs) == 1
+        assert runs[0].status == "failed"
+        assert runs[0].failure_class == "malformed_participations"
+
+
+def test_empty_payload_is_distinguished_from_malformed_and_never_deactivates() -> None:
+    """A structurally valid but empty payload is not treated as 'the seller
+    now has zero marketplaces' — existing product behavior already treats
+    zero participating marketplaces as a validation failure upstream
+    (AmazonSellerValidationService.validate's seller_identity_unavailable
+    gate), so this stays consistent: rejected outright, distinctly reasoned
+    from malformed data, and never deactivates prior rows."""
+    org_id = current_organization_id()
+    connection_id = _connection_id(org_id)
+    service = AmazonMarketplaceReconciliationService()
+
+    first = service.reconcile(
+        organization_id=org_id,
+        connection_id=connection_id,
+        region="na",
+        environment="PRODUCTION",
+        selling_partner_id="A1SELLERID",
+        participations=[_participation("ATVPDKIKX0DER")],
+    )
+    assert first.succeeded is True
+
+    outcome = service.reconcile(
+        organization_id=org_id,
+        connection_id=connection_id,
+        region="na",
+        environment="PRODUCTION",
+        selling_partner_id="A1SELLERID",
+        participations=[],
+    )
+    assert outcome.succeeded is False
+    assert outcome.reason == "empty_snapshot"
+    assert outcome.reason != "malformed_participations"
+    assert outcome.records_received == 0
+
+    with session_scope() as session:
+        # The prior successful synchronization's row is untouched, not deactivated.
+        rows = AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
+            org_id, first.seller_account_id
+        )
+        assert len(rows) == 1
+        assert rows[0].is_active is True
+
+        # (Two runs created back-to-back can tie at SQLite's timestamp
+        # resolution, so this checks by status rather than by position.)
+        runs = AmazonIngestionRunRepository(session).list_for_connection(org_id, connection_id)
+        assert len(runs) == 2
+        assert {run.status for run in runs} == {"succeeded", "failed"}
+        failed_run = next(run for run in runs if run.status == "failed")
+        assert failed_run.failure_class == "empty_snapshot"
+        assert failed_run.records_received == 0
+
+
+def test_malformed_payload_does_not_deactivate_previously_synced_marketplaces() -> None:
+    """A fully malformed response on a later sync attempt must never be
+    treated as proof the seller left every marketplace — the earlier,
+    successfully-synced rows must remain exactly as they were."""
+    org_id = current_organization_id()
+    connection_id = _connection_id(org_id)
+    service = AmazonMarketplaceReconciliationService()
+
+    first = service.reconcile(
+        organization_id=org_id,
+        connection_id=connection_id,
+        region="na",
+        environment="PRODUCTION",
+        selling_partner_id="A1SELLERID",
+        participations=[_participation("ATVPDKIKX0DER"), _participation("A2EUQ1WTGCTBG2", store_name=None)],
+    )
+    assert first.succeeded is True
+
+    outcome = service.reconcile(
+        organization_id=org_id,
+        connection_id=connection_id,
+        region="na",
+        environment="PRODUCTION",
+        selling_partner_id="A1SELLERID",
+        participations=[_participation("   ")],
+    )
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_participations"
+
+    with session_scope() as session:
+        rows = {
+            row.marketplace_id: row
+            for row in AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
+                org_id, first.seller_account_id
+            )
+        }
+        assert set(rows) == {"ATVPDKIKX0DER", "A2EUQ1WTGCTBG2"}
+        assert rows["ATVPDKIKX0DER"].is_active is True
+        assert rows["A2EUQ1WTGCTBG2"].is_active is True
+
+        # The failed attempt is visible as a distinct, sanitized ingestion run —
+        # not silently dropped as an INFO-only event with no persisted trace.
+        # (Two runs created back-to-back can tie at SQLite's timestamp
+        # resolution, so this checks statuses as a set rather than by
+        # position — see the identical lesson in
+        # test_amazon_ingestion_run_repository.py.)
+        runs = AmazonIngestionRunRepository(session).list_for_connection(org_id, connection_id)
+        assert len(runs) == 2
+        statuses = {run.status for run in runs}
+        assert statuses == {"succeeded", "failed"}
+        failed_run = next(run for run in runs if run.status == "failed")
+        assert failed_run.failure_class == "malformed_participations"
 
 
 def test_organization_isolation_is_preserved_across_reconciliation() -> None:

@@ -37,11 +37,12 @@ TEST_URL = "/api/v1/amazon/connection/test"
 INGEST_MARKERS = ("/listings/", "/orders/", "/fba/", "/reports/", "/finances/")
 
 
-def _participations_payload(*, selling_partner_id: str | None = SELLING_PARTNER_ID) -> dict:
-    body = json.loads((FIXTURES / "get_marketplace_participations.sandbox.json").read_text(encoding="utf-8"))
-    if selling_partner_id:
-        body["sellingPartnerId"] = selling_partner_id
-    return body
+def _participations_payload() -> dict:
+    """Amazon's real `getMarketplaceParticipations` response — no
+    `sellingPartnerId` field exists anywhere in the official schema; the
+    connection's own OAuth-captured `selling_partner_id` is the only
+    authoritative identity (see `_seed_pending_validation`)."""
+    return json.loads((FIXTURES / "get_marketplace_participations.sandbox.json").read_text(encoding="utf-8"))
 
 
 def _settings(**overrides) -> Settings:
@@ -92,7 +93,13 @@ def _seed_pending_validation(
     organization_id=None,
     environment: str = "SANDBOX",
     region: str = "eu",
+    selling_partner_id: str | None = SELLING_PARTNER_ID,
 ) -> tuple[object, str]:
+    """Seeds a connection matching the real invariant: `selling_partner_id`
+    is captured on the connection row at OAuth callback time, before it can
+    ever reach `pending_validation`/`connected` — never discovered later from
+    a Sellers API response. Pass `selling_partner_id=None` to simulate the
+    (fail-closed) case where that capture never happened."""
     org_id = organization_id or current_organization_id()
     with session_scope() as session:
         repo = AmazonConnectionRepository(session)
@@ -102,6 +109,7 @@ def _seed_pending_validation(
             environment=environment,
             region=region,
             status=status,
+            selling_partner_id=selling_partner_id,
         )
         reference = build_asi_secret_reference(
             provider="SP_API",
@@ -201,24 +209,41 @@ async def test_successful_seller_validation_marks_connected(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_successful_validation_reconciles_canonical_seller_identity(caplog) -> None:
-    """12B.2B — a successful handshake now populates the canonical tables."""
+    """12B.2B — a successful handshake now populates the canonical tables,
+    using Amazon's real production-shaped response (no sellingPartnerId
+    field at all; identity comes solely from the OAuth-captured, stored
+    connection identity)."""
     from app.persistence.repositories import (
         AmazonIngestionRunRepository,
         AmazonMarketplaceParticipationRepository,
         AmazonSellerAccountRepository,
     )
 
-    service, provider = _service()
+    official_payload = json.loads(
+        (FIXTURES / "get_marketplace_participations.official.json").read_text(encoding="utf-8")
+    )
+    assert "sellingPartnerId" not in official_payload
+
+    service, provider = _service(transport=_mock_transport(sellers_json=official_payload))
     connection_id, _ = _seed_pending_validation(
         provider=provider,
         environment="PRODUCTION",
         region="na",
     )
+    with session_scope() as session:
+        connection_before = AmazonConnectionRepository(session).get_by_id(
+            current_organization_id(), connection_id
+        )
+        assert connection_before is not None
+        assert connection_before.last_successful_sync_at is None
+
     with caplog.at_level("DEBUG"):
         result = await service.validate_seller_connection(environment="PRODUCTION")
     assert result.valid is True
-    assert result.participations[0].marketplace_id == "ATVPDKIKX0DER"
-    assert result.participations[0].is_participating is True
+    assert result.selling_partner_id == SELLING_PARTNER_ID
+    # Every entry from the response is preserved, including non-participating
+    # and suspended-listing marketplaces.
+    assert len(result.participations) == 3
     org_id = current_organization_id()
     with session_scope() as session:
         account = AmazonSellerAccountRepository(session).get_by_selling_partner_id(
@@ -226,14 +251,28 @@ async def test_successful_validation_reconciles_canonical_seller_identity(caplog
         )
         assert account is not None
         assert account.display_store_name == "BestSellerStore"
-        rows = AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
-            org_id, account.id
-        )
-        assert len(rows) == 1
-        assert rows[0].marketplace_id == "ATVPDKIKX0DER"
+        rows = {
+            row.marketplace_id: row
+            for row in AmazonMarketplaceParticipationRepository(session).list_for_seller_account(
+                org_id, account.id
+            )
+        }
+        assert set(rows) == {"ATVPDKIKX0DER", "A2EUQ1WTGCTBG2", "A1AM78C64UM0Y8"}
+        assert rows["ATVPDKIKX0DER"].is_participating is True
+        assert rows["ATVPDKIKX0DER"].has_suspended_listings is False
+        assert rows["A2EUQ1WTGCTBG2"].is_participating is False
+        assert rows["A1AM78C64UM0Y8"].is_participating is True
+        assert rows["A1AM78C64UM0Y8"].has_suspended_listings is True
+        assert all(row.is_active for row in rows.values())
         runs = AmazonIngestionRunRepository(session).list_for_connection(org_id, connection_id)
         assert len(runs) == 1
         assert runs[0].status == "succeeded"
+        assert runs[0].records_accepted == 3
+
+        connection_after = AmazonConnectionRepository(session).get_by_id(org_id, connection_id)
+        assert connection_after is not None
+        assert connection_after.last_successful_sync_at is not None
+        assert connection_after.status == "connected"
     _assert_no_secrets(result, caplog.text)
 
 
@@ -278,33 +317,37 @@ async def test_ownership_conflict_fails_closed_and_does_not_reveal_owner() -> No
 
 
 @pytest.mark.asyncio
-async def test_identity_conflict_between_callback_and_validation_is_not_reconciled() -> None:
+async def test_absent_stored_identity_fails_closed_with_no_canonical_writes() -> None:
+    """getMarketplaceParticipations does not define a sellingPartnerId field —
+    the connection's own OAuth-captured selling_partner_id is the only
+    authoritative identity. If it was never captured, validation must fail
+    closed rather than reconcile without a trustworthy identity."""
+    from app.persistence.repositories import (
+        AmazonIngestionRunRepository,
+        AmazonSellerAccountRepository,
+    )
+
     service, provider = _service()
-    connection_id, reference = _seed_pending_validation(provider=provider)
-    with session_scope() as session:
-        AmazonConnectionRepository(session).update(
-            current_organization_id(),
-            connection_id,
-            selling_partner_id="CALLBACKCAPTUREDID",
-        )
+    connection_id, reference = _seed_pending_validation(provider=provider, selling_partner_id=None)
     result = await service.validate_seller_connection()
     assert result.valid is False
-    assert result.reason == "identity_conflict"
-    assert result.connection_status == "pending_validation"
+    assert result.reason == "identity_missing"
+    assert result.connection_status == "error"
     assert result.selling_partner_id is None
     _assert_no_secrets(result)
+    org_id = current_organization_id()
     with session_scope() as session:
-        stored = AmazonConnectionRepository(session).get_by_id(
-            current_organization_id(), connection_id
-        )
+        stored = AmazonConnectionRepository(session).get_by_id(org_id, connection_id)
         assert stored is not None
-        # Last known-good identity (captured earlier, e.g. at OAuth callback) is
-        # preserved; the disagreeing Sellers API value is not reconciled in.
-        assert stored.selling_partner_id == "CALLBACKCAPTUREDID"
-        assert stored.status == "pending_validation"
+        assert stored.status == "error"
         assert stored.status != "connected"
-        assert stored.last_error_code == "identity_conflict"
+        assert stored.selling_partner_id is None
+        assert stored.last_error_code == "identity_missing"
         assert stored.token_reference == reference
+        # No canonical seller-identity rows were ever written — reconciliation
+        # must never be reached without a trustworthy identity.
+        assert AmazonSellerAccountRepository(session).list_for_org(org_id) == []
+        assert AmazonIngestionRunRepository(session).list_for_org(org_id) == []
 
 
 @pytest.mark.asyncio
@@ -436,7 +479,7 @@ async def test_organization_cannot_validate_another_org_token() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_marketplace_participation_does_not_connect() -> None:
-    empty = {"payload": [], "sellingPartnerId": SELLING_PARTNER_ID}
+    empty = {"payload": []}
     service, provider = _service(transport=_mock_transport(sellers_json=empty))
     connection_id, reference = _seed_pending_validation(provider=provider)
     result = await service.validate_seller_connection()

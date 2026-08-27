@@ -56,10 +56,18 @@ class MarketplaceParticipation(BaseModel):
 
 
 class GetMarketplaceParticipationsResponse(BaseModel):
+    """Matches Amazon's real `getMarketplaceParticipations` contract exactly.
+
+    The official schema defines `payload` as a `MarketplaceParticipationList`
+    and does not define a `sellingPartnerId` field anywhere on this response.
+    Seller identity is never expected from this endpoint — the OAuth-captured,
+    connection-persisted `selling_partner_id` is the only authoritative source
+    (see `AmazonSellerValidationService.validate`).
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     payload: list[MarketplaceParticipation] | None = None
-    selling_partner_id: str | None = Field(default=None, alias="sellingPartnerId")
     errors: list[dict] | None = None
 
 

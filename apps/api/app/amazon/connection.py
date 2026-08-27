@@ -1145,14 +1145,17 @@ class AmazonConnectionService:
         self,
         snapshot: _SellerConnectionSnapshot,
         result: SellerValidationResult,
-    ) -> bool:
+    ) -> str | None:
         """Persist the handshake outcome and reconcile canonical identity rows.
 
-        Returns `True` if a seller-identity ownership conflict was detected
-        during reconciliation. That case must fail closed: the connection is
-        written as `error`, never `connected`, and the owning organization
-        is never disclosed (the reconciliation layer never returns it, and
-        this method never receives or logs it).
+        Returns a sanitized reason code (`"ownership_conflict"` or
+        `"identity_conflict"`) if reconciliation could not proceed safely and
+        the connection was forced into `error`/needs-attention, or `None` if
+        the connection's final state exactly matches `result`. Both failure
+        cases fail closed: the connection is written as `error`, never
+        `connected`, and no organization identifier is ever disclosed (the
+        reconciliation layer never returns one, and this method never
+        receives or logs one).
         """
         now = datetime.now(UTC)
         if result.revoke_secret and snapshot.token_reference:
@@ -1164,27 +1167,42 @@ class AmazonConnectionService:
                     snapshot.id,
                 )
 
+        # The connection's own persisted selling_partner_id (captured at OAuth
+        # callback) is the sole authoritative identity for reconciliation —
+        # never `result.selling_partner_id` on faith alone, even though
+        # `AmazonSellerValidationService.validate` now derives that field from
+        # this exact same stored value. Comparing them explicitly here is
+        # deliberate defense-in-depth: if the two ever disagree (e.g. a future
+        # refactor decouples them), fail closed rather than silently trusting
+        # either one.
+        stored_identity = (snapshot.selling_partner_id or "").strip() or None
+        result_identity = (result.selling_partner_id or "").strip() or None
+        identity_mismatch = bool(stored_identity and result_identity and stored_identity != result_identity)
+
         reconciliation: ReconciliationOutcome | None = None
-        if result.valid and result.selling_partner_id:
+        if result.valid and not identity_mismatch and stored_identity:
             reconciliation = self._reconciler().reconcile(
                 organization_id=snapshot.organization_id,
                 connection_id=snapshot.id,
                 region=snapshot.region,
                 environment=snapshot.environment,
-                selling_partner_id=result.selling_partner_id,
+                selling_partner_id=stored_identity,
                 participations=result.participations,
             )
         ownership_conflict = reconciliation is not None and reconciliation.reason == "ownership_conflict"
-        effective_valid = result.valid and not ownership_conflict
+        needs_attention = ownership_conflict or identity_mismatch
+        effective_valid = result.valid and not needs_attention
 
         with session_scope() as session:
             repo = AmazonConnectionRepository(session)
             fields: dict[str, Any] = {
-                "status": "error" if ownership_conflict else result.connection_status,
-                "last_error_code": "ownership_conflict" if ownership_conflict else (
-                    None if result.valid else result.reason
+                "status": "error" if needs_attention else result.connection_status,
+                "last_error_code": (
+                    "ownership_conflict" if ownership_conflict
+                    else "identity_conflict" if identity_mismatch
+                    else (None if result.valid else result.reason)
                 ),
-                "last_error_at": now if (ownership_conflict or not result.valid) else None,
+                "last_error_at": now if (needs_attention or not result.valid) else None,
             }
             if effective_valid:
                 fields["last_successful_validation_at"] = now
@@ -1195,7 +1213,11 @@ class AmazonConnectionService:
             repo.update(snapshot.organization_id, snapshot.id, **fields)
             if result.revoke_secret:
                 repo.clear_token_reference(snapshot.organization_id, snapshot.id)
-        return ownership_conflict
+        if ownership_conflict:
+            return "ownership_conflict"
+        if identity_mismatch:
+            return "identity_conflict"
+        return None
 
     async def validate_seller_connection(
         self,
@@ -1218,14 +1240,14 @@ class AmazonConnectionService:
             organization_id=self._org_id(),
             connection=snapshot,
         )
-        ownership_conflict = self._apply_seller_validation(snapshot, result)
-        if ownership_conflict:
+        attention_reason = self._apply_seller_validation(snapshot, result)
+        if attention_reason is not None:
             return SellerValidationResult(
                 valid=False,
                 selling_partner_id=None,
                 marketplaces=result.marketplaces,
                 connection_status="error",
-                reason="ownership_conflict",
+                reason=attention_reason,
                 message=IDENTITY_CONFLICT_MESSAGE,
             )
         return result
@@ -1241,8 +1263,8 @@ class AmazonConnectionService:
                 organization_id=self._org_id(),
                 connection=snapshot,
             )
-            ownership_conflict = self._apply_seller_validation(snapshot, result)
-            effective_valid = result.valid and not ownership_conflict
+            attention_reason = self._apply_seller_validation(snapshot, result)
+            effective_valid = result.valid and attention_reason is None
             environment: ConnectionEnvironment = (
                 "PRODUCTION" if snapshot.environment == "PRODUCTION" else "SANDBOX"
             )
@@ -1252,7 +1274,7 @@ class AmazonConnectionService:
                 marketplace=cfg.default_marketplace,
                 operation=result.operation,
                 tested_at=tested_at,
-                message=IDENTITY_CONFLICT_MESSAGE if ownership_conflict else result.message,
+                message=IDENTITY_CONFLICT_MESSAGE if attention_reason is not None else result.message,
             )
         if not self._credentials_ready(cfg):
             logger.info("amazon connection test skipped reason=missing_credentials")

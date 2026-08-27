@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 INGESTION_DOMAIN = "sellers_marketplace_participations"
 
-ReconciliationFailureReason = str  # "identity_missing" | "malformed_participations" | "ownership_conflict" | "database_failure"
+ReconciliationFailureReason = str  # "identity_missing" | "empty_snapshot" | "malformed_participations" | "ownership_conflict" | "database_failure"
 
 
 @dataclass(frozen=True)
@@ -91,25 +91,49 @@ class AmazonMarketplaceReconciliationService:
     ) -> ReconciliationOutcome:
         spid = (selling_partner_id or "").strip()
         if not spid:
+            # No canonical seller account can be scoped without an identity
+            # at all, so there is nothing meaningful for an ingestion run to
+            # bind to — this stays a connection-level fail-closed state,
+            # handled upstream in AmazonSellerValidationService.validate /
+            # AmazonConnectionService._apply_seller_validation, and is
+            # unreachable from that real call chain. Kept here only as a
+            # defensive guard for direct callers.
             logger.info(
                 "amazon marketplace reconciliation rejected reason=identity_missing connection_id=%s",
                 connection_id,
             )
             return ReconciliationOutcome(succeeded=False, reason="identity_missing")
 
+        records_received = len(participations)
         valid_participations = [p for p in participations if (p.marketplace_id or "").strip()]
-        rejected_count = len(participations) - len(valid_participations)
-        if not valid_participations:
-            logger.info(
-                "amazon marketplace reconciliation rejected reason=malformed_participations connection_id=%s",
-                connection_id,
-            )
-            return ReconciliationOutcome(
-                succeeded=False,
-                reason="malformed_participations",
-                records_received=len(participations),
-                records_rejected=rejected_count,
-            )
+        rejected_count = records_received - len(valid_participations)
+
+        # Decide up front whether this snapshot can be trusted at all, before
+        # ever starting an ingestion run, so the run — once started — always
+        # records a truthful, final classification.
+        #
+        # An empty payload (zero entries of any kind) is distinguished from a
+        # malformed one (entries present but unusable): existing product
+        # behavior already treats zero participating marketplaces as a
+        # validation failure (`seller_identity_unavailable` in
+        # AmazonSellerValidationService.validate, which gates reconcile()
+        # from ever being reached with an empty payload on the real
+        # handshake path), so an empty snapshot here is never treated as "the
+        # seller now has no marketplaces" — it is rejected outright rather
+        # than risk deactivating every previously-known marketplace on
+        # what is far more likely a transport/parsing artifact than a real
+        # business fact.
+        #
+        # A snapshot mixing valid and malformed entries is rejected in full,
+        # not partially reconciled: a malformed entry is not evidence the
+        # seller left that marketplace, and Amazon's contract gives no basis
+        # for treating a partially-unusable response as a complete,
+        # authoritative absence signal for deactivation purposes.
+        snapshot_failure_reason: ReconciliationFailureReason | None = None
+        if records_received == 0:
+            snapshot_failure_reason = "empty_snapshot"
+        elif rejected_count > 0:
+            snapshot_failure_reason = "malformed_participations"
 
         run_id = self._start_run(
             organization_id=organization_id,
@@ -121,8 +145,32 @@ class AmazonMarketplaceReconciliationService:
             return ReconciliationOutcome(
                 succeeded=False,
                 reason="database_failure",
-                records_received=len(participations),
-                records_rejected=len(participations),
+                records_received=records_received,
+                records_rejected=records_received,
+            )
+
+        if snapshot_failure_reason is not None:
+            logger.info(
+                "amazon marketplace reconciliation rejected reason=%s connection_id=%s",
+                snapshot_failure_reason,
+                connection_id,
+            )
+            self._complete_run(
+                organization_id=organization_id,
+                run_id=run_id,
+                connection_id=connection_id,
+                succeeded=False,
+                records_received=records_received,
+                records_accepted=0,
+                records_rejected=records_received,
+                failure_reason=snapshot_failure_reason,
+            )
+            return ReconciliationOutcome(
+                succeeded=False,
+                reason=snapshot_failure_reason,
+                ingestion_run_id=run_id,
+                records_received=records_received,
+                records_rejected=records_received,
             )
 
         seller_account_id, failure_reason = self._reconcile_canonical_rows(
@@ -138,9 +186,9 @@ class AmazonMarketplaceReconciliationService:
             run_id=run_id,
             connection_id=connection_id,
             succeeded=failure_reason is None,
-            records_received=len(participations),
+            records_received=records_received,
             records_accepted=len(valid_participations) if failure_reason is None else 0,
-            records_rejected=rejected_count if failure_reason is None else len(participations),
+            records_rejected=0 if failure_reason is None else records_received,
             failure_reason=failure_reason,
         )
 
@@ -149,17 +197,17 @@ class AmazonMarketplaceReconciliationService:
                 succeeded=False,
                 reason=failure_reason,
                 ingestion_run_id=run_id,
-                records_received=len(participations),
-                records_rejected=len(participations),
+                records_received=records_received,
+                records_rejected=records_received,
             )
 
         return ReconciliationOutcome(
             succeeded=True,
             seller_account_id=seller_account_id,
             ingestion_run_id=run_id,
-            records_received=len(participations),
+            records_received=records_received,
             records_accepted=len(valid_participations),
-            records_rejected=rejected_count,
+            records_rejected=0,
         )
 
     def _start_run(
