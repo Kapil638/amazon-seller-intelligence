@@ -1340,14 +1340,39 @@ class AmazonSellerAccountRepository:
             selling_partner_id=spid,
             display_store_name=display_store_name,
         )
-        self.session.add(row)
         try:
-            self.session.flush()
+            # A SAVEPOINT (`begin_nested()`), not a full `session.rollback()`.
+            # On PostgreSQL, an uncaught error inside a transaction leaves
+            # the *whole* transaction aborted — no further statement can run
+            # on it until a rollback. A savepoint isolates that failure to
+            # just this attempted INSERT: on IntegrityError, SQLAlchemy
+            # issues `ROLLBACK TO SAVEPOINT`, undoing only this insert and
+            # leaving the outer transaction (and anything the caller already
+            # did on this same session before calling this method) fully
+            # intact and usable for the re-read and reconciliation below.
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
         except IntegrityError as exc:
-            self.session.rollback()
-            raise SellerAccountOwnershipConflict(
-                "This Amazon seller account is already connected to another organization."
-            ) from exc
+            # The unique-constraint loser here could be this same
+            # organization's own concurrent reconciliation attempt racing
+            # itself (benign — the two initial SELECTs above both saw no
+            # row yet), not necessarily a different organization. Re-read
+            # the now-committed winner and classify by its actual owner
+            # rather than assuming every insert failure is a genuine
+            # cross-organization conflict.
+            winner = self.session.scalars(
+                select(AmazonSellerAccount).where(AmazonSellerAccount.selling_partner_id == spid)
+            ).first()
+            if winner is None or winner.organization_id != organization_id:
+                raise SellerAccountOwnershipConflict(
+                    "This Amazon seller account is already connected to another organization."
+                ) from exc
+            if display_store_name:
+                winner.display_store_name = display_store_name
+            winner.last_seen_at = datetime.now(UTC)
+            self.session.flush()
+            return winner
         return row
 
     def get_by_id(self, organization_id: UUID, seller_account_id: UUID) -> AmazonSellerAccount | None:
@@ -1456,8 +1481,43 @@ class AmazonMarketplaceParticipationRepository:
             store_name=store_name,
             is_active=True,
         )
-        self.session.add(row)
-        self.session.flush()
+        try:
+            # SAVEPOINT, not a full rollback — see AmazonSellerAccountRepository
+            # .create_or_reconcile for why: isolates a failed INSERT without
+            # aborting the outer transaction this method's caller (the
+            # reconciliation service, upserting many participations in one
+            # transaction) is still in the middle of.
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            # Same principle as the seller-account race: the loser of this
+            # unique-constraint race (seller_account_id, marketplace_id) is
+            # necessarily this same seller account's own concurrent
+            # reconciliation attempt — participations are never shared
+            # across organizations — so reconcile into the winner instead
+            # of surfacing a spurious failure.
+            winner = self.session.scalars(
+                select(AmazonMarketplaceParticipation).where(
+                    AmazonMarketplaceParticipation.seller_account_id == seller_account_id,
+                    AmazonMarketplaceParticipation.marketplace_id == marketplace_id,
+                )
+            ).one()
+            winner.name = name or winner.name
+            winner.country_code = country_code or winner.country_code
+            winner.default_currency_code = default_currency_code or winner.default_currency_code
+            winner.default_language_code = default_language_code or winner.default_language_code
+            winner.domain_name = domain_name or winner.domain_name
+            winner.store_name = store_name or winner.store_name
+            winner.region = region
+            winner.is_participating = is_participating
+            winner.has_suspended_listings = has_suspended_listings
+            winner.is_active = True
+            winner.last_seen_at = now
+            if connection_id is not None:
+                winner.connection_id = connection_id
+            self.session.flush()
+            return winner
         return row
 
     def list_for_seller_account(

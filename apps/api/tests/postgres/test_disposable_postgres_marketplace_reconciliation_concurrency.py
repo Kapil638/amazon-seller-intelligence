@@ -209,11 +209,12 @@ def _reconcile(
 
 
 def test_concurrent_same_seller_reconciliation_produces_no_duplicate_rows(disposable_engine) -> None:
-    """Two overlapping reconcile() calls for the same seller must never
-    produce two seller-account rows or two participation rows for the same
-    marketplace — the read-then-upsert repository methods can race, and any
-    loser must fail cleanly into `database_failure` rather than raising an
-    unhandled exception or corrupting state.
+    """Two overlapping reconcile() calls for the SAME organization and SAME
+    seller must both fully succeed — the SAVEPOINT-based recovery in
+    `AmazonSellerAccountRepository`/`AmazonMarketplaceParticipationRepository
+    .create_or_reconcile()` means the loser of either unique-constraint race
+    reconciles into the winner's row rather than surfacing `database_failure`
+    or `ownership_conflict`. Both ingestion runs must record `succeeded`.
     """
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
@@ -249,9 +250,11 @@ def test_concurrent_same_seller_reconciliation_produces_no_duplicate_rows(dispos
         assert not any(thread.is_alive() for thread in threads), "a worker thread did not finish in time"
         assert errors == [], f"worker thread(s) raised: {errors!r}"
         assert len(outcomes) == 2
-        # Whichever thread(s) failed must have failed cleanly, never crashed the process.
+        # Benign same-organization contention must never surface as a
+        # failure of any kind — both attempts converge on the same winner.
         for outcome in outcomes:
-            assert outcome.succeeded or outcome.reason == "database_failure"
+            assert outcome.succeeded, f"same-org reconciliation unexpectedly failed: {outcome}"
+            assert outcome.reason is None
 
         with Session(disposable_engine) as session:
             accounts = AmazonSellerAccountRepository(session).list_for_org(org_id)
@@ -264,6 +267,14 @@ def test_concurrent_same_seller_reconciliation_produces_no_duplicate_rows(dispos
                 {"seller_account_id": str(accounts[0].id)},
             ).fetchall()
             assert len(rows) == 1
+            run_statuses = session.execute(
+                text(
+                    "SELECT status FROM amazon_ingestion_runs WHERE organization_id = :organization_id"
+                ),
+                {"organization_id": str(org_id)},
+            ).scalars().all()
+            assert len(run_statuses) == 2
+            assert all(status == "succeeded" for status in run_statuses)
 
 
 def test_concurrent_cross_org_ownership_conflict_has_exactly_one_winner(disposable_engine) -> None:
