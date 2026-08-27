@@ -180,7 +180,13 @@ class AmazonMarketplaceReconciliationService:
                     connection_id=connection_id,
                 )
                 return run.id
-        except SQLAlchemyError:
+        except (TypeError, SQLAlchemyError):
+            # `start()` raises `TypeError` for an ambiguous/cross-organization
+            # connection binding, not a `SQLAlchemyError` — this must degrade
+            # to the same sanitized `database_failure` outcome as an actual
+            # database error, never propagate as an unhandled exception out
+            # of a `POST /connection/test` or OAuth-callback request. No run
+            # row exists in either case, so there is nothing to mark failed.
             logger.warning(
                 "amazon marketplace reconciliation failed reason=database_failure phase=start_run "
                 "connection_id=%s",

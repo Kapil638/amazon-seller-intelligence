@@ -1531,14 +1531,20 @@ class AmazonIngestionRunRepository:
         request_correlation_id: str | None = None,
     ) -> AmazonIngestionRun:
         if seller_account_id is not None:
-            seller_account = self.session.get(AmazonSellerAccount, seller_account_id)
-            if seller_account is None or seller_account.organization_id != organization_id:
+            # Org-scoped lookup, not a Python-level equality against a
+            # separately-loaded row: the WHERE clause enforces ownership in
+            # SQL itself, so this can never be defeated by a stale identity-
+            # map entry or by comparing values of differing representations.
+            seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+                organization_id, seller_account_id
+            )
+            if seller_account is None:
                 raise TypeError(
                     "Amazon ingestion run cannot bind a seller account from another organization."
                 )
         if connection_id is not None:
-            connection = self.session.get(AmazonConnection, connection_id)
-            if connection is None or connection.organization_id != organization_id:
+            connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+            if connection is None:
                 raise TypeError("Amazon ingestion run cannot bind a connection from another organization.")
         row = AmazonIngestionRun(
             organization_id=organization_id,
