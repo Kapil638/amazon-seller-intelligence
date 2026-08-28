@@ -1,0 +1,33 @@
+{
+  "numberOfResults": 5,
+  "pagination": {
+    "previousToken": "ASI-FIXTURE-PAGE-TOKEN-2"
+  },
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0104",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN24",
+          "productType": "TOY",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Toy Item 5",
+          "createdDate": "2026-03-05T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "22.49" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 3 }
+      ],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "TOY" }
+      ]
+    }
+  ]
+}

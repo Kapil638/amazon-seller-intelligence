@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0009_amazon_seller_identity (head)" /tmp/heads.txt
+          grep -q "0010_amazon_seller_listings (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0009_amazon_seller_identity" /tmp/current.txt
+          grep -q "0010_amazon_seller_listings" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
@@ -92,6 +92,44 @@ jobs:
       - name: Confirm final revision
         working-directory: apps/api
         run: uv run alembic current | grep -q "0009_amazon_seller_identity"
+
+  existing-database-upgrade-0010:
+    name: Existing PostgreSQL (0009) — upgrade to 0010
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0010
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0010
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0009 (simulates an existing pre-12B.3B database)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0009_amazon_seller_identity
+      - name: alembic upgrade to 0010 (the real 12B.3B upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0010_amazon_seller_listings
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0010_amazon_seller_listings"
 
   postgres-identity-concurrency:
     name: PostgreSQL — OAuth identity concurrency validation

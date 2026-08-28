@@ -43,6 +43,18 @@ read both docstrings below before touching either:
 
 Neither test in this file ever touches the configured `DATABASE_URL`: it is
 overridden for the duration of each test and restored in a `finally` block.
+
+12B.3B note: migration `0010_amazon_seller_listings` is now head. It adds
+`amazon_seller_listings`, which uses the same PostgreSQL-only `JSONB` type,
+so it inherits the identical SQLite limitation described above and is not
+independently isolation-tested here — `0010` also `ADD COLUMN`s onto the
+already-existing `amazon_ingestion_runs` table (unlike `0009`, which only
+created brand-new tables), which would require reconstructing an exact
+pre-0010 schema by hand to bootstrap correctly, for a dialect that cannot
+run the migration end-to-end regardless. See
+`tests/postgres/test_disposable_postgres_seller_listings_migration.py` and
+`tests/test_migration_chain_matches_orm_metadata.py` for 0010's real
+coverage.
 """
 
 from __future__ import annotations
@@ -80,10 +92,10 @@ def test_alembic_has_a_single_head() -> None:
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0009_amazon_seller_identity"
-    revision = script.get_revision("0009_amazon_seller_identity")
+    assert heads[0] == "0010_amazon_seller_listings"
+    revision = script.get_revision("0010_amazon_seller_listings")
     assert revision is not None
-    assert revision.down_revision == "0008_amazon_oauth_states"
+    assert revision.down_revision == "0009_amazon_seller_identity"
 
 
 def test_migration_0009_upgrades_and_downgrades_in_isolation_from_0008(tmp_path) -> None:

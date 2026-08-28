@@ -1,0 +1,50 @@
+{
+  "numberOfResults": 2,
+  "pagination": {},
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0600-VALID",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN60",
+          "productType": "OFFICE_PRODUCT",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Valid Item Alongside Malformed Item",
+          "createdDate": "2026-04-01T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z"
+        }
+      ],
+      "offers": [
+        { "marketplaceId": "ATVPDKIKX0DER", "offerType": "B2C", "price": { "currencyCode": "USD", "amount": "6.99" } }
+      ],
+      "fulfillmentAvailability": [
+        { "fulfillmentChannelCode": "DEFAULT", "quantity": 25 }
+      ],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "OFFICE_PRODUCT" }
+      ]
+    },
+    {
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN61",
+          "productType": "OFFICE_PRODUCT",
+          "status": [],
+          "itemName": "ASI Test Malformed Item (missing required sku field)",
+          "createdDate": "2026-04-01T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z"
+        }
+      ],
+      "offers": [],
+      "fulfillmentAvailability": [],
+      "issues": [],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "OFFICE_PRODUCT" }
+      ]
+    }
+  ]
+}

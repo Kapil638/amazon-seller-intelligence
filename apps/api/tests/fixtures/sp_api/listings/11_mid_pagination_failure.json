@@ -1,0 +1,16 @@
+{
+  "_fixture_note": "Represents a failure fetching page 2 of 3, after page 1 (03_pagination_page_1_of_3.json) already succeeded and returned a nextToken. Use alongside 03_pagination_page_1_of_3.json to exercise partial-run/resume-vs-restart handling. Per product decision, the first version is not resumable: a mid-pagination failure must restart from page 1 on the next attempt, and the run for this attempt must be recorded as failed/partial with truthful received/accepted counts reflecting only page 1's items.",
+  "http_status": 500,
+  "response_headers": {
+    "x-amzn-RequestId": "ASI-FIXTURE-REQUEST-ID-500"
+  },
+  "response_body": {
+    "errors": [
+      {
+        "code": "InternalFailure",
+        "message": "An unexpected condition occurred that prevented the server from fulfilling the request.",
+        "details": ""
+      }
+    ]
+  }
+}

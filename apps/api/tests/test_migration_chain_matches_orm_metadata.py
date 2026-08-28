@@ -100,8 +100,9 @@ def test_full_migration_chain_compiles_for_postgresql_with_no_collisions() -> No
     assert "amazon_seller_accounts" in tables
     assert "amazon_marketplace_participations" in tables
     assert "amazon_ingestion_runs" in tables
-    # 24 application tables + alembic's own bookkeeping table.
-    assert len(tables) == 25, sorted(tables)
+    assert "amazon_seller_listings" in tables
+    # 25 application tables + alembic's own bookkeeping table.
+    assert len(tables) == 26, sorted(tables)
 
 
 def test_migration_chain_table_set_matches_orm_metadata() -> None:

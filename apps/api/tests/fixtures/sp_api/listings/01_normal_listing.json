@@ -1,0 +1,49 @@
+{
+  "numberOfResults": 1,
+  "pagination": {},
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0001",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "asin": "B0TESTASIN01",
+          "productType": "LUGGAGE",
+          "conditionType": "new_new",
+          "status": ["BUYABLE", "DISCOVERABLE"],
+          "itemName": "ASI Test Carry-On Suitcase, Synthetic Fixture Item",
+          "createdDate": "2026-01-15T00:00:00Z",
+          "lastUpdatedDate": "2026-08-20T00:00:00Z",
+          "mainImage": {
+            "link": "https://example.com/fixtures/asi-test-sku-0001.png",
+            "height": 500,
+            "width": 500
+          }
+        }
+      ],
+      "offers": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "offerType": "B2C",
+          "price": {
+            "currencyCode": "USD",
+            "amount": "89.99"
+          }
+        }
+      ],
+      "fulfillmentAvailability": [
+        {
+          "fulfillmentChannelCode": "DEFAULT",
+          "quantity": 42
+        }
+      ],
+      "issues": [],
+      "productTypes": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "productType": "LUGGAGE"
+        }
+      ]
+    }
+  ]
+}

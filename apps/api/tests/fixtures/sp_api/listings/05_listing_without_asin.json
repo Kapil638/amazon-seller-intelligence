@@ -1,0 +1,33 @@
+{
+  "numberOfResults": 1,
+  "pagination": {},
+  "items": [
+    {
+      "sku": "ASI-TEST-SKU-0200-DRAFT",
+      "summaries": [
+        {
+          "marketplaceId": "ATVPDKIKX0DER",
+          "productType": "HOME",
+          "status": [],
+          "itemName": "ASI Test Draft Listing (no ASIN yet)",
+          "createdDate": "2026-08-01T00:00:00Z",
+          "lastUpdatedDate": "2026-08-01T00:00:00Z"
+        }
+      ],
+      "offers": [],
+      "fulfillmentAvailability": [],
+      "issues": [
+        {
+          "code": "90210",
+          "message": "This listing has not been assigned an ASIN yet.",
+          "severity": "WARNING",
+          "categories": ["MISSING_ATTRIBUTE"],
+          "marketplaceIds": ["ATVPDKIKX0DER"]
+        }
+      ],
+      "productTypes": [
+        { "marketplaceId": "ATVPDKIKX0DER", "productType": "HOME" }
+      ]
+    }
+  ]
+}
