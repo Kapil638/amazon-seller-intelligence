@@ -99,12 +99,21 @@ def disposable_engine():
         engine.dispose()
 
 
-# 1-2-3: empty PostgreSQL -> alembic upgrade head -> revision is 0009, single head.
+# 1-2-3: empty PostgreSQL -> alembic upgrade to the pinned 0009 revision ->
+# revision is exactly 0009. Deliberately pinned, not "head": this test's
+# stated purpose is the 0009 boundary specifically (12B.2A), which must stay
+# provable in isolation regardless of how many later migrations (0010+)
+# become head. A fresh database's upgrade to the CURRENT head is proven
+# separately and is expected to keep advancing — see
+# test_disposable_postgres_seller_listings_migration.py::
+# test_empty_postgres_upgrades_cleanly_to_0010 (12B.3B) — and the repo-wide
+# single-head invariant is proven by
+# test_amazon_seller_identity_schema.py::test_alembic_has_a_single_head.
 def test_empty_postgres_upgrades_cleanly_to_0009(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0009_amazon_seller_identity")
 
     with disposable_engine.connect() as conn:
         current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
