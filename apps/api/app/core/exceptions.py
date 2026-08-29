@@ -284,3 +284,17 @@ class SpApiRequestFailedError(Exception):
 class SpApiParseFailedError(Exception):
     def __init__(self, message: str = "Amazon SP-API response could not be parsed.") -> None:
         super().__init__(message)
+
+
+class SpApiInvalidRequestError(Exception):
+    """A non-transient 4xx response (not authentication, not rate limiting).
+
+    Distinct from `SpApiRequestFailedError`, which covers transient failures
+    (5xx, timeouts, transport errors) that were retried and ultimately
+    exhausted. This one is never retried: repeating an identical request
+    that Amazon rejected as malformed/unsupported (400, 404, 413, 415, ...)
+    will not produce a different outcome.
+    """
+
+    def __init__(self, message: str = "Amazon SP-API rejected the request.") -> None:
+        super().__init__(message)
