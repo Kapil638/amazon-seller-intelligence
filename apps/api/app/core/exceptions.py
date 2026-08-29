@@ -286,6 +286,31 @@ class SpApiParseFailedError(Exception):
         super().__init__(message)
 
 
+class AmazonListingsParticipationNotFoundError(Exception):
+    """A marketplace participation could not be resolved for this request.
+
+    Deliberately identical whether the id is missing, malformed-but-valid-
+    UUID, belongs to another organization, or is simply unknown — the
+    caller must never be able to distinguish "doesn't exist" from
+    "belongs to someone else" from this error alone. Only echoes the
+    identifier the caller already supplied, never anything internal.
+    """
+
+    def __init__(self, marketplace_participation_id: str) -> None:
+        self.marketplace_participation_id = marketplace_participation_id
+        super().__init__(f"Marketplace participation {marketplace_participation_id} was not found.")
+
+
+class AmazonSellerListingNotFoundError(Exception):
+    """A listing could not be resolved within its (already-validated)
+    marketplace participation — same sanitized shape for missing, foreign,
+    or cross-participation listing ids."""
+
+    def __init__(self, listing_id: str) -> None:
+        self.listing_id = listing_id
+        super().__init__(f"Listing {listing_id} was not found.")
+
+
 class SpApiInvalidRequestError(Exception):
     """A non-transient 4xx response (not authentication, not rate limiting).
 
