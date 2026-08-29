@@ -44,6 +44,19 @@ def ensure_organization_id(session: Session) -> UUID:
     return get_settings().default_organization_id
 
 
+# 12B.3E — LIKE/ILIKE wildcard escaping for user-entered search terms.
+# `%` and `_` are SQL wildcards; a literal search for e.g. "SKU_100" or a
+# 10%-off promo SKU containing "%" must not silently widen into a
+# catalog-wide match. `_LIKE_ESCAPE_CHAR` must itself be escaped first, or
+# an escape character already present in the user's term would be
+# misread as introducing an escape sequence instead of matching itself.
+_LIKE_ESCAPE_CHAR = "\\"
+
+
+def _escape_like_term(term: str, escape_char: str = _LIKE_ESCAPE_CHAR) -> str:
+    return term.replace(escape_char, escape_char * 2).replace("%", escape_char + "%").replace("_", escape_char + "_")
+
+
 class ProductSnapshotRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -1732,6 +1745,46 @@ class AmazonIngestionRunRepository:
         )
         return list(self.session.scalars(statement).all())
 
+    def get_latest_listings_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """The single most recent `run_type='listings'` run for this
+        organization-scoped participation, regardless of status — 12B.3E
+        read-side evidence. Read-only: never claims, heartbeats, or
+        completes anything. Deliberately excludes every other `run_type`
+        (e.g. `marketplace_participations`) so a caller can never mistake
+        an unrelated synchronization for Listings synchronization
+        evidence."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
+    def get_latest_successful_listings_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """The most recent *succeeded* `run_type='listings'` run — may be
+        an earlier run than `get_latest_listings_run` if the most recent
+        attempt failed. Used only for "last known-good data" evidence, not
+        for the current run's own status."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "succeeded",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
     def claim_listings_run(
         self,
         *,
@@ -1961,6 +2014,28 @@ class AmazonIngestionRunRepository:
         )
         self.session.flush()
         return result.rowcount == 1
+
+
+@dataclass(frozen=True)
+class ListingSummaryCounts:
+    """Plain aggregate counts for one marketplace participation's listings.
+    12B.3E read API. Never carries an identifier — purely counts."""
+
+    total: int
+    active: int
+    inactive: int
+    buyable: int
+    not_buyable: int
+    discoverable: int
+    not_discoverable: int
+    with_issues: int
+    without_issues: int
+    severity_error: int
+    severity_warning: int
+    severity_info: int
+    with_asin: int
+    with_price: int
+    with_fulfillment_availability: int
 
 
 class AmazonSellerListingRepository:
@@ -2254,6 +2329,251 @@ class AmazonSellerListingRepository:
         if deactivated:
             self.session.flush()
         return deactivated
+
+    # --- 12B.3E: read-only, organization-scoped listings access ------------
+    #
+    # Distinct from `_require_participation_in_organization` (the write
+    # boundary above, which raises `TypeError` for a caller bug): a read
+    # miss here is an ordinary, expected "not found" outcome — the caller
+    # is typically an HTTP request for a resource that may legitimately
+    # not exist or not belong to this organization. These methods return
+    # `None` instead, and the service layer above turns that into a
+    # sanitized domain not-found error. Foreign and nonexistent
+    # participation ids are indistinguishable: both simply produce `None`
+    # from the same organization-scoped lookup.
+
+    _SORT_COLUMNS: dict[str, Any] = {
+        "last_seen_at": AmazonSellerListing.last_seen_at,
+        "first_seen_at": AmazonSellerListing.first_seen_at,
+        "seller_sku": AmazonSellerListing.seller_sku,
+        "asin": AmazonSellerListing.asin,
+        "issue_count": AmazonSellerListing.issue_count,
+        "price_amount": AmazonSellerListing.price_amount,
+    }
+
+    def _get_owned_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonMarketplaceParticipation | None:
+        return AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+
+    def get_summary_counts(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> "ListingSummaryCounts | None":
+        """One aggregate SQL query for every plain-column count, plus one
+        lightweight single-column scan for `fulfillment_availability`
+        "present" (non-empty JSON array). Returns `None` if the
+        participation does not belong to `organization_id`.
+
+        The single-column scan (not a full-row load, not N+1 — one query
+        selecting only `fulfillment_availability` for every row in this
+        participation) is a deliberate choice over SQL-side JSON-length
+        functions: PostgreSQL's `jsonb_array_length` and SQLite's JSON1
+        `json_array_length` are not the same callable name, and
+        SQLAlchemy has no dialect-agnostic "JSON array is non-empty"
+        expression for a column typed `JSON().with_variant(JSONB(),
+        "postgresql")` — introducing dialect-specific raw SQL here purely
+        for aggregation elegance was judged not worth the fragility.
+
+        Scale bound: 12B.3D's ingestion ceiling
+        (`LISTINGS_RESULT_CEILING = 1000` in `listings_ingestion.py`) caps
+        every *individual* successful snapshot at <=1000 accepted items —
+        `reconcile_snapshot` is only ever called once, atomically, after a
+        fully-accepted traversal, so no single sync can ever upsert more
+        than that many rows. This does **not** by itself cap this table's
+        *cumulative* row count forever: deactivated rows are kept, not
+        deleted (see `_deactivate_missing`), so a seller who repeatedly
+        lists and delists many distinct SKUs across many sync cycles could
+        in principle accumulate more total rows than any one snapshot ever
+        contained. The actual practical bound this method relies on is the
+        realistic seller-catalog scale already assumed by
+        `AmazonSellerListing`'s own schema docstring (12B.3B): "hundreds to
+        low thousands" of distinct SKUs per seller over time, not a
+        mathematical guarantee from the ingestion ceiling. If a
+        participation's row count is ever observed growing far beyond that
+        (e.g. from unusually high SKU churn), this scan — and the
+        equivalent full-catalog page loaded by `list_page`'s default
+        request — should be revisited before it, not after.
+        """
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+
+        row = self.session.execute(
+            select(
+                func.count().label("total"),
+                func.count().filter(AmazonSellerListing.is_active.is_(True)).label("active"),
+                func.count().filter(AmazonSellerListing.is_active.is_(False)).label("inactive"),
+                func.count().filter(AmazonSellerListing.is_buyable.is_(True)).label("buyable"),
+                func.count().filter(AmazonSellerListing.is_buyable.is_(False)).label("not_buyable"),
+                func.count().filter(AmazonSellerListing.is_discoverable.is_(True)).label("discoverable"),
+                func.count().filter(AmazonSellerListing.is_discoverable.is_(False)).label("not_discoverable"),
+                func.count().filter(AmazonSellerListing.issue_count > 0).label("with_issues"),
+                func.count().filter(AmazonSellerListing.issue_count == 0).label("without_issues"),
+                func.count().filter(AmazonSellerListing.highest_issue_severity == "ERROR").label("severity_error"),
+                func.count().filter(AmazonSellerListing.highest_issue_severity == "WARNING").label(
+                    "severity_warning"
+                ),
+                func.count().filter(AmazonSellerListing.highest_issue_severity == "INFO").label("severity_info"),
+                func.count().filter(AmazonSellerListing.asin.is_not(None)).label("with_asin"),
+                func.count().filter(AmazonSellerListing.price_amount.is_not(None)).label("with_price"),
+            ).where(AmazonSellerListing.marketplace_participation_id == marketplace_participation_id)
+        ).one()
+
+        fulfillment_present = 0
+        for (fulfillment_availability,) in self.session.execute(
+            select(AmazonSellerListing.fulfillment_availability).where(
+                AmazonSellerListing.marketplace_participation_id == marketplace_participation_id
+            )
+        ):
+            if fulfillment_availability:
+                fulfillment_present += 1
+
+        return ListingSummaryCounts(
+            total=row.total,
+            active=row.active,
+            inactive=row.inactive,
+            buyable=row.buyable,
+            not_buyable=row.not_buyable,
+            discoverable=row.discoverable,
+            not_discoverable=row.not_discoverable,
+            with_issues=row.with_issues,
+            without_issues=row.without_issues,
+            severity_error=row.severity_error,
+            severity_warning=row.severity_warning,
+            severity_info=row.severity_info,
+            with_asin=row.with_asin,
+            with_price=row.with_price,
+            with_fulfillment_availability=fulfillment_present,
+        )
+
+    def list_page(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        search: str | None = None,
+        is_active: bool | None = None,
+        is_buyable: bool | None = None,
+        is_discoverable: bool | None = None,
+        has_issues: bool | None = None,
+        highest_issue_severity: str | None = None,
+        product_type: str | None = None,
+        sort_by: str = "last_seen_at",
+        sort_dir: str = "desc",
+        offset: int = 0,
+        limit: int = 25,
+    ) -> "tuple[list[AmazonSellerListing], int] | None":
+        """Validated, filtered, deterministically-ordered listings page,
+        scoped to one organization-owned marketplace participation.
+        Returns `None` if the participation does not belong to
+        `organization_id`.
+
+        `sort_by`/`sort_dir` are validated against an explicit allowlist
+        (`_SORT_COLUMNS`, `{"asc", "desc"}`) and raise `ValueError` if
+        not recognized. The API layer's `Literal[...]` request typing is
+        the primary rejection point (this project's `RequestValidationError`
+        handler returns 400 before this method is ever called — see
+        `app/main.py`); this is defense in depth, not the only check.
+
+        Ordering policy (identical on SQLite and PostgreSQL, verified by
+        direct compilation): the requested sort column, `NULLS LAST`
+        regardless of direction, then `id ASC` as a final, always-present
+        tie-breaker. Two nullable sort fields (`asin`, `price_amount`)
+        would otherwise sort differently across dialects — PostgreSQL
+        defaults to NULLS LAST for ASC / NULLS FIRST for DESC, SQLite
+        always puts NULLs first — so the `NULLS LAST` placement is always
+        explicit here, never left to either dialect's default. The `id`
+        tie-breaker is applied *after* NULLS LAST placement, so multiple
+        NULL rows (or multiple rows sharing the same non-null value) still
+        sort deterministically among themselves, and identical requests
+        return identical pages across repeated calls and across page
+        boundaries.
+
+        `search` matches seller SKU or ASIN, case-insensitively, as a
+        literal substring: `%`, `_`, and the escape character itself are
+        escaped via `_escape_like_term` before being wrapped in wildcards,
+        so a search for e.g. `"SKU_100"` or `"10%OFF"` never widens into
+        an unintended catalog-wide match — those characters are never
+        treated as SQL wildcards. A whitespace-only search is treated
+        identically to no search at all.
+        """
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+        if sort_by not in self._SORT_COLUMNS:
+            raise ValueError(f"Unsupported listings sort field: {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"Unsupported listings sort direction: {sort_dir!r}")
+
+        filters = [AmazonSellerListing.marketplace_participation_id == marketplace_participation_id]
+        search = (search or "").strip()
+        if search:
+            term = f"%{_escape_like_term(search)}%"
+            filters.append(
+                or_(
+                    AmazonSellerListing.seller_sku.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                    AmazonSellerListing.asin.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                )
+            )
+        if is_active is not None:
+            filters.append(AmazonSellerListing.is_active.is_(is_active))
+        if is_buyable is not None:
+            filters.append(AmazonSellerListing.is_buyable.is_(is_buyable))
+        if is_discoverable is not None:
+            filters.append(AmazonSellerListing.is_discoverable.is_(is_discoverable))
+        if has_issues is not None:
+            filters.append(
+                AmazonSellerListing.issue_count > 0 if has_issues else AmazonSellerListing.issue_count == 0
+            )
+        if highest_issue_severity is not None:
+            filters.append(AmazonSellerListing.highest_issue_severity == highest_issue_severity)
+        if product_type is not None:
+            filters.append(AmazonSellerListing.product_type == product_type)
+
+        total = self.session.scalar(select(func.count()).select_from(AmazonSellerListing).where(*filters)) or 0
+
+        sort_column = self._SORT_COLUMNS[sort_by]
+        # Explicit NULLS LAST for both directions: `asin` and `price_amount`
+        # are nullable sort fields, and SQLite/PostgreSQL disagree on where
+        # NULL sorts by default (PostgreSQL: NULLS LAST for ASC, NULLS
+        # FIRST for DESC; SQLite: NULLS FIRST always). `nulls_last()`
+        # compiles to the identical `NULLS LAST` clause on both dialects
+        # (verified directly), so ordering is deterministic and identical
+        # in local SQLite tests and production PostgreSQL regardless of
+        # sort direction. `id ASC` remains the final tie-breaker, applied
+        # after the NULLS LAST placement, so multiple NULL rows (or
+        # multiple rows sharing the same non-null value) still sort
+        # deterministically among themselves.
+        order = (sort_column.desc() if sort_dir == "desc" else sort_column.asc()).nulls_last()
+        statement = (
+            select(AmazonSellerListing)
+            .where(*filters)
+            .order_by(order, AmazonSellerListing.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = list(self.session.scalars(statement).all())
+        return rows, int(total)
+
+    def get_detail(
+        self, organization_id: UUID, marketplace_participation_id: UUID, listing_id: UUID
+    ) -> AmazonSellerListing | None:
+        """One listing, scoped through both the organization-owned
+        participation and that exact participation's own id. A listing
+        cannot be retrieved by id alone, and cannot be retrieved through
+        a *different* (even organization-owned) participation than the
+        one it actually belongs to — the `marketplace_participation_id`
+        equality check below is not redundant with `_get_owned_
+        participation`, it is the second half of the same boundary.
+        """
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+        return self.session.scalars(
+            select(AmazonSellerListing).where(
+                AmazonSellerListing.id == listing_id,
+                AmazonSellerListing.marketplace_participation_id == marketplace_participation_id,
+            )
+        ).first()
 
 
 def file_sha256(data: bytes) -> str:
