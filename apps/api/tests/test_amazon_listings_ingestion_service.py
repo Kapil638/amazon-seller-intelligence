@@ -4,6 +4,27 @@ HTTP behavior is already covered by 12B.3C's own test suite). Uses the
 shared, per-test-isolated SQLite database (`conftest.py`'s autouse
 `reset_persistence()` fixture), matching `test_amazon_marketplace_
 reconciliation.py`'s established pattern.
+
+Credential hermeticity (CI remediation): `AmazonListingsIngestionService.
+_client()` calls `oauth_application_credentials(cfg)` *before* the injected
+`listings_client_factory` is ever invoked — a fake client factory alone does
+not skip that check. Every test therefore builds its `Settings` through
+`_test_settings()` below, which supplies obviously-synthetic LWA
+credentials and passes `_env_file=None` so this file never reads
+`apps/api/.env` or ambient process environment variables for those fields
+(explicit constructor kwargs already take precedence over both, but
+`_env_file=None` removes the dependency outright rather than merely
+out-prioritizing it). This is what makes the suite pass in a genuinely
+credential-free environment (e.g. CI) instead of only appearing to pass
+because a developer machine's real `.env` happened to supply production
+credentials. The real, non-test-injected credential path — a genuinely
+empty `Settings` instance, exactly like a clean production/CI environment
+with nothing configured — still fails closed with the existing sanitized
+`SpApiConfigurationError`: proven directly by
+`test_missing_application_credentials_fails_closed_through_the_real_client_path`
+below, and already proven at the shared `oauth_application_credentials()`
+level by `test_missing_application_credentials_and_redirect_uri` in
+`test_amazon_lwa_token_exchange.py` (same function, different caller).
 """
 
 from __future__ import annotations
@@ -18,8 +39,10 @@ from app.amazon.listings_client import ListingsPageRequest
 from app.amazon.listings_ingestion import AmazonListingsIngestionService
 from app.amazon.listings_models import Item, ListingsPage, ListingsPageProvenance
 from app.amazon.secrets import InvalidSecretReferenceError
+from app.core.config import Settings
 from app.core.exceptions import (
     SpApiAuthenticationError,
+    SpApiConfigurationError,
     SpApiParseFailedError,
     SpApiRequestFailedError,
 )
@@ -62,6 +85,24 @@ class _FakeListingsClient:
         return item
 
 
+def _test_settings(**overrides) -> Settings:
+    """Obviously-synthetic LWA application credentials for every test in
+    this file. `_env_file=None` plus an explicit value for every field
+    `oauth_application_credentials()` inspects means this never reads
+    `apps/api/.env` or any ambient `SP_API_*`/`SP_API_PRODUCTION_*`
+    process environment variable — construction is fully self-contained,
+    regardless of what a given machine (developer laptop or CI runner)
+    happens to have configured. Never a real credential."""
+    fields = dict(
+        sp_api_lwa_client_id=SecretStr("test-sandbox-lwa-client-id-DO-NOT-USE"),
+        sp_api_lwa_client_secret=SecretStr("test-sandbox-lwa-client-secret-DO-NOT-USE"),
+        sp_api_production_lwa_client_id=SecretStr("test-production-lwa-client-id-DO-NOT-USE"),
+        sp_api_production_lwa_client_secret=SecretStr("test-production-lwa-client-secret-DO-NOT-USE"),
+    )
+    fields.update(overrides)
+    return Settings(_env_file=None, **fields)
+
+
 def _service(script: list, **kwargs) -> tuple[AmazonListingsIngestionService, _FakeListingsClient]:
     client = _FakeListingsClient(script)
 
@@ -70,7 +111,9 @@ def _service(script: list, **kwargs) -> tuple[AmazonListingsIngestionService, _F
 
     resolver = kwargs.pop("resolver", None) or _FakeResolver()
     lease_owner_factory = kwargs.pop("lease_owner_factory", None) or (lambda: f"lease-{uuid4().hex[:8]}")
+    settings = kwargs.pop("settings", None) or _test_settings()
     service = AmazonListingsIngestionService(
+        settings=settings,
         resolver=resolver,
         listings_client_factory=factory,
         lease_owner_factory=lease_owner_factory,
@@ -253,6 +296,31 @@ async def test_missing_connection_fails_closed() -> None:
     service, client = _service([_page([_item("SKU-1")])])
     outcome = await service.sync(**{k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")})
     assert outcome.reason == "connection_unresolvable"
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_missing_application_credentials_fails_closed_through_the_real_client_path() -> None:
+    """The other boundary this file's credential-hermeticity fix must not
+    weaken: with a genuinely credential-empty `Settings` instance — matching
+    a clean production/CI environment with nothing configured, not the
+    synthetic-but-configured `_test_settings()` every other test in this
+    file uses — the service's real credential-resolution path still fails
+    closed with the existing sanitized `SpApiConfigurationError`, raised
+    from `_client()` before any client is ever constructed. The fake
+    resolver/client factory are still injected, so this makes zero live
+    network calls either way; `_env_file=None` keeps `empty_settings`
+    itself independent of `apps/api/.env` and ambient environment
+    variables, so this test's outcome cannot depend on what happens to be
+    configured on whatever machine runs it.
+    """
+    scope = _seed_scope()
+    empty_settings = Settings(_env_file=None)
+    service, client = _service([_page([_item("SKU-1")])], settings=empty_settings)
+    with pytest.raises(SpApiConfigurationError):
+        await service.sync(
+            **{k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")}
+        )
     assert client.requests == []
 
 
@@ -623,7 +691,10 @@ async def test_lease_lost_before_final_reconciliation_rolls_back_and_writes_no_l
         return client
 
     service = AmazonListingsIngestionService(
-        resolver=_FakeResolver(), listings_client_factory=factory, lease_owner_factory=lambda: "victim-owner"
+        settings=_test_settings(),
+        resolver=_FakeResolver(),
+        listings_client_factory=factory,
+        lease_owner_factory=lambda: "victim-owner",
     )
     outcome = await service.sync(**kwargs)
 
