@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, func, or_, select, update
+from sqlalchemy import DateTime, Select, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -35,6 +36,7 @@ from app.persistence.models import (
     AmazonMarketplaceParticipation,
     AmazonOAuthState,
     AmazonSellerAccount,
+    AmazonSellerListing,
 )
 
 
@@ -1520,6 +1522,16 @@ class AmazonMarketplaceParticipationRepository:
             return winner
         return row
 
+    def get_by_id(
+        self, organization_id: UUID, participation_id: UUID
+    ) -> AmazonMarketplaceParticipation | None:
+        return self.session.scalars(
+            select(AmazonMarketplaceParticipation).where(
+                AmazonMarketplaceParticipation.organization_id == organization_id,
+                AmazonMarketplaceParticipation.id == participation_id,
+            )
+        ).first()
+
     def list_for_seller_account(
         self, organization_id: UUID, seller_account_id: UUID
     ) -> list[AmazonMarketplaceParticipation]:
@@ -1568,6 +1580,16 @@ class AmazonMarketplaceParticipationRepository:
         return deactivated
 
 
+@dataclass(frozen=True)
+class ListingsRunClaim:
+    """Outcome of an atomic listings-run claim attempt. Never carries a
+    lease owner or any identifier beyond what the caller already supplied."""
+
+    claimed: bool
+    run_id: UUID | None = None
+    reason: str | None = None  # "already_running" when claimed is False
+
+
 class AmazonIngestionRunRepository:
     """Org- and seller-account-scoped ingestion-run lifecycle records.
 
@@ -1578,6 +1600,34 @@ class AmazonIngestionRunRepository:
 
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    def _lease_expiry_value(self, lease_duration_seconds: int):
+        """The future `lease_expires_at` value written at claim time or at
+        heartbeat renewal.
+
+        On PostgreSQL this is computed entirely from the *database's* own
+        clock — `func.now(type_=DateTime) + timedelta(...)` compiles to
+        `now() + make_interval(secs=>...)` — so the value actually written
+        shares the same time authority as every expiry/staleness
+        comparison in this class (`func.now()`): lease creation, renewal,
+        expiry comparison, and stale detection all read from one coherent
+        database clock, with no dependency on the calling application
+        worker's own clock. Verified directly: this expression executes
+        correctly against PostgreSQL but raises at *execution* time against
+        SQLite (confirmed empirically, not assumed — SQLite has no
+        portable `DATETIME + INTERVAL` construct for SQLAlchemy to compile
+        here).
+
+        SQLite is used only by this project's local/CI unit tests (never
+        production), so those tests fall back to an approximate
+        Python-computed value. That fallback is test-only scaffolding and
+        must never be read as evidence of the production invariant above —
+        the disposable-PostgreSQL tests exercise the real database-time
+        expression directly.
+        """
+        if self.session.get_bind().dialect.name == "postgresql":
+            return func.now(type_=DateTime) + timedelta(seconds=lease_duration_seconds)
+        return datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
 
     def start(
         self,
@@ -1632,6 +1682,8 @@ class AmazonIngestionRunRepository:
         retry_count: int = 0,
         failure_class: str | None = None,
         pagination_complete: bool = True,
+        pages_fetched: int = 0,
+        reported_total_results: int | None = None,
     ) -> AmazonIngestionRun | None:
         if status not in self._VALID_STATUSES:
             raise TypeError(f"Unsupported Amazon ingestion run status: {status!r}")
@@ -1646,6 +1698,8 @@ class AmazonIngestionRunRepository:
         row.retry_count = retry_count
         row.failure_class = failure_class
         row.pagination_complete = pagination_complete
+        row.pages_fetched = pages_fetched
+        row.reported_total_results = reported_total_results
         self.session.flush()
         return row
 
@@ -1677,6 +1731,529 @@ class AmazonIngestionRunRepository:
             .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
         )
         return list(self.session.scalars(statement).all())
+
+    def claim_listings_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        region: str,
+        environment: str,
+        connection_id: UUID | None,
+        lease_owner: str,
+        lease_duration_seconds: int,
+    ) -> ListingsRunClaim:
+        """Atomically claims the single-writer listings-ingestion scope for
+        `(seller_account_id, marketplace_participation_id)`.
+
+        Two statements, one transaction (whatever transaction the caller's
+        session is already in — this method never commits):
+
+        1. A conditional `UPDATE` terminalizes any *expired* `'started'`
+           listings run for this exact scope (`status='timed_out'`) before
+           attempting to claim. This is the stale-recovery step, and it is
+           safe under concurrency without any explicit locking: a second,
+           concurrent transaction attempting the same `UPDATE` on the same
+           row blocks on Postgres's normal row-level write lock until the
+           first commits, then re-evaluates its own `WHERE status=
+           'started'` against the now-committed data — which no longer
+           matches, so only one transaction ever actually performs the
+           reclaim.
+        2. An `INSERT` of the new `'started'` row, wrapped in a SAVEPOINT
+           (`begin_nested()`) so a collision — either an unexpired run
+           genuinely still active, or a concurrent claimant that already
+           committed a replacement for the scope this same stale row just
+           vacated — surfaces as a plain `ListingsRunClaim(claimed=False,
+           reason="already_running")`, isolated from the outer transaction
+           by the savepoint exactly like `AmazonSellerAccountRepository.
+           create_or_reconcile`'s pattern.
+
+        Raises `TypeError` for a missing/cross-organization seller account,
+        marketplace participation, participation-does-not-belong-to-this-
+        seller-account, or cross-organization connection — the same
+        fail-closed, no-foreign-identifier-disclosed pattern already used by
+        `start()` and the other repositories in this module.
+        """
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+            organization_id, seller_account_id
+        )
+        if seller_account is None:
+            raise TypeError(
+                "Amazon listings run cannot bind a seller account from another organization."
+            )
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon listings run cannot bind a marketplace participation from another organization."
+            )
+        if participation.seller_account_id != seller_account_id:
+            raise TypeError(
+                "Amazon listings run marketplace participation does not belong to the given seller account."
+            )
+        if connection_id is not None:
+            connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+            if connection is None:
+                raise TypeError("Amazon listings run cannot bind a connection from another organization.")
+
+        # Database time, not `datetime.now(UTC)`, for the staleness
+        # comparison: comparing a row's `lease_expires_at` against the
+        # DATABASE server's clock means every worker agrees on the same
+        # authoritative "now" regardless of its own local clock skew. The
+        # NEW row's `lease_expires_at` a few lines below is likewise
+        # computed from database time on PostgreSQL via
+        # `_lease_expiry_value` — see that method's docstring for why the
+        # value written and the value later compared against share one
+        # coherent clock authority.
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                # Truthful terminal record: an abandoned run never actually
+                # reached a confirmed natural end of pagination, regardless
+                # of what the column's insert-time default says.
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        row = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            seller_account_id=seller_account_id,
+            marketplace_participation_id=marketplace_participation_id,
+            run_type="listings",
+            domain="listings_items",
+            status="started",
+            region=region,
+            environment=environment,
+            lease_owner=lease_owner,
+            lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            return ListingsRunClaim(claimed=False, reason="already_running")
+        return ListingsRunClaim(claimed=True, run_id=row.id)
+
+    def heartbeat_listings_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        pages_fetched: int,
+    ) -> bool:
+        """Extends the lease and records progress for an in-flight listings
+        run. The `WHERE lease_owner = :lease_owner AND status = 'started'
+        AND lease_expires_at > now()` clause makes this an atomic
+        compare-and-set: it only succeeds if this exact caller still holds
+        the claim, the run is still active, AND the lease has not already
+        expired — merely matching on `lease_owner` is not enough, since a
+        worker whose lease genuinely expired must fail closed even before
+        any replacement worker has reclaimed the scope (nothing else would
+        otherwise ever notice the expiry until a *new* claim attempt runs
+        the stale-reclaim step in `claim_listings_run`). Uses the
+        database's own clock for that comparison, not the calling worker's,
+        so this never depends on clock agreement between workers. The
+        renewed `lease_expires_at` written below shares that same
+        authority on PostgreSQL — see `_lease_expiry_value`. Returns
+        False if the lease was stolen OR has simply expired — the caller
+        must treat either as a lost claim and stop, never continue writing
+        pages under an ownership it no longer holds.
+        """
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                pages_fetched=pages_fetched,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def complete_listings_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        status: str,
+        records_received: int = 0,
+        records_accepted: int = 0,
+        records_rejected: int = 0,
+        pages_fetched: int = 0,
+        reported_total_results: int | None = None,
+        pagination_complete: bool = True,
+        failure_class: str | None = None,
+    ) -> bool:
+        """Atomic, lease-owner-gated completion. Like `heartbeat_listings_
+        run`, the `WHERE lease_owner = :lease_owner AND status = 'started'
+        AND lease_expires_at > now()` clause is a compare-and-set: returns
+        False (and writes nothing) if this caller no longer holds the
+        claim — because it was stolen, or simply because its lease already
+        expired, even if nothing has reclaimed the scope yet — so a caller
+        that lost its lease mid-fetch can never overwrite whatever a
+        reclaiming process has since recorded, and an expired-but-not-yet-
+        reclaimed worker cannot silently finalize a run it no longer has
+        exclusive rights to. Uses the database's own clock, not the calling
+        worker's. Clears `lease_owner`/`lease_expires_at` on success — the
+        scope is released the moment `status` leaves `'started'`, which is
+        exactly what the partial unique index already keys on; clearing the
+        lease fields is cleanliness for future observability, not a
+        separate unlocking step.
+        """
+        if status not in self._VALID_STATUSES:
+            raise TypeError(f"Unsupported Amazon ingestion run status: {status!r}")
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                # Without this, a caller whose lease was already stolen and
+                # reclaimed by a stale-recovery step (which terminalizes
+                # status but historically left lease_owner unchanged on the
+                # vacated row) could still match on lease_owner alone and
+                # re-complete an already-terminal row. Matching
+                # `heartbeat_listings_run`'s same guard closes that gap.
+                AmazonIngestionRun.status == "started",
+                # And even if nothing has reclaimed it yet, an already-
+                # expired lease must not be treated as still valid.
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status=status,
+                completed_at=func.now(),
+                records_received=records_received,
+                records_accepted=records_accepted,
+                records_rejected=records_rejected,
+                pages_fetched=pages_fetched,
+                reported_total_results=reported_total_results,
+                pagination_complete=pagination_complete,
+                failure_class=failure_class,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+
+class AmazonSellerListingRepository:
+    """Marketplace-participation-scoped canonical listings. 12B.3D.
+
+    `amazon_seller_listings` has no `organization_id` column by design (see
+    `AmazonSellerListing`'s docstring in `models.py`) — but that must not
+    mean "any caller holding a `marketplace_participation_id` UUID can
+    write." Every public read and write on this repository takes
+    `organization_id` and validates it against `marketplace_participation_
+    id` via `AmazonMarketplaceParticipationRepository.get_by_id` (an
+    indexed primary-key lookup) — the same org-scoped-lookup pattern
+    already used by `AmazonIngestionRunRepository.claim_listings_run` and
+    every other repository in this module. Possession of a participation
+    UUID alone is never sufficient.
+
+    Writes go through exactly one path: `reconcile_snapshot()`. It
+    validates ownership **once** per call (not once per listing — a
+    snapshot can contain hundreds of items, and re-validating per row would
+    be exactly the "inefficient per-row ownership query" this design
+    avoids), then performs every upsert and the deactivation pass against
+    that single already-validated `marketplace_participation_id`. The
+    lower-level `_upsert`/`_deactivate_missing` helpers are intentionally
+    private and are never called from outside this class — there is no
+    public method that can mutate a listing without first passing the
+    organization check in `reconcile_snapshot()`.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> None:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            # Deliberately generic: missing, cross-organization, and
+            # not-this-organization's-participation all fail identically,
+            # with no foreign identifier disclosed — the same fail-closed
+            # shape already used throughout this module (e.g. `claim_
+            # listings_run`, `AmazonListingsIngestionService._validate_and_
+            # claim`'s `scope_not_found`).
+            raise TypeError(
+                "Amazon seller listing access cannot bind a marketplace participation from another organization."
+            )
+
+    def get_by_natural_key(
+        self, organization_id: UUID, marketplace_participation_id: UUID, seller_sku: str
+    ) -> AmazonSellerListing | None:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        return self._get_by_natural_key_unchecked(marketplace_participation_id, seller_sku)
+
+    def _get_by_natural_key_unchecked(
+        self, marketplace_participation_id: UUID, seller_sku: str
+    ) -> AmazonSellerListing | None:
+        """No organization check — only ever called from inside this class
+        (`_upsert`, and the public, already-checked `get_by_natural_key`
+        above), after ownership has already been validated exactly once for
+        the enclosing call."""
+        return self.session.scalars(
+            select(AmazonSellerListing).where(
+                AmazonSellerListing.marketplace_participation_id == marketplace_participation_id,
+                AmazonSellerListing.seller_sku == seller_sku,
+            )
+        ).first()
+
+    def list_for_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> list[AmazonSellerListing]:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        statement: Select[tuple[AmazonSellerListing]] = (
+            select(AmazonSellerListing)
+            .where(AmazonSellerListing.marketplace_participation_id == marketplace_participation_id)
+            .order_by(AmazonSellerListing.seller_sku.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def reconcile_snapshot(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        listings: list,
+        last_ingestion_run_id: UUID,
+    ) -> tuple[int, int]:
+        """The one validated, organization-scoped write boundary for a
+        listings snapshot. Validates ownership exactly once, then upserts
+        every entry in `listings` (each a `NormalizedListing`-shaped object
+        — see `app.amazon.listings_normalization`) and deactivates whatever
+        is missing from it. Returns `(upserted_count, deactivated_count)`.
+
+        Callers must only pass a fully validated, authoritative snapshot —
+        this method does not itself decide authority (that remains the
+        service's job); it only decides *ownership*.
+        """
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        seen_skus: set[str] = set()
+        for listing in listings:
+            self._upsert(
+                marketplace_participation_id=marketplace_participation_id,
+                seller_sku=listing.seller_sku,
+                asin=listing.asin,
+                product_type=listing.product_type,
+                condition_type=listing.condition_type,
+                item_name=listing.item_name,
+                main_image_url=listing.main_image_url,
+                amazon_created_at=listing.amazon_created_at,
+                amazon_last_updated_at=listing.amazon_last_updated_at,
+                status=listing.status,
+                is_buyable=listing.is_buyable,
+                is_discoverable=listing.is_discoverable,
+                offers=listing.offers,
+                price_amount=listing.price_amount,
+                price_currency=listing.price_currency,
+                fulfillment_availability=listing.fulfillment_availability,
+                issues=listing.issues,
+                issue_count=listing.issue_count,
+                highest_issue_severity=listing.highest_issue_severity,
+                product_types=listing.product_types,
+                last_ingestion_run_id=last_ingestion_run_id,
+            )
+            seen_skus.add(listing.seller_sku)
+        deactivated = self._deactivate_missing(
+            marketplace_participation_id=marketplace_participation_id, seen_skus=seen_skus
+        )
+        return len(listings), deactivated
+
+    def _upsert(
+        self,
+        *,
+        marketplace_participation_id: UUID,
+        seller_sku: str,
+        asin: str | None,
+        product_type: str | None,
+        condition_type: str | None,
+        item_name: str | None,
+        main_image_url: str | None,
+        amazon_created_at: datetime | None,
+        amazon_last_updated_at: datetime | None,
+        status: list,
+        is_buyable: bool,
+        is_discoverable: bool,
+        offers: list,
+        price_amount,
+        price_currency: str | None,
+        fulfillment_availability: list,
+        issues: list,
+        issue_count: int,
+        highest_issue_severity: str | None,
+        product_types: list,
+        last_ingestion_run_id: UUID,
+    ) -> AmazonSellerListing:
+        """Upsert by `(marketplace_participation_id, seller_sku)`. Preserves
+        `first_seen_at`; reactivates a previously-inactive row that
+        reappears. `last_ingestion_run_id` must already belong to the same
+        `marketplace_participation_id` and carry `run_type='listings'` —
+        this is enforced by the database's own composite foreign key
+        (`fk_amazon_seller_listings_last_ingestion_run_same_participation`),
+        not re-validated here; an `IntegrityError` from a genuine caller bug
+        propagates rather than being silently swallowed.
+        """
+        now = datetime.now(UTC)
+        existing = self._get_by_natural_key_unchecked(marketplace_participation_id, seller_sku)
+        if existing is not None:
+            existing.asin = asin
+            existing.product_type = product_type
+            existing.condition_type = condition_type
+            existing.item_name = item_name
+            existing.main_image_url = main_image_url
+            existing.amazon_created_at = amazon_created_at
+            existing.amazon_last_updated_at = amazon_last_updated_at
+            existing.status = status
+            existing.is_buyable = is_buyable
+            existing.is_discoverable = is_discoverable
+            existing.offers = offers
+            existing.price_amount = price_amount
+            existing.price_currency = price_currency
+            existing.fulfillment_availability = fulfillment_availability
+            existing.issues = issues
+            existing.issue_count = issue_count
+            existing.highest_issue_severity = highest_issue_severity
+            existing.product_types = product_types
+            existing.is_active = True
+            existing.last_seen_at = now
+            existing.last_successful_sync_at = now
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return existing
+        row = AmazonSellerListing(
+            marketplace_participation_id=marketplace_participation_id,
+            seller_sku=seller_sku,
+            asin=asin,
+            product_type=product_type,
+            condition_type=condition_type,
+            item_name=item_name,
+            main_image_url=main_image_url,
+            amazon_created_at=amazon_created_at,
+            amazon_last_updated_at=amazon_last_updated_at,
+            status=status,
+            is_buyable=is_buyable,
+            is_discoverable=is_discoverable,
+            offers=offers,
+            price_amount=price_amount,
+            price_currency=price_currency,
+            fulfillment_availability=fulfillment_availability,
+            issues=issues,
+            issue_count=issue_count,
+            highest_issue_severity=highest_issue_severity,
+            product_types=product_types,
+            is_active=True,
+            last_successful_sync_at=now,
+            last_ingestion_run_id=last_ingestion_run_id,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            # The single-writer lease should make a genuine natural-key race
+            # unreachable in practice (only one process reconciles a given
+            # scope at a time), but a SAVEPOINT here costs nothing and
+            # matches the established convention elsewhere in this module
+            # rather than risking an aborted outer transaction on an
+            # unexpected race. Not every IntegrityError here is that race,
+            # though: a genuine composite-FK violation (last_ingestion_run_id
+            # from a different participation, or a non-'listings' run — a
+            # real caller bug) also raises IntegrityError but leaves no
+            # natural-key winner row to find. Re-raise honestly in that case
+            # instead of letting `.one()` mask it as a confusing
+            # `NoResultFound`.
+            winner = self.session.scalars(
+                select(AmazonSellerListing).where(
+                    AmazonSellerListing.marketplace_participation_id == marketplace_participation_id,
+                    AmazonSellerListing.seller_sku == seller_sku,
+                )
+            ).first()
+            if winner is None:
+                raise
+            winner.asin = asin
+            winner.product_type = product_type
+            winner.condition_type = condition_type
+            winner.item_name = item_name
+            winner.main_image_url = main_image_url
+            winner.amazon_created_at = amazon_created_at
+            winner.amazon_last_updated_at = amazon_last_updated_at
+            winner.status = status
+            winner.is_buyable = is_buyable
+            winner.is_discoverable = is_discoverable
+            winner.offers = offers
+            winner.price_amount = price_amount
+            winner.price_currency = price_currency
+            winner.fulfillment_availability = fulfillment_availability
+            winner.issues = issues
+            winner.issue_count = issue_count
+            winner.highest_issue_severity = highest_issue_severity
+            winner.product_types = product_types
+            winner.is_active = True
+            winner.last_seen_at = now
+            winner.last_successful_sync_at = now
+            winner.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return winner
+        return row
+
+    def _deactivate_missing(
+        self,
+        *,
+        marketplace_participation_id: UUID,
+        seen_skus: set[str],
+    ) -> int:
+        """Mark rows absent from the latest complete, authoritative snapshot
+        as inactive. Only called by `reconcile_snapshot()`, after ownership
+        has already been validated once for this call. Mirrors
+        `AmazonMarketplaceParticipationRepository.deactivate_missing`.
+        """
+        rows = self.session.scalars(
+            select(AmazonSellerListing).where(
+                AmazonSellerListing.marketplace_participation_id == marketplace_participation_id,
+                AmazonSellerListing.is_active.is_(True),
+            )
+        ).all()
+        now = datetime.now(UTC)
+        deactivated = 0
+        for row in rows:
+            if row.seller_sku not in seen_skus:
+                row.is_active = False
+                row.last_seen_at = now
+                deactivated += 1
+        if deactivated:
+            self.session.flush()
+        return deactivated
 
 
 def file_sha256(data: bytes) -> str:
