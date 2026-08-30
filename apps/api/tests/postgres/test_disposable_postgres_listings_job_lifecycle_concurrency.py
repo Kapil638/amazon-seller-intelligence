@@ -37,6 +37,7 @@ from app.persistence.models import (
     AmazonIngestionRun,
     AmazonMarketplaceParticipation,
     AmazonSellerAccount,
+    AmazonSellerListing,
     Organization,
 )
 from app.persistence.repositories import AmazonIngestionRunRepository
@@ -94,11 +95,21 @@ def disposable_engine():
 
 
 def _seed_scope(engine, *, org_id: UUID | None = None) -> tuple[UUID, UUID, UUID]:
+    """Seeds one seller account + one marketplace participation. Passing
+    an existing `org_id` reuses that organization (creating a second,
+    additional seller account/participation under it — `selling_partner_
+    id` is freshly random per call, and is uniquely constrained globally,
+    not per-organization, so this never collides) rather than attempting
+    to insert `Organization` a second time, which would violate its
+    primary key. Omit `org_id` (or pass a genuinely new one) to seed an
+    entirely fresh organization instead."""
+    reuse_org = org_id is not None
     org_id = org_id or uuid4()
     seller_account_id = uuid4()
     participation_id = uuid4()
     with Session(engine) as session:
-        session.add(Organization(id=org_id, name="12B.3G Postgres Job Lifecycle Test Org"))
+        if not reuse_org or session.get(Organization, org_id) is None:
+            session.add(Organization(id=org_id, name="12B.3G Postgres Job Lifecycle Test Org"))
         session.add(
             AmazonSellerAccount(
                 id=seller_account_id,
@@ -438,42 +449,138 @@ def test_rescheduled_run_can_be_reclaimed_after_its_retry_time_passes(disposable
             lease_owner="worker-2", lease_duration_seconds=300,
             max_global_active=10, max_active_per_organization=10,
         )
+        # Captured as plain values *before* `session.commit()` — SQLAlchemy
+        # expires ORM attributes on commit by default, and accessing them
+        # afterward (once this `with` block has closed the session) raises
+        # `DetachedInstanceError`, not a silent stale read. This is a test
+        # boundary fix only; production session behavior is unchanged.
+        assert reclaimed is not None
+        reclaimed_id = reclaimed.id
+        reclaimed_status = reclaimed.status
+        reclaimed_retry_count = reclaimed.retry_count
         session.commit()
-    assert reclaimed is not None
-    assert reclaimed.id == claim.run_id
-    assert reclaimed.status == "started"
-    assert reclaimed.retry_count == 1  # incremented only on a genuine retry reclaim
+    assert reclaimed_id == claim.run_id
+    assert reclaimed_status == "started"
+    assert reclaimed_retry_count == 1  # incremented only on a genuine retry reclaim
 
 
 # --- 5: migration 0010 -> 0011 preserves existing rows and the downgrade
 # refuses to destroy data it cannot represent. ------------------------------
 
 
+_INSERT_0010_INGESTION_RUN_SQL = text(
+    """
+    INSERT INTO amazon_ingestion_runs (
+        id, organization_id, seller_account_id, marketplace_participation_id,
+        run_type, domain, region, environment, status,
+        started_at, completed_at, records_received, records_accepted, records_rejected,
+        retry_count, failure_class, pagination_complete, pages_fetched, reported_total_results
+    ) VALUES (
+        :id, :organization_id, :seller_account_id, :marketplace_participation_id,
+        'listings', 'listings_items', 'na', 'PRODUCTION', :status,
+        :started_at, :completed_at, :records_received, :records_accepted, :records_rejected,
+        0, :failure_class, :pagination_complete, :pages_fetched, :reported_total_results
+    )
+    """
+)
+
+
 def test_migration_0011_upgrade_preserves_existing_0010_rows_and_widens_constraints(disposable_engine) -> None:
+    """Pinned to the genuine `0010` schema for its seeding phase — the
+    CURRENT `AmazonIngestionRun` ORM class is never used until *after*
+    the upgrade below, because its mapped columns include `next_retry_at`/
+    `last_heartbeat_at`, which do not exist at `0010`; PostgreSQL
+    correctly rejects an INSERT referencing them. Historical rows are
+    seeded via raw SQL restricted to columns that genuinely existed at
+    `0010` instead. `Organization`/`AmazonSellerAccount`/`Amazon
+    MarketplaceParticipation`/`AmazonSellerListing` are all untouched by
+    migration `0011`, so the current ORM remains valid for those
+    regardless of which `amazon_ingestion_runs` revision is applied.
+    """
     url = _guard.disposable_url()
     with _alembic_environment(url):
         command.downgrade(_alembic_config(url), "0010_amazon_seller_listings")
 
     org_id, seller_account_id, participation_id = _seed_scope(disposable_engine)
+
+    # Representative historical evidence: one succeeded run, one failed
+    # run, both genuinely pre-`0011` shaped. Expected values captured as
+    # plain Python locals *before* upgrading, for after-upgrade comparison.
+    succeeded_run_id = uuid4()
+    failed_run_id = uuid4()
+    now = datetime.now(UTC)
+    succeeded_params = {
+        "id": succeeded_run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+        "marketplace_participation_id": participation_id, "status": "succeeded",
+        "started_at": now - timedelta(hours=2), "completed_at": now - timedelta(hours=1, minutes=55),
+        "records_received": 5, "records_accepted": 5, "records_rejected": 0,
+        "failure_class": None, "pagination_complete": True, "pages_fetched": 1,
+        "reported_total_results": 5,
+    }
+    failed_params = {
+        "id": failed_run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+        "marketplace_participation_id": participation_id, "status": "failed",
+        "started_at": now - timedelta(hours=1), "completed_at": now - timedelta(minutes=55),
+        "records_received": 2, "records_accepted": 0, "records_rejected": 2,
+        "failure_class": "malformed_page", "pagination_complete": False, "pages_fetched": 1,
+        "reported_total_results": 5,
+    }
+    with disposable_engine.begin() as conn:
+        conn.execute(_INSERT_0010_INGESTION_RUN_SQL, succeeded_params)
+        conn.execute(_INSERT_0010_INGESTION_RUN_SQL, failed_params)
+
+    # Listing provenance: a real `amazon_seller_listings` row whose
+    # composite FK points at the succeeded historical run. This table is
+    # unaffected by `0011`, so the current ORM is safe here even while
+    # `amazon_ingestion_runs` itself is still pinned to `0010`.
     with Session(disposable_engine) as session:
-        session.add(
-            AmazonIngestionRun(
-                id=uuid4(), organization_id=org_id, seller_account_id=seller_account_id,
-                marketplace_participation_id=participation_id, run_type="listings",
-                domain="listings_items", region="na", environment="PRODUCTION", status="succeeded",
-            )
+        listing = AmazonSellerListing(
+            id=uuid4(), marketplace_participation_id=participation_id, seller_sku="HIST-SKU-1",
+            status=["BUYABLE"], offers=[], fulfillment_availability=[], issues=[], product_types=[],
+            is_buyable=True, is_discoverable=True, is_active=True,
+            last_ingestion_run_id=succeeded_run_id,
         )
+        session.add(listing)
         session.commit()
+        listing_id = listing.id
 
     with _alembic_environment(url):
         command.upgrade(_alembic_config(url), "0011_listings_job_lifecycle")
 
+    # Only now — after the upgrade — is the current `AmazonIngestionRun`
+    # ORM used again.
     with Session(disposable_engine) as session:
-        rows = session.query(AmazonIngestionRun).filter_by(
-            seller_account_id=seller_account_id, marketplace_participation_id=participation_id
-        ).all()
-        assert len(rows) == 1
-        assert rows[0].status == "succeeded"  # pre-existing row untouched
+        succeeded_row = session.get(AmazonIngestionRun, succeeded_run_id)
+        failed_row = session.get(AmazonIngestionRun, failed_run_id)
+        assert succeeded_row.status == "succeeded"
+        assert succeeded_row.started_at == succeeded_params["started_at"]
+        assert succeeded_row.completed_at == succeeded_params["completed_at"]
+        assert succeeded_row.records_accepted == 5
+        assert failed_row.status == "failed"
+        assert failed_row.failure_class == "malformed_page"
+        # New columns correctly NULL for historical rows — nothing before
+        # `0011` ever tracked either concept, so there is nothing to
+        # backfill; NULL is the truthful value, not a default guess.
+        assert succeeded_row.next_retry_at is None
+        assert succeeded_row.last_heartbeat_at is None
+        assert failed_row.next_retry_at is None
+        assert failed_row.last_heartbeat_at is None
+
+        listing_row = session.get(AmazonSellerListing, listing_id)
+        assert listing_row.last_ingestion_run_id == succeeded_run_id
+        assert listing_row.seller_sku == "HIST-SKU-1"
+
+    # Terminal historical rows (both are terminal — succeeded/failed —
+    # for this exact scope) never block a *new* queued job: the widened
+    # partial unique index only ever covers queued/started/waiting_to_retry.
+    with Session(disposable_engine) as session:
+        claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=org_id, seller_account_id=seller_account_id,
+            marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
+            connection_id=None,
+        )
+        session.commit()
+    assert claim.claimed is True
 
     # The widened CHECK constraint now genuinely accepts the new states.
     with Session(disposable_engine) as session:
