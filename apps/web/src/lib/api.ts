@@ -45,6 +45,13 @@ import type {
   AmazonConnectionTestResult,
   AmazonAuthorizationStart,
   AmazonConnectionEnvironment,
+  ListingCollectionResponse,
+  ListingDetail,
+  ListingIssueSeverity,
+  ListingSortField,
+  ListingsSummary,
+  ListingsSyncTriggerResponse,
+  SortDirection,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1248,6 +1255,141 @@ export async function authorizeAmazonConnection(
     throw new AmazonConnectionError(AUTHORIZE_START_FAILED, "unknown");
   }
   return result;
+}
+
+export class ListingsApiError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "not_found" | "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "ListingsApiError";
+  }
+}
+
+async function listingsRequest<T>(path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+  } catch {
+    throw new ListingsApiError(
+      "Seller Listings could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new ListingsApiError(detail || "This was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new ListingsApiError(detail || "Seller Listings is not configured right now.", "unavailable");
+  }
+  throw new ListingsApiError(detail || "Seller Listings could not complete this request.", "unknown");
+}
+
+export async function fetchListingsSummary(participationId: string): Promise<ListingsSummary> {
+  return listingsRequest<ListingsSummary>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/listings/summary`,
+  );
+}
+
+export type ListingsQuery = {
+  q?: string;
+  isActive?: boolean;
+  isBuyable?: boolean;
+  isDiscoverable?: boolean;
+  hasIssues?: boolean;
+  highestIssueSeverity?: ListingIssueSeverity;
+  productType?: string;
+  sortBy?: ListingSortField;
+  sortDir?: SortDirection;
+  offset?: number;
+  limit?: number;
+};
+
+export async function fetchListings(
+  participationId: string,
+  query: ListingsQuery = {},
+): Promise<ListingCollectionResponse> {
+  const params = new URLSearchParams();
+  if (query.q) params.set("q", query.q);
+  if (query.isActive !== undefined) params.set("is_active", String(query.isActive));
+  if (query.isBuyable !== undefined) params.set("is_buyable", String(query.isBuyable));
+  if (query.isDiscoverable !== undefined) params.set("is_discoverable", String(query.isDiscoverable));
+  if (query.hasIssues !== undefined) params.set("has_issues", String(query.hasIssues));
+  if (query.highestIssueSeverity) params.set("highest_issue_severity", query.highestIssueSeverity);
+  if (query.productType) params.set("product_type", query.productType);
+  params.set("sort_by", query.sortBy ?? "last_seen_at");
+  params.set("sort_dir", query.sortDir ?? "desc");
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 25));
+  return listingsRequest<ListingCollectionResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/listings?${params.toString()}`,
+  );
+}
+
+export async function fetchListingDetail(
+  participationId: string,
+  listingId: string,
+): Promise<ListingDetail> {
+  return listingsRequest<ListingDetail>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/listings/${encodeURIComponent(listingId)}`,
+  );
+}
+
+export class ListingsSyncError extends Error {
+  constructor(
+    message: string,
+    readonly reason: string | null,
+    readonly kind: "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "ListingsSyncError";
+  }
+}
+
+// 12B.3G: the trigger endpoint enqueues a durable job and returns
+// immediately — it never runs synchronization itself, so every outcome
+// this function can observe (a newly queued job, an already-running job,
+// a cooldown/capacity rejection, or a scope failure) is a normal,
+// structured `ListingsSyncTriggerResponse`, not an exception. This only
+// throws `ListingsSyncError` for a genuine transport failure or a
+// response so malformed it cannot be interpreted at all — never for an
+// ordinary business outcome the caller is expected to branch on via
+// `reason`.
+export async function triggerListingsSync(participationId: string): Promise<ListingsSyncTriggerResponse> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${apiBaseUrl()}/api/v1/amazon/marketplace-participations/${encodeURIComponent(participationId)}/listings/sync`,
+      { method: "POST", cache: "no-store" },
+    );
+  } catch {
+    throw new ListingsSyncError("Could not reach the server to start synchronization.", null, "unavailable");
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new ListingsSyncError("Synchronization could not be started.", null, "unknown");
+  }
+
+  if (response.ok) {
+    return body as ListingsSyncTriggerResponse;
+  }
+  // Every non-2xx status this endpoint returns wraps the same structured
+  // shape in `detail` (see `ListingsSyncTriggerResponse` in `app.api.
+  // routes.amazon_listings_sync`) — parsed here directly rather than
+  // reused from `formatDetail`, which expects a plain string/list shape.
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object") {
+    return detail as ListingsSyncTriggerResponse;
+  }
+  throw new ListingsSyncError("Synchronization could not be started.", null, "unknown");
 }
 
 export async function createProfitModel(payload: {

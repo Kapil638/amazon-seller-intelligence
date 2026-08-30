@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Select, func, or_, select, update
+from sqlalchemy import DateTime, Select, and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -1677,6 +1677,12 @@ class AmazonIngestionRunRepository:
             region=region,
             environment=environment,
             status="started",
+            # Explicit since 12B.3G: `started_at` lost its `server_default`
+            # when it became nullable for the Listings job lifecycle's
+            # `queued` state (which this run_type does not have — a
+            # `marketplace_participations` run is always immediately
+            # "started", exactly as before).
+            started_at=func.now(),
             request_correlation_id=request_correlation_id,
         )
         self.session.add(row)
@@ -1895,6 +1901,12 @@ class AmazonIngestionRunRepository:
             environment=environment,
             lease_owner=lease_owner,
             lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+            # Explicit since 12B.3G: `started_at` lost its `server_default`
+            # for the new `queued` state. This method claims a run that is
+            # immediately `started` (the pre-12B.3G synchronous path,
+            # still used by `AmazonListingsIngestionService.sync()`), so it
+            # always has a real start time, exactly as before.
+            started_at=func.now(),
         )
         try:
             with self.session.begin_nested():
@@ -2008,6 +2020,393 @@ class AmazonIngestionRunRepository:
                 reported_total_results=reported_total_results,
                 pagination_complete=pagination_complete,
                 failure_class=failure_class,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    # --- 12B.3G: durable job lifecycle (queued / waiting_to_retry) ---------
+
+    def enqueue_listings_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        region: str,
+        environment: str,
+        connection_id: UUID | None,
+    ) -> ListingsRunClaim:
+        """Creates a durable `status='queued'` Listings job — no lease, no
+        `started_at`, no Amazon call. A separate worker process claims it
+        later via `claim_next_listings_job`.
+
+        Ownership validation and the stale-`started`-lease reclaim step are
+        identical to `claim_listings_run`; only the terminal state of a
+        *successful* claim differs (`queued`, not `started`). Protected by
+        the same partial unique index (now covering queued/started/
+        waiting_to_retry), so a concurrent enqueue/claim for the same scope
+        fails the same way: `ListingsRunClaim(claimed=False,
+        reason="already_running")`.
+        """
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+            organization_id, seller_account_id
+        )
+        if seller_account is None:
+            raise TypeError(
+                "Amazon listings run cannot bind a seller account from another organization."
+            )
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon listings run cannot bind a marketplace participation from another organization."
+            )
+        if participation.seller_account_id != seller_account_id:
+            raise TypeError(
+                "Amazon listings run marketplace participation does not belong to the given seller account."
+            )
+        if connection_id is not None:
+            connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+            if connection is None:
+                raise TypeError("Amazon listings run cannot bind a connection from another organization.")
+
+        # Same stale-`started`-lease reclaim as claim_listings_run — a
+        # `queued`/`waiting_to_retry` row is never "stale" in this sense
+        # (neither holds a lease), so this predicate is intentionally
+        # unchanged: only an abandoned `started` row is reclaimed here.
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        row = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            seller_account_id=seller_account_id,
+            marketplace_participation_id=marketplace_participation_id,
+            run_type="listings",
+            domain="listings_items",
+            status="queued",
+            region=region,
+            environment=environment,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            return ListingsRunClaim(claimed=False, reason="already_running")
+        return ListingsRunClaim(claimed=True, run_id=row.id)
+
+    def get_active_listings_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """The current nonterminal (`queued`/`started`/`waiting_to_retry`)
+        Listings run for this organization-owned participation, if any.
+        Used to surface sanitized evidence in an `already_running`
+        response — never raises for a missing/foreign participation
+        (callers that need that check already performed it beforehand)."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+            .order_by(AmazonIngestionRun.created_at.desc())
+            .limit(1)
+        ).first()
+
+    def claim_next_listings_job(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        max_global_active: int,
+        max_active_per_organization: int,
+        batch_size: int = 50,
+    ) -> AmazonIngestionRun | None:
+        """Worker-side claim: atomically picks at most one eligible
+        Listings job (`queued`, or `waiting_to_retry` whose `next_retry_at`
+        has passed) across *every* organization, subject to global and
+        per-organization concurrency limits, and transitions it to
+        `started`.
+
+        PostgreSQL-safe claim semantics: candidates are selected with
+        `SELECT ... FOR UPDATE SKIP LOCKED`, so two workers racing this
+        method can never both select the same row — one gets it, the other
+        moves on to its next candidate (or finds none). `FOR UPDATE SKIP
+        LOCKED` is a no-op on SQLite (no row-level locking there), so this
+        method's *correctness under real concurrency* is proven only by
+        the guarded disposable-PostgreSQL suite, never by SQLite tests
+        alone — do not cite an SQLite test as proof of this method's
+        locking behavior.
+
+        `started_at` is set only on the *first* claim (`COALESCE`-style:
+        left untouched if already set from an earlier attempt);
+        `retry_count` increments only when reclaiming from
+        `waiting_to_retry` (a genuine retry), never on a fresh `queued`
+        claim. Stale `started` rows (lease expired, no worker ever
+        finished them) are reclaimed to `timed_out` first, exactly like
+        `claim_listings_run`'s own stale-reclaim step, so their scope is
+        freed before any new candidate is considered.
+        """
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        active_global = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(AmazonIngestionRun.run_type == "listings", AmazonIngestionRun.status == "started")
+        )
+        if active_global is not None and active_global >= max_global_active:
+            return None
+
+        candidates = self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "listings",
+                or_(
+                    AmazonIngestionRun.status == "queued",
+                    and_(
+                        AmazonIngestionRun.status == "waiting_to_retry",
+                        AmazonIngestionRun.next_retry_at.is_not(None),
+                        AmazonIngestionRun.next_retry_at <= func.now(),
+                    ),
+                ),
+            )
+            .order_by(func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc())
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        for candidate in candidates:
+            active_for_org = self.session.scalar(
+                select(func.count())
+                .select_from(AmazonIngestionRun)
+                .where(
+                    AmazonIngestionRun.organization_id == candidate.organization_id,
+                    AmazonIngestionRun.run_type == "listings",
+                    AmazonIngestionRun.status == "started",
+                )
+            )
+            if active_for_org is not None and active_for_org >= max_active_per_organization:
+                continue
+            was_retry = candidate.status == "waiting_to_retry"
+            candidate.status = "started"
+            candidate.lease_owner = lease_owner
+            candidate.lease_expires_at = self._lease_expiry_value(lease_duration_seconds)
+            candidate.last_heartbeat_at = func.now()
+            candidate.next_retry_at = None
+            if candidate.started_at is None:
+                candidate.started_at = func.now()
+            if was_retry:
+                candidate.retry_count = candidate.retry_count + 1
+            self.session.flush()
+            return candidate
+        return None
+
+    def count_active_listings_runs_for_organization(self, organization_id: UUID) -> int:
+        """Nonterminal (`queued`/`started`/`waiting_to_retry`) Listings run
+        count for one organization, across every participation.
+
+        Monitoring/reporting only — see this class's own docstring history:
+        an earlier version of 12B.3G used this to gate the *trigger*
+        (`listings_sync_max_concurrent_jobs_per_organization`), which was
+        wrong — it conflated worker EXECUTION capacity with queue
+        ADMISSION, meaning a legitimate new job could be rejected outright
+        just because other jobs happened to be queued, not because any
+        worker was actually busy. The trigger no longer calls this method.
+        Execution capacity is enforced exactly once, at claim time, by
+        `claim_next_listings_job`'s own `started`-only count. See
+        `count_queued_listings_runs_for_organization` for the trigger's
+        actual (queue-backlog-only) admission check.
+        """
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+        )
+        return count or 0
+
+    def count_active_listings_runs_global(self) -> int:
+        """Nonterminal Listings run count across every organization.
+
+        Monitoring/reporting only — not used for trigger admission or
+        claim-time execution limits. See `count_active_listings_runs_
+        for_organization`'s docstring for why, and `claim_next_listings_
+        job` for the actual (`started`-only) global execution limit.
+        """
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+        )
+        return count or 0
+
+    def count_queued_listings_runs_for_organization(self, organization_id: UUID) -> int:
+        """Genuine queue-backlog count for one organization: `status =
+        'queued'` only — never `started` or `waiting_to_retry`, which
+        already each occupy their own participation's single-writer slot
+        and are not "backlog" in the sense this exists to bound.
+
+        This is the trigger's *only* admission-time capacity check
+        (`listings_sync_max_queued_per_organization`) — a safety valve
+        against unbounded queue growth (e.g. a caller triggering many
+        distinct marketplace participations in a tight loop), deliberately
+        unrelated to worker execution capacity. A legitimate new job is
+        never rejected merely because workers are currently busy; it is
+        only ever rejected if this organization's *queue* itself has
+        grown unreasonably large.
+        """
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "queued",
+            )
+        )
+        return count or 0
+
+    def terminalize_unclaimed_listings_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        failure_class: str = "cancelled_before_start",
+    ) -> bool:
+        """Operator-only, race-safe compare-and-set: terminalizes a
+        Listings run that has **never been claimed** — never a `started`,
+        `waiting_to_retry`, or already-terminal run, never a run from
+        another organization, and never a `marketplace_participations`
+        run. Exists so an operator can dispose of a durable job that
+        should never be processed (e.g. one queued in error) without
+        risking a race against a worker that might claim it at any
+        moment — there is no other safe way to remove a queued job's
+        single-writer hold on its scope short of this.
+
+        The WHERE clause requires ALL of: exact `id` + `organization_id`
+        match, `run_type = 'listings'`, `status = 'queued'`, and
+        `started_at`/`lease_owner`/`lease_expires_at`/`last_heartbeat_at`
+        all `IS NULL` — i.e. this run has not been touched by anything
+        since `enqueue_listings_run` created it. If a worker claims the
+        row (or anything else changes about it) between an operator's
+        decision to call this and the call itself, every one of those
+        columns changes, the `UPDATE` matches zero rows, and this returns
+        `False` — never overwriting a job that has since become active.
+
+        On success, transitions to `status='failed'` with `completed_at`
+        set, the given sanitized `failure_class` (default
+        `'cancelled_before_start'`), and `pagination_complete=False` —
+        truthful: this run never attempted pagination at all. Every
+        counter (`records_received`/`records_accepted`/`records_rejected`/
+        `pages_fetched`) is left at its existing value, which for a
+        genuinely never-claimed run is always the `0` `enqueue_listings_
+        run` set them to — never fabricated here. No lease field is
+        touched (all already `NULL`, per the WHERE clause). Never calls
+        Amazon and never touches `amazon_seller_listings` — this method
+        exists entirely within `amazon_ingestion_runs`.
+        """
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status == "queued",
+                AmazonIngestionRun.started_at.is_(None),
+                AmazonIngestionRun.lease_owner.is_(None),
+                AmazonIngestionRun.lease_expires_at.is_(None),
+                AmazonIngestionRun.last_heartbeat_at.is_(None),
+            )
+            .values(
+                status="failed",
+                completed_at=func.now(),
+                failure_class=failure_class,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def reschedule_listings_run_for_retry(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        next_retry_at,
+        failure_class: str,
+        pages_fetched: int = 0,
+        records_received: int = 0,
+        reported_total_results: int | None = None,
+    ) -> bool:
+        """Releases the lease and moves a run to `waiting_to_retry` rather
+        than a terminal status — the run is *not* completed, it is paused.
+        Same lease-owner/status/unexpired-lease compare-and-set guarantee
+        as `complete_listings_run`, so a caller that already lost its
+        lease can never reschedule a run it no longer owns, and a stale
+        worker can never undo a newer owner's progress."""
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="waiting_to_retry",
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                pages_fetched=pages_fetched,
+                records_received=records_received,
+                reported_total_results=reported_total_results,
                 lease_owner=None,
                 lease_expires_at=None,
             )

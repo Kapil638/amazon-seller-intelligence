@@ -234,6 +234,33 @@ class _TransientServerFailure(Exception):
         super().__init__(f"transient server failure status={status}")
 
 
+def _parse_retry_after(raw: str | None) -> float | None:
+    """RFC 7231 `Retry-After`: either delta-seconds or an HTTP-date. Never
+    raises — an absent, malformed, or negative value is simply "no usable
+    signal" (`None`), so a caller always has a defined, safe fallback
+    (its own bounded backoff) rather than crashing on an unexpected
+    header. 12B.3G: read only to inform the *durable worker's* retry
+    scheduling — this module's own short-retry loop never used it."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        seconds = float(raw)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        target = parsedate_to_datetime(raw)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=UTC)
+        delta = (target - datetime.now(UTC)).total_seconds()
+        return delta if delta >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 @dataclass(frozen=True)
 class ListingsPageRequest:
     """One page request. `seller_id` must be the stored, OAuth-captured
@@ -398,7 +425,7 @@ class AmazonSpApiListingsClient:
                 raise SpApiRequestFailedError("Amazon SP-API listings request could not be completed.") from None
 
             try:
-                self._raise_for_status(response.status_code)
+                self._raise_for_status(response)
                 break
             except SpApiRateLimitedError:
                 if attempt < self._max_attempts:
@@ -416,7 +443,8 @@ class AmazonSpApiListingsClient:
         parsed = self._parse_response(response)
         return self._to_page(parsed, response, request, attempt_count=attempt)
 
-    def _raise_for_status(self, status: int) -> None:
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        status = response.status_code
         if status == 200:
             return
         if status in {401, 403}:
@@ -424,7 +452,10 @@ class AmazonSpApiListingsClient:
             raise SpApiAuthenticationError("Amazon SP-API listings authentication failed.")
         if status == 429:
             logger.warning("SP-API listings rate-limited status=%s", status)
-            raise SpApiRateLimitedError("Amazon SP-API listings rate limit reached.")
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            raise SpApiRateLimitedError(
+                "Amazon SP-API listings rate limit reached.", retry_after_seconds=retry_after
+            )
         if status >= 500:
             logger.warning("SP-API listings server failure status=%s", status)
             raise _TransientServerFailure(status)

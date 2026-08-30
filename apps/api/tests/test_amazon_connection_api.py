@@ -282,8 +282,96 @@ def test_connection_overview_exposes_canonical_marketplaces_after_test(client) -
     assert body["seller_account_display_name"] == "BestSellerStore"
     assert body["marketplaces"][0]["marketplace_id"] == "ATVPDKIKX0DER"
     assert body["marketplaces"][0]["is_participating"] is True
+    # 12B.3F: the participation's own id, so the frontend can address the
+    # 12B.3E Listings Read API's `{marketplace_participation_id}` path.
+    assert body["marketplaces"][0]["id"] is not None
+    assert body["marketplaces"][0]["id"] != body["seller_account_id"]
     assert body["latest_ingestion"]["status"] == "succeeded"
     _assert_public(body)
+
+
+def test_connection_overview_ignores_a_listings_run_when_computing_latest_ingestion() -> None:
+    """Regression (12B.3G): live-reproduced against a real database on
+    2026-08-29 as a 500 (`pydantic_core.ValidationError` on
+    `AmazonIngestionStatusRead.started_at`) the moment any *queued*
+    Listings run existed for a connection — a queued/waiting_to_retry
+    Listings run has a NULL `started_at` (a `marketplace_participations`
+    run is always immediately started), which sorts *before* a completed
+    marketplace run under real PostgreSQL's default NULLS-FIRST-on-DESC
+    ordering (SQLite does the opposite, so that exact manifestation can't
+    be reproduced portably here).
+
+    What's tested here instead is the underlying invariant the fix
+    actually establishes, in a way that fails on any backend regardless
+    of NULL-ordering semantics: a Listings run — even a `started` one
+    with a perfectly valid, strictly *later* `started_at` than the
+    marketplace run — must never become `latest_ingestion`. That field
+    has only ever meant seller-validation ingestion status, never
+    Listings synchronization.
+    """
+    from app.amazon.marketplace_reconciliation import INGESTION_DOMAIN
+    from app.persistence.repositories import (
+        AmazonIngestionRunRepository,
+        AmazonMarketplaceParticipationRepository,
+        AmazonSellerAccountRepository,
+    )
+
+    org_id = current_organization_id()
+    with session_scope() as session:
+        connection = AmazonConnectionRepository(session).create(
+            organization_id=org_id, provider="SP_API", environment="PRODUCTION", region="na"
+        )
+        session.flush()
+
+        runs = AmazonIngestionRunRepository(session)
+        marketplace_run = runs.start(
+            organization_id=org_id,
+            domain=INGESTION_DOMAIN,
+            region="na",
+            environment="PRODUCTION",
+            connection_id=connection.id,
+        )
+        runs.complete(org_id, marketplace_run.id, status="succeeded", records_accepted=6)
+
+        seller_account = AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=org_id, selling_partner_id="A1B2C3D4E5F6G7"
+        )
+        session.flush()
+        participation = AmazonMarketplaceParticipationRepository(session).create_or_reconcile(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            marketplace_id="ATVPDKIKX0DER",
+            region="na",
+            connection_id=connection.id,
+        )
+        session.flush()
+        # Claimed (not merely enqueued) *after* the marketplace run
+        # completes, so its `started_at` (set via `func.now()`) is
+        # strictly later — this must still lose to the marketplace run
+        # under any DB's ordering, because it is the wrong `run_type`
+        # entirely, not because of how the two timestamps compare.
+        claim = runs.claim_listings_run(
+            organization_id=org_id,
+            seller_account_id=seller_account.id,
+            marketplace_participation_id=participation.id,
+            region="na",
+            environment="PRODUCTION",
+            connection_id=connection.id,
+            lease_owner="test-worker",
+            lease_duration_seconds=300,
+        )
+        assert claim.claimed is True
+        session.commit()
+        connection_id = connection.id
+
+    service = AmazonConnectionService(settings=Settings(_env_file=None))
+    with session_scope() as session:
+        row = session.get(AmazonConnection, connection_id)
+        latest = service._latest_ingestion_read_state(session, row)
+
+    assert latest is not None
+    assert latest.status == "succeeded"
+    assert latest.started_at is not None
 
 
 def test_connection_overview_degrades_when_seller_identity_tables_are_missing(client) -> None:

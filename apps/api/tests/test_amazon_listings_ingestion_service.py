@@ -29,7 +29,8 @@ level by `test_missing_application_credentials_and_redirect_uri` in
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -47,6 +48,7 @@ from app.core.exceptions import (
     SpApiRequestFailedError,
 )
 from app.persistence.database import current_organization_id, session_scope
+from app.persistence.models import AmazonIngestionRun
 from app.persistence.repositories import (
     AmazonConnectionRepository,
     AmazonIngestionRunRepository,
@@ -742,6 +744,300 @@ async def test_truthful_run_counters_and_timestamps() -> None:
     assert run.completed_at is not None
     assert run.lease_owner is None
     assert run.lease_expires_at is None
+
+
+# --- 12B.3G follow-up: time-based lease renewal during a slow request ----
+#
+# `_renew_lease_while_awaiting` renews the lease on a fixed wall-clock
+# cadence WHILE a single `fetch_page()` call is in flight — independent of
+# whether that page ever completes. Real (not mocked) small `asyncio.sleep`
+# delays are used below; at hundredths of a second these tests remain fast.
+
+
+class _SlowFakeListingsClient:
+    """Like `_FakeListingsClient`, but each page fetch takes a real,
+    controllable amount of wall-clock time before resolving — long enough,
+    relative to a deliberately tiny `listings_sync_heartbeat_time_interval_
+    seconds`, for the background renewal task to fire at least once."""
+
+    def __init__(self, script: list, *, delay_seconds: float) -> None:
+        self._script = list(script)
+        self._delay_seconds = delay_seconds
+        self.requests: list[ListingsPageRequest] = []
+
+    async def fetch_page(self, request: ListingsPageRequest) -> ListingsPage:
+        self.requests.append(request)
+        await asyncio.sleep(self._delay_seconds)
+        item = self._script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _slow_service(script: list, *, delay_seconds: float, **kwargs) -> tuple[AmazonListingsIngestionService, _SlowFakeListingsClient]:
+    client = _SlowFakeListingsClient(script, delay_seconds=delay_seconds)
+
+    def factory(**_kwargs):
+        return client
+
+    resolver = kwargs.pop("resolver", None) or _FakeResolver()
+    lease_owner_factory = kwargs.pop("lease_owner_factory", None) or (lambda: f"lease-{uuid4().hex[:8]}")
+    settings = kwargs.pop("settings", None) or _test_settings(listings_sync_heartbeat_time_interval_seconds=0.01)
+    service = AmazonListingsIngestionService(
+        settings=settings, resolver=resolver, listings_client_factory=factory,
+        lease_owner_factory=lease_owner_factory, **kwargs,
+    )
+    return service, client
+
+
+@pytest.mark.asyncio
+async def test_slow_page_fetch_triggers_time_based_lease_renewal(monkeypatch) -> None:
+    """The heartbeat's underlying repository call is spied on (not faked)
+    — a genuinely slow single request (0.05s) against a much shorter
+    renewal interval (0.01s) must cause at least one renewal call *before*
+    the page itself ever resolves, proving the renewal is driven by wall-
+    clock time elapsing during the await, not by page completion."""
+    scope = _seed_scope()
+    kwargs = {k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")}
+    service, client = _slow_service(
+        [_page([_item("SKU-1", summaries=[_summary()])])], delay_seconds=0.05,
+    )
+
+    calls: list[int] = []
+    real_heartbeat = AmazonIngestionRunRepository.heartbeat_listings_run
+
+    def _spy(self, *args, **kw):
+        calls.append(1)
+        return real_heartbeat(self, *args, **kw)
+
+    monkeypatch.setattr(AmazonIngestionRunRepository, "heartbeat_listings_run", _spy)
+
+    outcome = await service.sync(**kwargs)
+
+    assert outcome.succeeded is True
+    # At least one renewal from the background task during the slow
+    # request, plus the ordinary page-count-based heartbeat afterward.
+    assert len(calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_no_orphan_renewal_task_survives_a_multi_page_sync() -> None:
+    """Direct proof (not inference from behavior): a renewal task is
+    created fresh around every single page fetch and must be fully
+    cancelled and awaited before that fetch's `try/finally` exits — none
+    may still be running once `sync()` returns, across any number of
+    pages, success or failure."""
+    scope = _seed_scope()
+    kwargs = {k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")}
+    service, client = _slow_service(
+        [
+            _page([_item("SKU-1", summaries=[_summary()])], number_of_results=2, next_token="page-2"),
+            _page([_item("SKU-2", summaries=[_summary()])], number_of_results=2),
+        ],
+        delay_seconds=0.02,
+    )
+
+    tasks_before = {t for t in asyncio.all_tasks() if not t.done()}
+    outcome = await service.sync(**kwargs)
+    # Give any still-finishing cancellation a chance to actually settle —
+    # `task.cancel()` merely schedules cancellation; the awaited
+    # `finally` block already waits for it, but this is a defensive,
+    # zero-cost extra checkpoint before asserting.
+    await asyncio.sleep(0)
+    tasks_after = {t for t in asyncio.all_tasks() if not t.done()}
+
+    assert outcome.succeeded is True
+    assert tasks_after - tasks_before == set()
+
+
+@pytest.mark.asyncio
+async def test_lease_lost_during_a_slow_request_aborts_without_writing_the_page(monkeypatch) -> None:
+    """The lease is stolen (simulated: the renewal's own heartbeat call
+    fails) *while* a page fetch is still in flight. Even though the page
+    itself successfully arrives afterward, it must never be processed or
+    written — the run must report `lease_lost`, and no listing may exist."""
+    scope = _seed_scope()
+    kwargs = {k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")}
+    service, client = _slow_service(
+        [_page([_item("SKU-1", summaries=[_summary()])])], delay_seconds=0.05,
+    )
+
+    monkeypatch.setattr(AmazonIngestionRunRepository, "heartbeat_listings_run", lambda self, *a, **kw: False)
+
+    outcome = await service.sync(**kwargs)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "lease_lost"
+    assert outcome.records_received == 0
+    assert _get_listing(scope["organization_id"], scope["marketplace_participation_id"], "SKU-1") is None
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_heartbeat_exception_during_a_slow_request_is_handled_deterministically(
+    monkeypatch,
+) -> None:
+    """An unexpected exception from the renewal task's own `_heartbeat`
+    call (e.g. a transient DB error, distinct from an ordinary failed
+    compare-and-set) must never propagate out uncaught — it must be
+    treated the same fail-safe way as a failed renewal: a clean,
+    already-tested `lease_lost` outcome, never an unhandled exception
+    surfacing from deep inside a cancelled background task."""
+    scope = _seed_scope()
+    kwargs = {k: scope[k] for k in ("organization_id", "seller_account_id", "marketplace_participation_id")}
+    service, client = _slow_service(
+        [_page([_item("SKU-1", summaries=[_summary()])])], delay_seconds=0.05,
+    )
+
+    def _raising_heartbeat(self, *args, **kw):
+        raise RuntimeError("simulated transient database error during lease renewal")
+
+    monkeypatch.setattr(AmazonIngestionRunRepository, "heartbeat_listings_run", _raising_heartbeat)
+
+    outcome = await service.sync(**kwargs)  # must not raise
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "lease_lost"
+    assert outcome.records_received == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stale_worker_cannot_renew_after_a_genuine_takeover(monkeypatch) -> None:
+    """Simulates a real takeover: the lease genuinely expires and is
+    reclaimed by a second worker mid-request (a compare-and-set failure,
+    not a network fault) — the ORIGINAL worker's renewal attempt must
+    fail closed (the same `heartbeat_listings_run` compare-and-set every
+    other lease operation relies on), never able to convince itself it
+    still holds the lease."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"], seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"], region="na",
+            environment="PRODUCTION", connection_id=scope["connection_id"],
+            lease_owner="original-worker", lease_duration_seconds=300,
+        )
+        session.commit()
+
+    # A second worker genuinely reclaims the scope (lease expired for real).
+    with session_scope() as session:
+        row = session.get(AmazonIngestionRun, claim.run_id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    with session_scope() as session:
+        reclaim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"], seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"], region="na",
+            environment="PRODUCTION", connection_id=scope["connection_id"],
+            lease_owner="new-worker", lease_duration_seconds=300,
+        )
+        session.commit()
+    assert reclaim.claimed is True
+
+    # The ORIGINAL (now-stale) worker's own renewal attempt must fail.
+    with session_scope() as session:
+        ok = AmazonIngestionRunRepository(session).heartbeat_listings_run(
+            scope["organization_id"], claim.run_id, lease_owner="original-worker",
+            lease_duration_seconds=300, pages_fetched=1,
+        )
+        session.commit()
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_is_refused_after_takeover(monkeypatch) -> None:
+    """Mirrors the renewal-refusal test above for the *completion* write —
+    a stale worker's `complete_listings_run` call must also fail closed
+    once a new owner holds the lease, never finalizing a run out from
+    under the worker that has genuinely taken it over."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"], seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"], region="na",
+            environment="PRODUCTION", connection_id=scope["connection_id"],
+            lease_owner="original-worker", lease_duration_seconds=300,
+        )
+        session.commit()
+    with session_scope() as session:
+        row = session.get(AmazonIngestionRun, claim.run_id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    with session_scope() as session:
+        reclaim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"], seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"], region="na",
+            environment="PRODUCTION", connection_id=scope["connection_id"],
+            lease_owner="new-worker", lease_duration_seconds=300,
+        )
+        session.commit()
+    assert reclaim.claimed is True
+
+    with session_scope() as session:
+        completed = AmazonIngestionRunRepository(session).complete_listings_run(
+            scope["organization_id"], claim.run_id, lease_owner="original-worker", status="succeeded",
+        )
+        session.commit()
+    assert completed is False
+
+
+@pytest.mark.asyncio
+async def test_waiting_to_retry_releases_the_worker_slot_for_another_job(monkeypatch) -> None:
+    """A run parked at `waiting_to_retry` must not occupy `started`-based
+    execution capacity — `claim_next_listings_job`'s global/per-org limits
+    only ever count `status='started'` rows, so a second, independent
+    job must remain claimable even while the first sits waiting."""
+    scope_a = _seed_scope()
+    with session_scope() as session:
+        claim_a = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope_a["organization_id"], seller_account_id=scope_a["seller_account_id"],
+            marketplace_participation_id=scope_a["marketplace_participation_id"], region="na",
+            environment="PRODUCTION", connection_id=scope_a["connection_id"],
+            lease_owner="worker-a", lease_duration_seconds=300,
+        )
+        session.commit()
+    with session_scope() as session:
+        rescheduled = AmazonIngestionRunRepository(session).reschedule_listings_run_for_retry(
+            scope_a["organization_id"], claim_a.run_id, lease_owner="worker-a",
+            next_retry_at=datetime.now(UTC) + timedelta(minutes=10), failure_class="throttled",
+        )
+        session.commit()
+    assert rescheduled is True
+
+    # A second, independent participation under the SAME organization/
+    # seller account/connection (created directly, not via `_seed_scope`
+    # again — that helper creates a brand new SP_API/PRODUCTION connection
+    # every call, which collides with the one-connection-per-org/provider/
+    # environment constraint `scope_a` already established).
+    with session_scope() as session:
+        participation_b = AmazonMarketplaceParticipationRepository(session).create_or_reconcile(
+            organization_id=scope_a["organization_id"],
+            seller_account_id=scope_a["seller_account_id"],
+            marketplace_id="A2EUQ1WTGCTBG2",
+            region="eu",
+            connection_id=scope_a["connection_id"],
+        )
+        session.flush()
+        participation_b_id = participation_b.id
+
+    with session_scope() as session:
+        enqueue_b = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope_a["organization_id"], seller_account_id=scope_a["seller_account_id"],
+            marketplace_participation_id=participation_b_id, region="eu",
+            environment="PRODUCTION", connection_id=scope_a["connection_id"],
+        )
+        session.commit()
+    assert enqueue_b.claimed is True
+
+    # `worker-a`'s waiting_to_retry run does not count as an active
+    # `started` slot, so this claim (limit=1) still succeeds for job B.
+    with session_scope() as session:
+        claimed = AmazonIngestionRunRepository(session).claim_next_listings_job(
+            lease_owner="worker-b", lease_duration_seconds=300,
+            max_global_active=1, max_active_per_organization=1,
+        )
+        assert claimed is not None
+        assert claimed.id == enqueue_b.run_id
+        session.commit()
 
 
 @pytest.mark.asyncio

@@ -155,10 +155,22 @@ class AdsApiConnectionPlaceholder(BaseModel):
 
 
 class SellerMarketplaceRead(BaseModel):
-    """Canonical marketplace-participation read row. UI display only."""
+    """Canonical marketplace-participation read row. UI display only.
+
+    `id` is `AmazonMarketplaceParticipation.id` — an opaque internal
+    identifier, not a secret — added in 12B.3F so the frontend has a stable
+    way to address the 12B.3E Listings Read API's
+    `{marketplace_participation_id}` path segment. Before this, nothing in
+    any API response exposed that UUID, making the Listings API
+    unreachable from the UI; this mirrors existing precedent elsewhere in
+    this app (`report_id`, profit `model_id`, `job_id` are all exposed the
+    same way for the same reason: identifying a resource so the client can
+    make a follow-up request for it).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    id: UUID
     marketplace_id: str
     name: str | None = None
     country_code: str | None = None
@@ -319,6 +331,7 @@ class AmazonConnectionService:
                 return None, None, []
             marketplaces = [
                 SellerMarketplaceRead(
+                    id=participation.id,
                     marketplace_id=participation.marketplace_id,
                     name=participation.name,
                     country_code=participation.country_code,
@@ -356,9 +369,18 @@ class AmazonConnectionService:
                 "amazon connection overview ingestion-run table unavailable (pre-0009 schema)"
             )
             return None
-        if not runs:
+        # `list_for_connection` returns every run type for this connection
+        # (Listings runs included, since 12B.3D/12B.3G) — this overview
+        # field has only ever meant "seller validation" ingestion status,
+        # never Listings synchronization, and `AmazonIngestionStatusRead`
+        # below assumes `started_at` is always populated, which a queued/
+        # waiting_to_retry Listings run (12B.3G) genuinely does not have.
+        # Filtered here rather than narrowing `list_for_connection` itself,
+        # which other callers legitimately use for every run type.
+        marketplace_participation_runs = [r for r in runs if r.run_type == "marketplace_participations"]
+        if not marketplace_participation_runs:
             return None
-        latest = runs[0]
+        latest = marketplace_participation_runs[0]
         return AmazonIngestionStatusRead(
             status=latest.status,
             started_at=latest.started_at,

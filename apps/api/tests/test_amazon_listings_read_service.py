@@ -193,7 +193,9 @@ def test_never_synchronized_summary() -> None:
 @pytest.mark.parametrize(
     "db_status,expected_api_status",
     [
+        ("queued", "queued"),
         ("started", "running"),
+        ("waiting_to_retry", "waiting_to_retry"),
         ("succeeded", "succeeded"),
         ("failed", "failed"),
         ("partial", "partial"),
@@ -205,6 +207,66 @@ def test_run_status_maps_to_sync_status(db_status, expected_api_status) -> None:
     _seed_run(scope, status=db_status, failure_class="malformed_page" if db_status == "failed" else None)
     summary = AmazonListingsReadService().get_summary(scope["participation_id"])
     assert summary.sync.status == expected_api_status
+
+
+def test_queued_run_exposes_queued_at_with_a_null_started_at() -> None:
+    """12B.3G follow-up regression: a `queued` run genuinely has no
+    `started_at` (never claimed) — `queued_at` (mapped from `created_at`)
+    is the only truthful "how long has this been waiting" signal the
+    summary can offer, and the frontend's stale-queue detection depends
+    on it being present rather than null."""
+    scope = _seed_participation()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["org_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["participation_id"],
+            region="na",
+            environment="PRODUCTION",
+            connection_id=None,
+        )
+    assert claim.claimed is True
+
+    summary = AmazonListingsReadService().get_summary(scope["participation_id"])
+    assert summary.sync.status == "queued"
+    assert summary.sync.started_at is None
+    assert summary.sync.queued_at is not None
+
+
+def test_get_summary_never_mutates_a_queued_run_no_matter_how_stale(tmp_path) -> None:
+    """12B.3G follow-up: `GET .../listings/summary` must be a pure read.
+    Calling it repeatedly against an old, never-claimed `queued` run must
+    never change its status, lease fields, or any counter — a GET
+    endpoint performing a hidden write would be a serious correctness
+    defect regardless of whether it happened to "help" in this case."""
+    scope = _seed_participation()
+    with session_scope() as session:
+        old_run = AmazonIngestionRun(
+            organization_id=scope["org_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["participation_id"],
+            run_type="listings",
+            domain="listings_items",
+            region="na",
+            environment="PRODUCTION",
+            status="queued",
+            created_at=datetime.now(UTC) - timedelta(days=30),
+        )
+        session.add(old_run)
+        session.flush()
+        run_id = old_run.id
+
+    def snapshot():
+        with session_scope() as session:
+            row = session.get(AmazonIngestionRun, run_id)
+            return (row.status, row.lease_owner, row.lease_expires_at, row.started_at, row.retry_count)
+
+    before = snapshot()
+    service = AmazonListingsReadService()
+    for _ in range(3):
+        summary = service.get_summary(scope["participation_id"])
+        assert summary.sync.status == "queued"
+    assert snapshot() == before
 
 
 def test_latest_run_selected_not_an_older_one() -> None:

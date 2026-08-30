@@ -12,6 +12,7 @@ from app.api.routes.profit import router as profit_router
 from app.api.routes.advertising import router as advertising_router
 from app.api.routes.amazon_connection import router as amazon_connection_router
 from app.api.routes.amazon_listings import router as amazon_listings_router
+from app.api.routes.amazon_listings_sync import router as amazon_listings_sync_router
 
 api_router = APIRouter()
 api_router.include_router(products_router)
@@ -26,3 +27,4 @@ api_router.include_router(profit_router)
 api_router.include_router(advertising_router)
 api_router.include_router(amazon_connection_router)
 api_router.include_router(amazon_listings_router)
+api_router.include_router(amazon_listings_sync_router)

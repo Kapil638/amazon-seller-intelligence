@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+"use client";
+
+import { useEffect, useRef, type ReactNode } from "react";
 import Link from "next/link";
-import { BarChart3, Cable, FileSpreadsheet, History, IndianRupee, Search, Sparkles } from "lucide-react";
+import { BarChart3, Boxes, Cable, FileSpreadsheet, History, IndianRupee, Search, Sparkles } from "lucide-react";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UsagePanel } from "@/components/usage-panel";
@@ -11,6 +13,7 @@ const LINKS = [
   { id: "copilot", href: "/copilot", label: "Copilot", icon: Sparkles },
   { id: "profit", href: "/profit", label: "Profit", icon: IndianRupee },
   { id: "connection", href: "/connection", label: "Connection", icon: Cable },
+  { id: "seller-listings", href: "/seller-listings", label: "Seller Data", icon: Boxes },
   { id: "history", href: "/history", label: "History", icon: History },
   { id: "reports", href: "/reports", label: "Seller Reports", icon: BarChart3 },
   { id: "bulk", href: "/bulk", label: "Bulk Due Diligence", icon: FileSpreadsheet },
@@ -20,9 +23,30 @@ export function AppShell({
   current,
   children,
 }: {
-  current: "asin" | "copilot" | "profit" | "connection" | "history" | "reports" | "bulk";
+  current:
+    | "asin"
+    | "copilot"
+    | "profit"
+    | "connection"
+    | "seller-listings"
+    | "history"
+    | "reports"
+    | "bulk";
   children: ReactNode;
 }) {
+  const activeLinkRef = useRef<HTMLAnchorElement | null>(null);
+
+  // On initial render and whenever the active destination changes, bring
+  // it into view within the nav bar's own horizontal scroll region — not
+  // the page. `block: "nearest"` means no vertical scroll happens (the
+  // nav is already fully visible), and `inline: "nearest"` scrolls only
+  // the nearest scrollable ancestor (this `<nav>`, via `overflow-x-auto`)
+  // just enough to reveal the link, never re-centering it and never
+  // fighting a user's own manual horizontal scroll on every render.
+  useEffect(() => {
+    activeLinkRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [current]);
+
   return (
     <div className="min-h-full">
       <header className="sticky top-0 z-40 border-b border-border bg-surface/90 backdrop-blur-sm">
@@ -41,6 +65,8 @@ export function AppShell({
               <Link
                 key={id}
                 href={href}
+                ref={current === id ? activeLinkRef : undefined}
+                aria-current={current === id ? "page" : undefined}
                 className={cn(
                   "inline-flex items-center gap-1.5 whitespace-nowrap border-b-2 px-2.5 py-3 text-sm transition-colors duration-200",
                   current === id
