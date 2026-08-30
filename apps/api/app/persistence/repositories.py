@@ -5,9 +5,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Select, and_, func, or_, select, update
+from sqlalchemy import DateTime, Select, and_, case, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from app.amazon.secrets import InvalidSecretReferenceError, parse_asi_amazon_secret_reference
 from app.core.config import get_settings
@@ -2137,6 +2137,13 @@ class AmazonIngestionRunRepository:
             .limit(1)
         ).first()
 
+    # Reserved solely for `claim_next_listings_job`'s claim-decision
+    # critical section below. Must never be reused by any other
+    # `pg_advisory_xact_lock` call anywhere in this codebase — a
+    # collision would silently and incorrectly serialize two unrelated
+    # features against each other.
+    _LISTINGS_CLAIM_ADVISORY_LOCK_KEY = 847_539_201_663
+
     def claim_next_listings_job(
         self,
         *,
@@ -2144,7 +2151,6 @@ class AmazonIngestionRunRepository:
         lease_duration_seconds: int,
         max_global_active: int,
         max_active_per_organization: int,
-        batch_size: int = 50,
     ) -> AmazonIngestionRun | None:
         """Worker-side claim: atomically picks at most one eligible
         Listings job (`queued`, or `waiting_to_retry` whose `next_retry_at`
@@ -2152,15 +2158,63 @@ class AmazonIngestionRunRepository:
         per-organization concurrency limits, and transitions it to
         `started`.
 
-        PostgreSQL-safe claim semantics: candidates are selected with
-        `SELECT ... FOR UPDATE SKIP LOCKED`, so two workers racing this
-        method can never both select the same row — one gets it, the other
-        moves on to its next candidate (or finds none). `FOR UPDATE SKIP
-        LOCKED` is a no-op on SQLite (no row-level locking there), so this
-        method's *correctness under real concurrency* is proven only by
-        the guarded disposable-PostgreSQL suite, never by SQLite tests
-        alone — do not cite an SQLite test as proof of this method's
-        locking behavior.
+        Claims exactly one row with a single `UPDATE ... WHERE id = (SELECT
+        ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *` statement — the
+        candidate subquery locks at most the one row it will actually
+        claim, never a wider batch. An earlier version selected up to a
+        batch of candidates with `FOR UPDATE SKIP LOCKED` and iterated them
+        in Python to find one under the concurrency limits; that held row
+        locks on *every* candidate it merely inspected, not just the one it
+        claimed, so concurrent workers raced past those unnecessarily
+        locked rows via `SKIP LOCKED` and could come back with nothing even
+        though eligible jobs genuinely existed — proven directly by
+        `tests/postgres/test_disposable_postgres_listings_job_lifecycle_
+        concurrency.py::test_claim_next_listings_job_does_not_hold_locks_
+        on_unclaimed_candidates`, and originally surfaced by five
+        concurrent single-shot claims against five eligible jobs returning
+        as few as two successes. This version never touches — let alone
+        locks — any row besides the one it may claim.
+
+        On PostgreSQL, the whole decision (stale-reclaim + capacity check +
+        candidate pick + claim) additionally runs inside a single
+        transaction-scoped advisory lock (`pg_advisory_xact_lock`, released
+        automatically at commit or rollback — crash-safe, no explicit
+        unlock needed, and immune to a worker crashing mid-claim leaving it
+        held). Without this, the global/per-organization capacity checks
+        below are plain, non-locking `COUNT` reads: two concurrent workers
+        could each read the *same* pre-claim count before either commits,
+        both pass the same capacity gate, and each then claim a
+        *different* eligible row via `SKIP LOCKED` — correct with respect
+        to each other (never a double-claim), but together they could
+        exceed the configured cap, since neither one's read ever saw the
+        other's write. The advisory lock closes that gap by fully
+        serializing the decision step itself — never actual job execution,
+        heartbeat renewal, or completion, all of which happen in later,
+        independent transactions after this one has already committed and
+        released the lock. This trades a small amount of decision-time
+        throughput (claim *decisions* across different organizations are
+        serialized against each other; job *execution* is not) for a
+        capacity guarantee that is trivial to prove from a single lock,
+        rather than relying on `SERIALIZABLE` isolation's optimistic
+        abort-and-retry behavior, whose retry budget is hard to bound
+        under genuinely N-way concurrent contention on one small table. A
+        single global key is used rather than one key per organization:
+        which organization a call will end up claiming for is only known
+        *after* the candidate is already picked, so a "peek the
+        organization, take its lock, then re-verify" two-phase scheme
+        would add real complexity for a decision step whose actual cost is
+        a handful of index lookups. Only this one advisory-lock key is
+        ever acquired by this method, and never nested with another, so it
+        cannot deadlock against itself or anything else —
+        `test_many_queued_jobs_are_distributed_one_per_worker_with_no_
+        double_claim` and `test_more_workers_than_jobs_yields_one_success_
+        per_job_and_none_for_the_rest` both exercise this directly at
+        5-way concurrency with a bounded thread-join timeout, which would
+        hang instead of completing if any deadlock were possible.
+        `pg_advisory_xact_lock` is a no-op on SQLite (no such function
+        there, and no concurrent writers to protect against in that
+        dialect's own test suite), matching how `FOR UPDATE SKIP LOCKED`
+        is already treated below.
 
         `started_at` is set only on the *first* claim (`COALESCE`-style:
         left untouched if already set from an earlier attempt);
@@ -2171,6 +2225,12 @@ class AmazonIngestionRunRepository:
         `claim_listings_run`'s own stale-reclaim step, so their scope is
         freed before any new candidate is considered.
         """
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": self._LISTINGS_CLAIM_ADVISORY_LOCK_KEY},
+            )
+
         self.session.execute(
             update(AmazonIngestionRun)
             .where(
@@ -2189,16 +2249,26 @@ class AmazonIngestionRunRepository:
         )
         self.session.flush()
 
-        active_global = self.session.scalar(
+        _Global = aliased(AmazonIngestionRun)
+        global_active_count = (
             select(func.count())
-            .select_from(AmazonIngestionRun)
-            .where(AmazonIngestionRun.run_type == "listings", AmazonIngestionRun.status == "started")
+            .select_from(_Global)
+            .where(_Global.run_type == "listings", _Global.status == "started")
+            .scalar_subquery()
         )
-        if active_global is not None and active_global >= max_global_active:
-            return None
-
-        candidates = self.session.scalars(
-            select(AmazonIngestionRun)
+        _Org = aliased(AmazonIngestionRun)
+        org_active_count = (
+            select(func.count())
+            .select_from(_Org)
+            .where(
+                _Org.run_type == "listings",
+                _Org.status == "started",
+                _Org.organization_id == AmazonIngestionRun.organization_id,
+            )
+            .scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonIngestionRun.id)
             .where(
                 AmazonIngestionRun.run_type == "listings",
                 or_(
@@ -2209,37 +2279,37 @@ class AmazonIngestionRunRepository:
                         AmazonIngestionRun.next_retry_at <= func.now(),
                     ),
                 ),
+                global_active_count < max_global_active,
+                org_active_count < max_active_per_organization,
             )
-            .order_by(func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc())
-            .limit(batch_size)
+            .order_by(
+                func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc(),
+                AmazonIngestionRun.id.asc(),
+            )
+            .limit(1)
             .with_for_update(skip_locked=True)
-        ).all()
+            .scalar_subquery()
+        )
 
-        for candidate in candidates:
-            active_for_org = self.session.scalar(
-                select(func.count())
-                .select_from(AmazonIngestionRun)
-                .where(
-                    AmazonIngestionRun.organization_id == candidate.organization_id,
-                    AmazonIngestionRun.run_type == "listings",
-                    AmazonIngestionRun.status == "started",
-                )
+        claimed = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(AmazonIngestionRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                last_heartbeat_at=func.now(),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonIngestionRun.started_at, func.now()),
+                retry_count=case(
+                    (AmazonIngestionRun.status == "waiting_to_retry", AmazonIngestionRun.retry_count + 1),
+                    else_=AmazonIngestionRun.retry_count,
+                ),
             )
-            if active_for_org is not None and active_for_org >= max_active_per_organization:
-                continue
-            was_retry = candidate.status == "waiting_to_retry"
-            candidate.status = "started"
-            candidate.lease_owner = lease_owner
-            candidate.lease_expires_at = self._lease_expiry_value(lease_duration_seconds)
-            candidate.last_heartbeat_at = func.now()
-            candidate.next_retry_at = None
-            if candidate.started_at is None:
-                candidate.started_at = func.now()
-            if was_retry:
-                candidate.retry_count = candidate.retry_count + 1
-            self.session.flush()
-            return candidate
-        return None
+            .returning(AmazonIngestionRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
 
     def count_active_listings_runs_for_organization(self, organization_id: UUID) -> int:
         """Nonterminal (`queued`/`started`/`waiting_to_retry`) Listings run

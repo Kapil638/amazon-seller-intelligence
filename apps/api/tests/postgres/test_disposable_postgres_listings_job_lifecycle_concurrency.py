@@ -340,6 +340,216 @@ def test_many_queued_jobs_are_distributed_one_per_worker_with_no_double_claim(di
     assert len(set(claimed_run_ids)) == 5  # no run id claimed twice
 
 
+def test_claim_next_listings_job_does_not_hold_locks_on_unclaimed_candidates(disposable_engine) -> None:
+    """Diagnostic proof for the over-locking bug this claim was rewritten
+    to fix: `claim_next_listings_job` claims at most one row, so every
+    OTHER eligible candidate must remain completely unlocked for the rest
+    of the claiming transaction — a fully independent connection must be
+    able to lock any of them *immediately* (`NOWAIT`), with no need to
+    wait for this transaction to commit or roll back. The earlier
+    implementation selected a whole batch of candidates with `FOR UPDATE
+    SKIP LOCKED` and only chose one in Python afterward, holding row
+    locks on every candidate it merely inspected; that version would fail
+    this exact assertion, since the un-chosen candidates would stay
+    locked (and therefore not `NOWAIT`-lockable) until the whole
+    transaction ended — which is exactly what produced the 2-of-5
+    under-claim this test file's other test above once required a real
+    fixture fix to even reach.
+    """
+    org_id = uuid4()
+    run_ids: list[UUID] = []
+    for _ in range(3):
+        _, seller_account_id, participation_id = _seed_scope(disposable_engine, org_id=org_id)
+        with Session(disposable_engine) as session:
+            enqueue = AmazonIngestionRunRepository(session).enqueue_listings_run(
+                organization_id=org_id, seller_account_id=seller_account_id,
+                marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
+                connection_id=None,
+            )
+            session.commit()
+        assert enqueue.claimed is True
+        run_ids.append(enqueue.run_id)
+
+    claiming_session = Session(disposable_engine)
+    try:
+        claimed = AmazonIngestionRunRepository(claiming_session).claim_next_listings_job(
+            lease_owner="worker-1", lease_duration_seconds=300,
+            max_global_active=10, max_active_per_organization=10,
+        )
+        assert claimed is not None
+        unclaimed_ids = [rid for rid in run_ids if rid != claimed.id]
+        assert len(unclaimed_ids) == 2
+
+        with disposable_engine.connect() as probe_conn:
+            with probe_conn.begin():
+                for rid in unclaimed_ids:
+                    probe_conn.execute(
+                        text("SELECT id FROM amazon_ingestion_runs WHERE id = :id FOR UPDATE NOWAIT"),
+                        {"id": rid},
+                    )
+    finally:
+        claiming_session.rollback()
+        claiming_session.close()
+
+
+def test_more_workers_than_jobs_yields_one_success_per_job_and_none_for_the_rest(disposable_engine) -> None:
+    """Three eligible jobs, five concurrent workers: exactly three
+    successes (one per job, no duplicates), and the two excess workers
+    must get `None` rather than an error or a stalled claim."""
+    org_id = uuid4()
+    run_ids: list[UUID] = []
+    for _ in range(3):
+        _, seller_account_id, participation_id = _seed_scope(disposable_engine, org_id=org_id)
+        with Session(disposable_engine) as session:
+            enqueue = AmazonIngestionRunRepository(session).enqueue_listings_run(
+                organization_id=org_id, seller_account_id=seller_account_id,
+                marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
+                connection_id=None,
+            )
+            session.commit()
+        assert enqueue.claimed is True
+        run_ids.append(enqueue.run_id)
+
+    barrier = threading.Barrier(5)
+    outcomes: list[_ClaimOutcome] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    threads = [
+        threading.Thread(
+            target=_worker_claim_attempt,
+            kwargs=dict(
+                engine=disposable_engine, worker=f"worker-{i}", barrier=barrier,
+                outcomes=outcomes, errors=errors, lock=lock, max_global=10, max_per_org=10,
+            ),
+        )
+        for i in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert errors == []
+    assert len(outcomes) == 5
+    successes = [o.run_id for o in outcomes if o.run_id is not None]
+    failures = [o for o in outcomes if o.run_id is None]
+    assert len(successes) == 3
+    assert len(failures) == 2
+    assert sorted(successes) == sorted(run_ids)
+    assert len(set(successes)) == 3
+
+
+def test_fewer_workers_than_jobs_leaves_the_remainder_queued_under_real_concurrency(disposable_engine) -> None:
+    """Five eligible jobs, two concurrent workers: exactly two distinct
+    jobs are claimed and the other three remain genuinely `queued` —
+    a worker never claims more than one job per call, and a scarcity of
+    workers never causes a job to be dropped or duplicated."""
+    org_id = uuid4()
+    run_ids: list[UUID] = []
+    for _ in range(5):
+        _, seller_account_id, participation_id = _seed_scope(disposable_engine, org_id=org_id)
+        with Session(disposable_engine) as session:
+            enqueue = AmazonIngestionRunRepository(session).enqueue_listings_run(
+                organization_id=org_id, seller_account_id=seller_account_id,
+                marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
+                connection_id=None,
+            )
+            session.commit()
+        assert enqueue.claimed is True
+        run_ids.append(enqueue.run_id)
+
+    barrier = threading.Barrier(2)
+    outcomes: list[_ClaimOutcome] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    threads = [
+        threading.Thread(
+            target=_worker_claim_attempt,
+            kwargs=dict(
+                engine=disposable_engine, worker=f"worker-{i}", barrier=barrier,
+                outcomes=outcomes, errors=errors, lock=lock, max_global=10, max_per_org=10,
+            ),
+        )
+        for i in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert errors == []
+    successes = [o.run_id for o in outcomes if o.run_id is not None]
+    assert len(successes) == 2
+    assert len(set(successes)) == 2
+    assert set(successes).issubset(set(run_ids))
+
+    with Session(disposable_engine) as session:
+        statuses = {
+            row.id: row.status
+            for row in session.query(AmazonIngestionRun).filter(AmazonIngestionRun.id.in_(run_ids)).all()
+        }
+    started = [rid for rid, status in statuses.items() if status == "started"]
+    queued = [rid for rid, status in statuses.items() if status == "queued"]
+    assert len(started) == 2
+    assert len(queued) == 3
+
+
+def test_claim_skips_a_row_locked_by_another_transaction_and_claims_the_next_one(disposable_engine) -> None:
+    """A row already locked by a concurrent, uncommitted transaction
+    (here a plain `FOR UPDATE` holder — not another claim call) must be
+    skipped via `SKIP LOCKED` in favor of the next eligible candidate,
+    never blocked on, and never left in any state but its original
+    `queued` once skipped."""
+    org_id, seller_account_id, participation_id = _seed_scope(disposable_engine)
+    with Session(disposable_engine) as session:
+        first = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=org_id, seller_account_id=seller_account_id,
+            marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
+            connection_id=None,
+        )
+        session.commit()
+    assert first.claimed is True
+
+    _, seller_account_id_2, participation_id_2 = _seed_scope(disposable_engine, org_id=org_id)
+    with Session(disposable_engine) as session:
+        second = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=org_id, seller_account_id=seller_account_id_2,
+            marketplace_participation_id=participation_id_2, region="na", environment="PRODUCTION",
+            connection_id=None,
+        )
+        session.commit()
+    assert second.claimed is True
+
+    # Force deterministic FIFO order: `first` would be picked first on
+    # ordering grounds alone, so skipping it can only be due to the lock.
+    with Session(disposable_engine) as session:
+        row = session.get(AmazonIngestionRun, first.run_id)
+        row.created_at = datetime.now(UTC) - timedelta(minutes=5)
+        session.commit()
+
+    holder_conn = disposable_engine.connect()
+    holder_txn = holder_conn.begin()
+    holder_conn.execute(
+        text("SELECT id FROM amazon_ingestion_runs WHERE id = :id FOR UPDATE"), {"id": first.run_id}
+    )
+    try:
+        with Session(disposable_engine) as session:
+            claimed = AmazonIngestionRunRepository(session).claim_next_listings_job(
+                lease_owner="worker-1", lease_duration_seconds=300,
+                max_global_active=10, max_active_per_organization=10,
+            )
+            session.commit()
+        assert claimed is not None
+        assert claimed.id == second.run_id  # skipped the locked, older row
+
+        with Session(disposable_engine) as session:
+            still_queued = session.get(AmazonIngestionRun, first.run_id)
+            assert still_queued.status == "queued"  # untouched, only skipped
+    finally:
+        holder_txn.rollback()
+        holder_conn.close()
+
+
 def test_per_organization_concurrency_limit_is_enforced_under_concurrent_claims(disposable_engine) -> None:
     """Two queued jobs for the SAME organization (different participations),
     `max_active_per_organization=1`: only one may ever transition to
@@ -583,10 +793,17 @@ def test_migration_0011_upgrade_preserves_existing_0010_rows_and_widens_constrai
     assert claim.claimed is True
 
     # The widened CHECK constraint now genuinely accepts the new states.
+    # A second, genuinely seeded scope is used here (reusing the same org)
+    # rather than a fabricated participation id — the FK to
+    # `amazon_marketplace_participations` is real, and the original
+    # `participation_id` already has a queued row from `enqueue_listings_run`
+    # above, so reusing it here would collide with the widened partial
+    # unique index instead of proving anything new.
+    _, seller_account_id_2, participation_id_2 = _seed_scope(disposable_engine, org_id=org_id)
     with Session(disposable_engine) as session:
         queued_row = AmazonIngestionRun(
-            id=uuid4(), organization_id=org_id, seller_account_id=seller_account_id,
-            marketplace_participation_id=uuid4(), run_type="listings", domain="listings_items",
+            id=uuid4(), organization_id=org_id, seller_account_id=seller_account_id_2,
+            marketplace_participation_id=participation_id_2, run_type="listings", domain="listings_items",
             region="na", environment="PRODUCTION", status="queued", started_at=None,
         )
         session.add(queued_row)
