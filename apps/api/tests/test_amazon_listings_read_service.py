@@ -270,10 +270,22 @@ def test_get_summary_never_mutates_a_queued_run_no_matter_how_stale(tmp_path) ->
 
 
 def test_latest_run_selected_not_an_older_one() -> None:
+    """`get_latest_listings_run` orders by `created_at` — set explicitly
+    here (not left to each row's own insertion-time default) because
+    SQLite's `CURRENT_TIMESTAMP` only has second-level precision; two
+    rows seeded microseconds apart in a fast test can otherwise land in
+    the same second and fall through to the `id` tiebreaker, whose
+    random UUID ordering has nothing to do with which row is actually
+    newer. Explicit `created_at` values make the test's intended
+    timeline the one actually stored, matching how a real, temporally
+    separated production timeline naturally avoids this collision."""
     scope = _seed_participation()
     now = datetime.now(UTC)
-    _seed_run(scope, status="failed", failure_class="malformed_page", started_at=now - timedelta(minutes=10))
-    _seed_run(scope, status="succeeded", started_at=now)
+    _seed_run(
+        scope, status="failed", failure_class="malformed_page",
+        started_at=now - timedelta(minutes=10), created_at=now - timedelta(minutes=10),
+    )
+    _seed_run(scope, status="succeeded", started_at=now, created_at=now)
     summary = AmazonListingsReadService().get_summary(scope["participation_id"])
     assert summary.sync.status == "succeeded"
 
@@ -281,11 +293,16 @@ def test_latest_run_selected_not_an_older_one() -> None:
 def test_last_successful_synchronized_at_survives_a_later_failure() -> None:
     """The latest attempt failed, but a PRIOR attempt succeeded — the
     summary's overall status reflects the latest attempt, while
-    last_successful_synchronized_at still reflects the earlier success."""
+    last_successful_synchronized_at still reflects the earlier success.
+    `created_at` set explicitly for the same reason as the test above —
+    see its docstring."""
     scope = _seed_participation()
     now = datetime.now(UTC)
-    _seed_run(scope, status="succeeded", started_at=now - timedelta(minutes=10), completed_at=now - timedelta(minutes=9))
-    _seed_run(scope, status="failed", failure_class="request_failed", started_at=now)
+    _seed_run(
+        scope, status="succeeded", started_at=now - timedelta(minutes=10),
+        completed_at=now - timedelta(minutes=9), created_at=now - timedelta(minutes=10),
+    )
+    _seed_run(scope, status="failed", failure_class="request_failed", started_at=now, created_at=now)
     summary = AmazonListingsReadService().get_summary(scope["participation_id"])
     assert summary.sync.status == "failed"
     assert summary.sync.last_successful_synchronized_at is not None

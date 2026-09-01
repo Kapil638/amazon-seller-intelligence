@@ -279,6 +279,267 @@ def test_no_cooldown_configured_allows_immediate_re_trigger() -> None:
     assert outcome.reason == "queued"
 
 
+def test_cooldown_response_includes_retry_allowed_at() -> None:
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+        created_at = session.get(AmazonIngestionRun, claim.run_id).created_at
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).complete_listings_run(
+            scope["organization_id"], claim.run_id, lease_owner="worker-1", status="succeeded",
+        )
+        completed_at = session.get(AmazonIngestionRun, claim.run_id).completed_at
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    assert outcome.reason == "cooldown"
+    assert outcome.retry_allowed_at is not None
+    # Anchored to completed_at, not created_at — asserted against both so
+    # a regression back to created_at would be caught even though the two
+    # happen to be milliseconds apart in this fast test (see the dedicated
+    # anchoring test below for a version with a real gap between them).
+    expected = completed_at.replace(tzinfo=completed_at.tzinfo or UTC) + timedelta(seconds=600)
+    assert abs((outcome.retry_allowed_at - expected).total_seconds()) < 2
+
+
+def test_cooldown_retry_allowed_at_is_anchored_to_completed_at_not_created_at() -> None:
+    """The cooldown must pace against when the last real Amazon attempt
+    *finished*, not when it was merely queued — a job that sits queued
+    for a while before a worker claims it would otherwise let its
+    cooldown clock run out before the real call it's meant to pace
+    against has even happened. `created_at` and `completed_at` are
+    forced deliberately far apart here so any regression back to
+    anchoring on `created_at` fails by minutes, not milliseconds."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        row = session.get(AmazonIngestionRun, claim.run_id)
+        row.created_at = datetime.now(UTC) - timedelta(minutes=20)
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).complete_listings_run(
+            scope["organization_id"], claim.run_id, lease_owner="worker-1", status="succeeded",
+        )
+        completed_at = session.get(AmazonIngestionRun, claim.run_id).completed_at
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    assert outcome.reason == "cooldown"
+    expected_from_completed_at = completed_at.replace(tzinfo=completed_at.tzinfo or UTC) + timedelta(seconds=600)
+    assert abs((outcome.retry_allowed_at - expected_from_completed_at).total_seconds()) < 2
+    # If this were still anchored to created_at (20 minutes earlier plus a
+    # 600s/10-minute cooldown), retry_allowed_at would already be roughly
+    # 10 minutes in the *past* relative to now — nowhere near the
+    # completed_at-anchored value asserted above.
+    assert outcome.retry_allowed_at > datetime.now(UTC)
+
+
+def test_cooldown_falls_back_to_created_at_when_completed_at_is_missing() -> None:
+    """Documented legacy-data fallback: every real terminal-transition
+    path in this codebase (`complete_listings_run`, the stale-lease
+    `timed_out` reclaim, `terminalize_unclaimed_listings_run`) always
+    sets `completed_at`, so this scenario cannot occur through any
+    current write path — it is simulated directly to prove the fallback
+    itself, not to claim it happens in practice."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).complete_listings_run(
+            scope["organization_id"], claim.run_id, lease_owner="worker-1", status="succeeded",
+        )
+    with session_scope() as session:
+        row = session.get(AmazonIngestionRun, claim.run_id)
+        row.completed_at = None  # simulates legacy data missing this column's value
+        created_at = row.created_at
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    assert outcome.reason == "cooldown"
+    expected_from_created_at = created_at.replace(tzinfo=created_at.tzinfo or UTC) + timedelta(seconds=600)
+    assert abs((outcome.retry_allowed_at - expected_from_created_at).total_seconds()) < 2
+
+
+# --- regression: a `cancelled_before_start` row must never defeat the -----
+# --- cooldown for a genuinely newer, real run (production incident) -------
+
+
+def test_an_old_cancelled_before_start_row_does_not_hide_a_newer_real_run_from_cooldown() -> None:
+    """Motivated by the production incident, but this specific assertion
+    is dialect-independent by design: `get_latest_cooldown_relevant_
+    listings_run` excludes `cancelled_before_start` rows via a `WHERE`
+    filter, not merely by out-ranking them in `ORDER BY` — so this passes
+    regardless of a database's null-ordering default. The production
+    defect itself (an old `cancelled_before_start` row's `NULL started_at`
+    silently outranking a newer real row under PostgreSQL's `NULLS FIRST`
+    for `DESC`) can only be reproduced against real PostgreSQL — see
+    `test_get_latest_listings_run_is_not_fooled_by_a_null_started_at_row`
+    in `tests/postgres/test_disposable_postgres_listings_sync_trigger_
+    concurrency.py`. This test instead proves the resulting business
+    behavior: a days-old cancelled row must never suppress the cooldown
+    that a real, recent run should impose."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        cancelled_claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+        )
+        row = session.get(AmazonIngestionRun, cancelled_claim.run_id)
+        row.created_at = datetime.now(UTC) - timedelta(days=3)
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).terminalize_unclaimed_listings_run(
+            scope["organization_id"], cancelled_claim.run_id
+        )
+
+    with session_scope() as session:
+        real_claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).complete_listings_run(
+            scope["organization_id"], real_claim.run_id, lease_owner="worker-1", status="succeeded",
+        )
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=3600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    assert outcome.reason == "cooldown"
+    assert outcome.job is not None
+    assert outcome.job.run_id == real_claim.run_id  # the real run, not the 3-day-old cancelled one
+
+
+def test_cancelled_before_start_itself_never_imposes_a_cooldown() -> None:
+    """The whole point of `terminalize-queued` is to unblock a stuck scope
+    immediately — an operator should never have to additionally wait out
+    a cooldown caused by the very job they just cancelled, since it made
+    zero Amazon calls."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+        )
+    with session_scope() as session:
+        terminalized = AmazonIngestionRunRepository(session).terminalize_unclaimed_listings_run(
+            scope["organization_id"], claim.run_id
+        )
+    assert terminalized is True
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=3600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    assert outcome.reason == "queued"
+
+
+def test_get_latest_listings_run_orders_by_created_at_not_started_at() -> None:
+    """Confirms current, fixed behavior on SQLite — but SQLite defaults to
+    `NULLS LAST` for `DESC`, the opposite of PostgreSQL's `NULLS FIRST`,
+    so this scenario would also have passed against the *pre-fix* query
+    (`ORDER BY started_at DESC`) on this dialect alone. This test is not
+    proof the regression is fixed; it only proves the current query still
+    behaves correctly here. The actual regression proof — which requires
+    PostgreSQL's real null-ordering semantics to even be capable of
+    failing — is `test_get_latest_listings_run_is_not_fooled_by_a_null_
+    started_at_row` in `tests/postgres/test_disposable_postgres_listings_
+    sync_trigger_concurrency.py`."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        never_started = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+        )
+        row = session.get(AmazonIngestionRun, never_started.run_id)
+        row.created_at = datetime.now(UTC) - timedelta(days=3)
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).terminalize_unclaimed_listings_run(
+            scope["organization_id"], never_started.run_id
+        )
+
+    with session_scope() as session:
+        real_claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+
+    with session_scope() as session:
+        latest = AmazonIngestionRunRepository(session).get_latest_listings_run(
+            scope["organization_id"], scope["marketplace_participation_id"]
+        )
+        assert latest.id == real_claim.run_id
+
+
+def test_get_latest_listings_run_tiebreak_prefers_a_started_row_on_an_exact_created_at_tie() -> None:
+    """Dialect-independent (unlike the days-old-vs-new scenario above,
+    which depends on PostgreSQL's real `NULLS FIRST` semantics to even be
+    capable of failing): forces an *exact* `created_at` tie between a
+    never-started cancelled row and a real started row. `created_at`
+    alone cannot break this tie in either row's favor — the
+    `started_at IS NOT NULL` tiebreak must, structurally and
+    deterministically (an explicit `ORDER BY` term, not a coincidence of
+    row content), never leaving this to the luck of a random UUID
+    comparison."""
+    scope = _seed_scope()
+    tie_point = datetime.now(UTC)
+    with session_scope() as session:
+        cancelled_claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+        )
+        session.get(AmazonIngestionRun, cancelled_claim.run_id).created_at = tie_point
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).terminalize_unclaimed_listings_run(
+            scope["organization_id"], cancelled_claim.run_id
+        )
+
+    with session_scope() as session:
+        real_claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        session.get(AmazonIngestionRun, real_claim.run_id).created_at = tie_point  # the exact same instant
+
+    with session_scope() as session:
+        latest = AmazonIngestionRunRepository(session).get_latest_listings_run(
+            scope["organization_id"], scope["marketplace_participation_id"]
+        )
+        assert latest.id == real_claim.run_id, "a same-created_at cancelled row outranked the real one"
+
+
 # --- admission control: per-organization / global limits ------------------
 
 

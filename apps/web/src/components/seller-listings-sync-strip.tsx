@@ -98,7 +98,13 @@ export function SellerListingsSyncStrip({
           <p className="text-xs text-muted-foreground">
             Last successful sync: {formatDateTime(sync.last_successful_synchronized_at)}
           </p>
-          <Button type="button" size="sm" disabled={!canSync || disabled} onClick={onSync}>
+          <Button
+            type="button"
+            size="sm"
+            disabled={!canSync || disabled}
+            aria-busy={triggering}
+            onClick={onSync}
+          >
             {showSpinner ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
             {buttonLabel}
           </Button>

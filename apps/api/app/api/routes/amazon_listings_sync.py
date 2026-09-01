@@ -17,6 +17,7 @@ secrets, and never bypasses the existing single-writer guarantee.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -57,6 +58,10 @@ class ListingsSyncTriggerResponse(BaseModel):
     reason: str
     message: str | None = None
     job: ListingsSyncJobStatus | None = None
+    # Populated only for reason="cooldown" — the database-computed moment
+    # after which a new trigger will be accepted again. Never derived
+    # from or compared against the caller's own clock.
+    retry_allowed_at: datetime | None = None
 
 
 def _status_for_trigger_reason(reason: str) -> int:
@@ -94,6 +99,7 @@ async def sync_listings(
         reason=outcome.reason,
         message=None if outcome.reason == "queued" else _TRIGGER_MESSAGES.get(outcome.reason, _DEFAULT_FAILURE_MESSAGE),
         job=outcome.job,
+        retry_allowed_at=outcome.retry_allowed_at,
     )
     public_model_dump(response)
 

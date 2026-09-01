@@ -1652,6 +1652,9 @@ export type ListingsSyncTriggerResponse = {
   reason: ListingsSyncTriggerReason;
   message: string | null;
   job: ListingsSyncJobStatus | null;
+  // Populated only for reason "cooldown" — the server-computed moment
+  // after which a new trigger will be accepted again.
+  retry_allowed_at?: string | null;
 };
 
 export type AmazonIngestionRunStatus = "started" | "succeeded" | "partial" | "failed" | "timed_out";

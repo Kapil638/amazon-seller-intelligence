@@ -1603,6 +1603,18 @@ class ListingsRunClaim:
     reason: str | None = None  # "already_running" when claimed is False
 
 
+# Shared by `get_latest_listings_run` and `get_latest_cooldown_relevant_
+# listings_run` — see the former's docstring for why the second key
+# (a boolean expression, never null on either PostgreSQL or SQLite) is
+# required to keep a same-`created_at` `cancelled_before_start` row from
+# ever outranking a genuinely newer, actually-started one.
+_LATEST_LISTINGS_RUN_ORDER_BY = (
+    AmazonIngestionRun.created_at.desc(),
+    AmazonIngestionRun.started_at.is_not(None).desc(),
+    AmazonIngestionRun.id.desc(),
+)
+
+
 class AmazonIngestionRunRepository:
     """Org- and seller-account-scoped ingestion-run lifecycle records.
 
@@ -1760,7 +1772,52 @@ class AmazonIngestionRunRepository:
         completes anything. Deliberately excludes every other `run_type`
         (e.g. `marketplace_participations`) so a caller can never mistake
         an unrelated synchronization for Listings synchronization
-        evidence."""
+        evidence.
+
+        Orders by `created_at` (every row has one — server-generated at
+        insert, never null), not `started_at`. An earlier version ordered
+        by `started_at DESC, id DESC`: `started_at` is null for any row
+        that was never claimed (most notably a `cancelled_before_start`
+        administrative cancellation — see `listings_job_admin`), and
+        PostgreSQL's default `NULLS FIRST` for `DESC` sorts every such row
+        *ahead* of every genuinely more recent, actually-started row,
+        forever, however old it is. In production this caused
+        `AmazonListingsSyncTriggerService.trigger()`'s cooldown check (a
+        direct caller of this method) to read a multi-day-old
+        never-started row's `created_at` as "the latest run" long after
+        three brand-new successful runs had actually happened, so the
+        cooldown's elapsed-time computation was never remotely close to
+        triggering — the cooldown was silently inert for that
+        participation. The same bug independently made `get_summary`'s
+        sync-status evidence show that stale cancelled row as "latest"
+        while real, newer synchronizations kept succeeding. Confirmed
+        directly against the live database: this method returned a
+        `cancelled_before_start` row from days earlier while three newer
+        `succeeded` rows already existed. `created_at` ordering has no
+        null to worry about and is also the more honest definition of
+        "latest" for evidence purposes regardless — the moment this run
+        was created, not the moment (if any) a worker got to it.
+
+        Ties broken by `started_at IS NOT NULL` before `id`: `created_at`
+        alone is not a *sufficient* tiebreak-free key on every backend —
+        SQLite's `CURRENT_TIMESTAMP` (what `created_at`'s server default
+        compiles to there) only has second-level precision, so two rows
+        genuinely created microseconds apart in rapid succession can
+        still tie exactly. Falling through to `id DESC` alone in that
+        case would compare random UUIDs, which is stable (the same query
+        against the same data always returns the same row) but not
+        *correct*: it has no relationship to which row is actually more
+        recent, and could just as easily pick a tied `cancelled_before_
+        start` row (`started_at IS NULL`) over a genuinely newer one that
+        happened to tie it. `AmazonIngestionRun.started_at.is_not(None)`
+        is a boolean expression, not a nullable column being sorted
+        directly — it evaluates to plain `TRUE`/`FALSE` for every row on
+        both PostgreSQL and SQLite, so it carries none of the `NULLS
+        FIRST`/`NULLS LAST` divergence a raw `started_at` sort would. This
+        guarantees a row that actually started can never be outranked by
+        a same-`created_at` row that never did; `id DESC` remains only as
+        the final, genuinely-arbitrary tiebreak for two rows that tie on
+        both `created_at` and started-ness."""
         return self.session.scalars(
             select(AmazonIngestionRun)
             .where(
@@ -1768,7 +1825,37 @@ class AmazonIngestionRunRepository:
                 AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
                 AmazonIngestionRun.run_type == "listings",
             )
-            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .order_by(*_LATEST_LISTINGS_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_latest_cooldown_relevant_listings_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """Like `get_latest_listings_run`, but excludes `cancelled_before_
+        start` rows. An administrative cancellation of a job that never
+        started never made an Amazon call and did zero work — the entire
+        point of `terminalize-queued` is to unblock a stuck scope so a
+        real attempt can proceed, so it must never itself impose a fresh
+        cooldown on top of the wait the operator just ended. Every other
+        terminal outcome (`succeeded`, `partial`, `timed_out`, and a
+        genuine `failed` run that actually made an Amazon call before
+        failing) still counts toward the cooldown, because each of those
+        represents real, recent Amazon API usage worth pacing against.
+        Same tie-safe ordering as `get_latest_listings_run` — see its
+        docstring."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "listings",
+                or_(
+                    AmazonIngestionRun.failure_class.is_(None),
+                    AmazonIngestionRun.failure_class != "cancelled_before_start",
+                ),
+            )
+            .order_by(*_LATEST_LISTINGS_RUN_ORDER_BY)
             .limit(1)
         ).first()
 

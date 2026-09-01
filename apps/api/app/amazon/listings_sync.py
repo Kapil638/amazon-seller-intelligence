@@ -19,10 +19,11 @@ helper the synchronous path and the durable worker path both already use.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func, select
 
 from app.amazon.common import ensure_utc
 from app.amazon.listings_ingestion import AmazonListingsIngestionService, _ClaimFailure
@@ -81,10 +82,16 @@ class ListingsSyncTriggerOutcome:
     being full. A legitimate new job is never rejected merely because
     workers are busy — it is accepted as `queued` and simply waits;
     `claim_next_listings_job`'s own `started`-only counts are the only
-    place execution capacity is enforced, strictly at claim time."""
+    place execution capacity is enforced, strictly at claim time.
+
+    `retry_allowed_at` is populated only for `reason="cooldown"` — the
+    database-computed moment (the cooldown-relevant run's `created_at`
+    plus the configured cooldown window) after which a new trigger will
+    be accepted again. Always `None` otherwise."""
 
     reason: str
     job: ListingsSyncJobStatus | None = None
+    retry_allowed_at: datetime | None = None
 
 
 def _job_status_from_row(row: AmazonIngestionRun) -> ListingsSyncJobStatus:
@@ -157,11 +164,47 @@ class AmazonListingsSyncTriggerService:
             if active is not None:
                 return ListingsSyncTriggerOutcome(reason="already_running", job=_job_status_from_row(active))
 
-            latest = runs.get_latest_listings_run(organization_id, marketplace_participation_id)
-            if latest is not None and latest.created_at is not None:
-                elapsed_seconds = (datetime.now(UTC) - ensure_utc(latest.created_at)).total_seconds()
-                if elapsed_seconds < cfg.listings_sync_trigger_cooldown_seconds:
-                    return ListingsSyncTriggerOutcome(reason="cooldown", job=_job_status_from_row(latest))
+            # Cooldown-relevant, not `get_latest_listings_run` — a
+            # `cancelled_before_start` administrative cancellation never
+            # made an Amazon call and must never itself extend a cooldown
+            # (see `get_latest_cooldown_relevant_listings_run`'s
+            # docstring for the production incident this distinction
+            # fixes: that method's predecessor let a days-old cancelled
+            # row silently defeat this cooldown entirely for three
+            # consecutive real Amazon calls).
+            latest = runs.get_latest_cooldown_relevant_listings_run(organization_id, marketplace_participation_id)
+            if latest is not None and cfg.listings_sync_trigger_cooldown_seconds > 0:
+                # Anchored to `completed_at` — the moment the last real
+                # Amazon attempt actually *finished* — not `created_at`
+                # (when it was merely queued). By the time control reaches
+                # here, `get_active_listings_run` has already confirmed no
+                # queued/started/waiting_to_retry row exists, so `latest`
+                # (excluding `cancelled_before_start`, which is never
+                # cooldown-relevant at all) is always a genuinely terminal
+                # run, and every terminal-transition path in this codebase
+                # (`complete_listings_run`, the stale-lease `timed_out`
+                # reclaim, and `terminalize_unclaimed_listings_run` itself)
+                # unconditionally sets `completed_at`. `created_at` is used
+                # only as a documented fallback for hypothetical legacy
+                # rows that predate that guarantee or were written outside
+                # it — never for a row this codebase's own write paths
+                # produced. Anchoring on completion, not creation, matters
+                # in practice: a job that sits queued for a while before a
+                # worker claims it would otherwise let its cooldown clock
+                # run out *before* the real Amazon call it's meant to pace
+                # against has even happened.
+                anchor = latest.completed_at if latest.completed_at is not None else latest.created_at
+                # Database time, not the API process's own clock — the
+                # same authority this codebase already insists on for
+                # lease/retry timing (see `_lease_expiry_value`), so a
+                # skewed application clock can never distort the cooldown
+                # window in either direction.
+                db_now = session.execute(select(func.now())).scalar_one()
+                retry_allowed_at = ensure_utc(anchor) + timedelta(seconds=cfg.listings_sync_trigger_cooldown_seconds)
+                if ensure_utc(db_now) < retry_allowed_at:
+                    return ListingsSyncTriggerOutcome(
+                        reason="cooldown", job=_job_status_from_row(latest), retry_allowed_at=retry_allowed_at
+                    )
 
             # Queue-backlog safety valve only — deliberately NOT a worker-
             # execution-capacity check. A legitimate new job must never be

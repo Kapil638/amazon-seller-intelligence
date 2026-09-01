@@ -159,8 +159,20 @@ class Settings(BaseSettings):
         description="Maximum number of Listings jobs one organization may run simultaneously.",
     )
     listings_sync_trigger_cooldown_seconds: int = Field(
-        default=30, ge=0, le=3600,
-        description="Minimum time after a Listings job's own creation before the trigger endpoint accepts another request for the same marketplace participation, independent of the single-active-job guarantee.",
+        default=300, ge=0, le=3600,
+        description=(
+            "Minimum time after a Listings job's own creation before the trigger endpoint accepts "
+            "another request for the same marketplace participation, independent of the "
+            "single-active-job guarantee. Raised from an earlier default of 30 seconds after a "
+            "production incident: a manual sync button's own completed job frequently finishes in "
+            "well under a minute for a small catalog, so 30 seconds left a wide window in which an "
+            "impatient repeat click (or a second browser tab) triggered another genuine, billable "
+            "Amazon SP-API call. 300 seconds (5 minutes) is long enough to absorb that normal human "
+            "re-click pattern while still letting a seller re-run a sync well within the same working "
+            "session after making a real change on Amazon's side. A `cancelled_before_start` "
+            "administrative cancellation is deliberately excluded from this cooldown entirely — see "
+            "`AmazonIngestionRunRepository.get_latest_cooldown_relevant_listings_run`."
+        ),
     )
     listings_sync_max_queued_per_organization: int = Field(
         default=25, ge=1, le=1000,
