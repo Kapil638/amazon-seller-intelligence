@@ -538,13 +538,21 @@ def test_claim_skips_a_row_locked_by_another_transaction_and_claims_the_next_one
                 lease_owner="worker-1", lease_duration_seconds=300,
                 max_global_active=10, max_active_per_organization=10,
             )
+            # Captured as a plain value *before* `session.commit()` —
+            # SQLAlchemy expires ORM attributes on commit by default, and
+            # accessing them afterward (once this `with` block has closed
+            # the session) raises `DetachedInstanceError`, not a silent
+            # stale read.
+            assert claimed is not None
+            claimed_run_id = claimed.id
             session.commit()
-        assert claimed is not None
-        assert claimed.id == second.run_id  # skipped the locked, older row
+        assert claimed_run_id == second.run_id  # skipped the locked, older row
 
         with Session(disposable_engine) as session:
             still_queued = session.get(AmazonIngestionRun, first.run_id)
             assert still_queued.status == "queued"  # untouched, only skipped
+            started_row = session.get(AmazonIngestionRun, claimed_run_id)
+            assert started_row.status == "started"
     finally:
         holder_txn.rollback()
         holder_conn.close()
