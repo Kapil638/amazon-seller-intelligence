@@ -14,7 +14,7 @@ import {
   ListingsSyncError,
   triggerListingsSync,
 } from "@/lib/api";
-import { CANONICAL_MARKETPLACE_ID, NONTERMINAL_SYNC_STATUSES } from "@/lib/seller-listings-view";
+import { CANONICAL_MARKETPLACE_ID, NONTERMINAL_SYNC_STATUSES, formatDateTime } from "@/lib/seller-listings-view";
 import type {
   AmazonSellerMarketplace,
   ListingCollectionResponse,
@@ -148,6 +148,17 @@ export function SellerListings() {
   const previousSyncStatusRef = useRef<ListingsSyncStatus | null>(null);
 
   const participationId = searchParams.get("participation");
+  // `handleSync` below closes over whatever `participationId` was current
+  // when it was created; if the user switches marketplaces while its POST
+  // is still in flight, the promise chain must not apply that stale
+  // response (a message, a summary refetch, a pagination reset) to
+  // whatever marketplace is now selected. A ref (always current, unlike
+  // the closed-over value) lets each in-flight request check whether it
+  // is still the one the page is showing before touching state.
+  const participationIdRef = useRef(participationId);
+  useEffect(() => {
+    participationIdRef.current = participationId;
+  }, [participationId]);
   const listingId = searchParams.get("listing");
   const filters = useMemo(() => parseFilters(searchParams), [searchParams]);
   const page = parsePage(searchParams);
@@ -496,10 +507,22 @@ export function SellerListings() {
     if (!participationId || triggering || syncBusy) {
       return;
     }
+    // Captured once, at the moment this request is fired — never
+    // re-read from the (possibly since-changed) `participationId`
+    // closure variable while the request is in flight.
+    const requestedParticipationId = participationId;
+    const isStillCurrent = () => participationIdRef.current === requestedParticipationId;
     setTriggering(true);
     setSyncMessage(null);
-    triggerListingsSync(participationId)
+    triggerListingsSync(requestedParticipationId)
       .then((response) => {
+        if (!isStillCurrent()) {
+          // The user switched marketplaces while this POST was in
+          // flight — this response no longer describes what's on
+          // screen. The newly selected marketplace's own effects
+          // already own fetching and displaying its own state.
+          return undefined;
+        }
         if (response.reason === "queued") {
           // Reset pagination so refreshed results are understandable once
           // the job completes; the polling effect above picks up the new
@@ -512,6 +535,13 @@ export function SellerListings() {
             kind: "info",
             text: response.message ?? "A Listings synchronization is already running for this marketplace.",
           });
+        } else if (response.reason === "cooldown") {
+          setSyncMessage({
+            kind: "info",
+            text: response.retry_allowed_at
+              ? `Recently synchronized. You can synchronize again at ${formatDateTime(response.retry_allowed_at)}.`
+              : (response.message ?? "Recently synchronized. Please try again shortly."),
+          });
         } else {
           setSyncMessage({
             kind: "error",
@@ -521,15 +551,22 @@ export function SellerListings() {
         // Whether we just queued a fresh job or discovered an existing
         // one, refetch summary immediately so the strip reflects truthful
         // current state without waiting for the next poll tick.
-        return fetchListingsSummary(participationId).then((result) => setSummary(result));
+        return fetchListingsSummary(requestedParticipationId).then((result) => {
+          if (isStillCurrent()) setSummary(result);
+        });
       })
       .catch((err: unknown) => {
+        if (!isStillCurrent()) return;
         setSyncMessage({
           kind: "error",
           text: err instanceof ListingsSyncError ? err.message : "Synchronization could not be started.",
         });
       })
       .finally(() => {
+        // Always cleared, regardless of which marketplace is now
+        // selected — this is a global "is a sync POST in flight"
+        // indicator, and must never leave the (possibly now-different)
+        // Sync button permanently disabled.
         setTriggering(false);
       });
   }, [participationId, triggering, syncBusy, replaceParams]);

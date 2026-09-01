@@ -1041,6 +1041,93 @@ describe("Sync listings action", () => {
     resolveTrigger(triggerResponse());
   });
 
+  it("shows the retry_allowed_at time in the cooldown message when provided", async () => {
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
+    vi.mocked(fetchListingsSummary).mockResolvedValueOnce(richSummary);
+    vi.mocked(fetchListings).mockResolvedValue(richCollection);
+    vi.mocked(triggerListingsSync).mockResolvedValue(
+      triggerResponse({
+        reason: "cooldown",
+        message: "Please wait a moment before synchronizing this marketplace again.",
+        job: job({ status: "succeeded" }),
+        retry_allowed_at: "2026-09-01T13:35:00.000Z",
+      }),
+    );
+    vi.mocked(fetchListingsSummary).mockResolvedValue(richSummary);
+    setup(`participation=${US_ID}`);
+
+    await waitFor(() => expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /^sync listings$/i }));
+
+    await waitFor(() => expect(screen.getByText(/recently synchronized/i)).toBeInTheDocument());
+    expect(screen.getByText(/you can synchronize again at/i)).toBeInTheDocument();
+    // Never the raw backend sentence when a structured retry time exists.
+    expect(
+      screen.queryByText("Please wait a moment before synchronizing this marketplace again."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("falls back to the plain cooldown message when retry_allowed_at is absent", async () => {
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
+    vi.mocked(fetchListingsSummary).mockResolvedValueOnce(richSummary);
+    vi.mocked(fetchListings).mockResolvedValue(richCollection);
+    vi.mocked(triggerListingsSync).mockResolvedValue(
+      triggerResponse({
+        reason: "cooldown",
+        message: "Please wait a moment before synchronizing this marketplace again.",
+        job: job({ status: "succeeded" }),
+        retry_allowed_at: null,
+      }),
+    );
+    vi.mocked(fetchListingsSummary).mockResolvedValue(richSummary);
+    setup(`participation=${US_ID}`);
+
+    await waitFor(() => expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /^sync listings$/i }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Please wait a moment before synchronizing this marketplace again."),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("ignores a trigger response for a marketplace the user has since switched away from", async () => {
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
+    vi.mocked(fetchListingsSummary).mockImplementation(async (id: string) =>
+      id === US_ID
+        ? { ...richSummary, marketplace_participation_id: US_ID }
+        : summary({ marketplace_participation_id: MX_ID, sync: sync({ status: "never_synchronized" }) }),
+    );
+    vi.mocked(fetchListings).mockImplementation(async (id: string) =>
+      id === US_ID ? richCollection : collection(),
+    );
+    let resolveTrigger!: (value: ReturnType<typeof triggerResponse>) => void;
+    vi.mocked(triggerListingsSync).mockReturnValue(
+      new Promise((resolve) => {
+        resolveTrigger = resolve;
+      }),
+    );
+    setup(`participation=${US_ID}`);
+
+    await waitFor(() => expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /^sync listings$/i }));
+    expect(triggerListingsSync).toHaveBeenCalledWith(US_ID);
+
+    // Switch marketplaces while the US trigger POST is still unresolved.
+    fireEvent.change(screen.getByLabelText(/marketplace/i), { target: { value: MX_ID } });
+    await waitFor(() => expect(screen.getByLabelText(/marketplace/i)).toHaveValue(MX_ID));
+
+    // Now the stale US response arrives.
+    resolveTrigger(triggerResponse({ job: job({ status: "queued", marketplace_participation_id: US_ID }) }));
+
+    // The now-displayed MX marketplace must never show US's "Queued"
+    // evidence, an info/success message meant for US, or have its
+    // pagination reset by a request it never made.
+    await waitFor(() => expect(screen.queryByText(/synchronizing…|^queued$/i)).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /^sync listings$/i })).not.toBeDisabled();
+  });
+
   it("is scoped to the currently selected marketplace, not another one", async () => {
     vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
     vi.mocked(fetchListingsSummary).mockResolvedValue(richSummary);
