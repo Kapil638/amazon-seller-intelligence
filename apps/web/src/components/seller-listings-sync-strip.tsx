@@ -124,7 +124,12 @@ export function SellerListingsSyncStrip({
               Refresh status
             </Button>
           </div>
-          <p>Processing has not started yet. Your existing listing data remains available.</p>
+          <p>
+            Processing has not started yet, and this page has no way to confirm whether a
+            synchronization worker is currently running — it can only report the job&apos;s own
+            recorded status. Your existing listing data remains available; processing will resume
+            automatically once a worker is available.
+          </p>
         </div>
       ) : null}
       {waitingToRetry ? (

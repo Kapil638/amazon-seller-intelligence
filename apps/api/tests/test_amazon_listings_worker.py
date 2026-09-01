@@ -13,16 +13,26 @@ anything about concurrent claimants.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
+from sqlalchemy.exc import OperationalError
 
 from app.amazon.listings_client import ListingsPageRequest
 from app.amazon.listings_ingestion import AmazonListingsIngestionService
 from app.amazon.listings_models import Item, ListingsPage, ListingsPageProvenance
-from app.amazon.listings_worker import ListingsWorker
+from app.amazon.listings_worker import (
+    EXIT_CONFIGURATION_ERROR,
+    EXIT_DISABLED,
+    EXIT_OK,
+    ListingsWorker,
+    _install_shutdown_signal_handlers,
+    main,
+)
 from app.core.config import Settings
 from app.core.exceptions import SpApiRateLimitedError
 from app.persistence.database import session_scope
@@ -76,6 +86,42 @@ def _test_settings(**overrides) -> Settings:
     )
     fields.update(overrides)
     return Settings(_env_file=None, **fields)
+
+
+# --- 12B.3H: worker poll-error backoff configuration validation -----------
+
+
+def test_worker_poll_error_backoff_rejects_a_negative_or_zero_base() -> None:
+    with pytest.raises(ValidationError):
+        _test_settings(listings_worker_poll_error_base_backoff_seconds=0.0)
+    with pytest.raises(ValidationError):
+        _test_settings(listings_worker_poll_error_base_backoff_seconds=-1.0)
+
+
+def test_worker_poll_error_backoff_rejects_a_negative_or_zero_max() -> None:
+    with pytest.raises(ValidationError):
+        _test_settings(listings_worker_poll_error_max_backoff_seconds=0.0)
+    with pytest.raises(ValidationError):
+        _test_settings(listings_worker_poll_error_max_backoff_seconds=-1.0)
+
+
+def test_worker_poll_error_backoff_rejects_base_exceeding_max() -> None:
+    with pytest.raises(ValidationError, match="must not exceed"):
+        _test_settings(
+            listings_worker_poll_error_base_backoff_seconds=100.0,
+            listings_worker_poll_error_max_backoff_seconds=10.0,
+        )
+
+
+def test_worker_poll_error_backoff_accepts_base_equal_to_max() -> None:
+    # Equal is a valid, if degenerate, configuration (no doubling ever
+    # matters since the first failure is already at the cap) — only a
+    # base that *exceeds* the cap is an actual inversion worth rejecting.
+    settings = _test_settings(
+        listings_worker_poll_error_base_backoff_seconds=5.0,
+        listings_worker_poll_error_max_backoff_seconds=5.0,
+    )
+    assert settings.listings_worker_poll_error_base_backoff_seconds == 5.0
 
 
 def _worker(script: list, *, resolver=None, settings: Settings | None = None) -> tuple[ListingsWorker, _FakeListingsClient]:
@@ -378,6 +424,279 @@ async def test_run_forever_sleeps_between_idle_polls(monkeypatch) -> None:
 
     assert len(sleep_calls) == 2
     assert all(s == 0.01 for s in sleep_calls)
+
+
+# --- 12B.3H: poll-error backoff --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_forever_backs_off_after_a_recoverable_poll_error_and_resets_on_success(monkeypatch) -> None:
+    worker, client = _worker([])
+    worker._idle_poll_seconds = 0.01
+    worker._poll_error_base_backoff_seconds = 0.05
+    worker._poll_error_max_backoff_seconds = 10.0
+    worker._current_poll_error_backoff_seconds = worker._poll_error_base_backoff_seconds
+    sleep_calls: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def _tracking_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _tracking_sleep)
+
+    calls = {"count": 0}
+
+    async def _fake_run_once() -> bool:
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            raise OperationalError("simulated statement", {}, Exception("simulated database connectivity failure"))
+        if calls["count"] >= 4:
+            worker.request_stop()
+        return False  # a *successful* poll that simply found no job
+
+    worker.run_once = _fake_run_once  # type: ignore[method-assign]
+    await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+    # Two failures back off with doubling (0.05, then 0.10); the third
+    # call succeeds and sleeps the normal idle interval, proving the
+    # error backoff was reset rather than carried forward.
+    assert sleep_calls[0] == pytest.approx(0.05)
+    assert sleep_calls[1] == pytest.approx(0.10)
+    assert sleep_calls[2] == pytest.approx(0.01)
+    assert worker._current_poll_error_backoff_seconds == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_run_forever_poll_error_backoff_is_capped(monkeypatch) -> None:
+    worker, client = _worker([])
+    worker._poll_error_base_backoff_seconds = 0.01
+    worker._poll_error_max_backoff_seconds = 0.03
+    worker._current_poll_error_backoff_seconds = worker._poll_error_base_backoff_seconds
+    sleep_calls: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def _tracking_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _tracking_sleep)
+
+    calls = {"count": 0}
+
+    async def _fake_run_once() -> bool:
+        calls["count"] += 1
+        if calls["count"] >= 6:
+            worker.request_stop()
+            return False
+        raise OperationalError("simulated statement", {}, Exception("simulated persistent recoverable failure"))
+
+    worker.run_once = _fake_run_once  # type: ignore[method-assign]
+    await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+    # 0.01, 0.02, then capped at 0.03 for every subsequent failure —
+    # never a busy loop (no zero/near-zero delay) and never unbounded.
+    assert sleep_calls[0] == pytest.approx(0.01)
+    assert sleep_calls[1] == pytest.approx(0.02)
+    assert all(s == pytest.approx(0.03) for s in sleep_calls[2:-1])
+
+
+@pytest.mark.asyncio
+async def test_a_job_processing_exception_never_triggers_poll_error_backoff(monkeypatch) -> None:
+    """A defect inside job *processing* (already handled by `run_once`
+    itself, which returns True rather than raising) must never be
+    mistaken for a poll/claim-step failure — the two are deliberately
+    different concerns with different recovery semantics."""
+    scope = _seed_scope()
+    _enqueue(scope)
+    worker, client = _worker([], resolver=_RaisingResolver())
+    sleep_calls: list[float] = []
+
+    async def _tracking_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _tracking_sleep)
+    claimed_something = await worker.run_once()
+
+    assert claimed_something is True
+    assert sleep_calls == []  # no backoff sleep — this was not a poll-step failure
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_programming_error_in_the_claim_step_is_not_swallowed() -> None:
+    """`run_forever`'s poll-error backoff must only catch plausibly
+    recoverable database/transport failures — a real defect (`TypeError`,
+    `AttributeError`, an invariant violation) has to propagate and crash
+    the process so a supervisor restarts it and an operator notices,
+    never be silently retried forever behind "recoverable backoff"."""
+    worker, client = _worker([])
+
+    async def _buggy_run_once() -> bool:
+        raise TypeError("simulated genuine programming defect, not a connectivity issue")
+
+    worker.run_once = _buggy_run_once  # type: ignore[method-assign]
+    with pytest.raises(TypeError, match="simulated genuine programming defect"):
+        await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_an_attribute_error_in_the_claim_step_is_not_swallowed() -> None:
+    worker, client = _worker([])
+
+    async def _buggy_run_once() -> bool:
+        raise AttributeError("simulated invariant violation")
+
+    worker.run_once = _buggy_run_once  # type: ignore[method-assign]
+    with pytest.raises(AttributeError):
+        await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+
+# --- 12B.3H: graceful shutdown signals ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sigint_requests_graceful_stop() -> None:
+    worker, _client = _worker([])
+    loop = asyncio.get_running_loop()
+    _install_shutdown_signal_handlers(worker, loop)
+    try:
+        os.kill(os.getpid(), signal.SIGINT)
+        await asyncio.wait_for(_poll_until(lambda: worker._stop_requested), timeout=2)
+        assert worker._stop_requested is True
+    finally:
+        loop.remove_signal_handler(signal.SIGINT)
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_sigterm_requests_graceful_stop() -> None:
+    worker, _client = _worker([])
+    loop = asyncio.get_running_loop()
+    _install_shutdown_signal_handlers(worker, loop)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(_poll_until(lambda: worker._stop_requested), timeout=2)
+        assert worker._stop_requested is True
+    finally:
+        loop.remove_signal_handler(signal.SIGINT)
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
+async def _poll_until(predicate, *, interval: float = 0.01) -> None:
+    while not predicate():
+        await asyncio.sleep(interval)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prevents_another_claim() -> None:
+    worker, client = _worker([])
+    worker.request_stop()  # requested before run_forever ever starts polling
+    calls = {"count": 0}
+
+    async def _fake_run_once() -> bool:
+        calls["count"] += 1
+        return False
+
+    worker.run_once = _fake_run_once  # type: ignore[method-assign]
+    await asyncio.wait_for(worker.run_forever(), timeout=2)
+
+    assert calls["count"] == 0  # the loop condition is checked before any claim attempt
+
+
+@pytest.mark.asyncio
+async def test_no_task_survives_run_forever_after_shutdown() -> None:
+    worker, client = _worker([])
+    worker._idle_poll_seconds = 0.01
+    before = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+
+    async def _fake_run_once() -> bool:
+        worker.request_stop()
+        return False
+
+    worker.run_once = _fake_run_once  # type: ignore[method-assign]
+    await asyncio.wait_for(worker.run_forever(), timeout=2)
+
+    after = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+    assert after - before == set(), "run_forever left a background task running after shutdown"
+
+
+# --- 12B.3H: fail-closed configuration errors --------------------------
+
+
+def test_main_exits_with_configuration_error_code_and_never_raises(monkeypatch) -> None:
+    monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", "true")
+
+    def _raise_invalid(*_args, **_kwargs):
+        raise ValidationError.from_exception_data("Settings", [])
+
+    monkeypatch.setattr("app.amazon.listings_worker.get_settings", _raise_invalid)
+    exit_code = main()
+    assert exit_code == EXIT_CONFIGURATION_ERROR
+    assert EXIT_CONFIGURATION_ERROR != EXIT_OK
+
+
+def test_configuration_error_log_never_echoes_the_validation_error_text(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", "true")
+
+    def _raise_invalid(*_args, **_kwargs):
+        raise ValidationError.from_exception_data(
+            "Settings", [{"type": "missing", "loc": ("sp_api_super_secret_field",), "input": "SECRET-LOOKING-VALUE"}]
+        )
+
+    monkeypatch.setattr("app.amazon.listings_worker.get_settings", _raise_invalid)
+    with caplog.at_level("ERROR", logger="app.amazon.listings_worker"):
+        main()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "SECRET-LOOKING-VALUE" not in log_text
+
+
+# --- 12B.3H: explicit worker-enable authorization gate ---------------------
+
+
+@pytest.mark.parametrize("value", [None, "", "false", "0", "no", "TRU"])
+def test_main_refuses_to_start_when_not_explicitly_enabled(monkeypatch, value) -> None:
+    if value is None:
+        monkeypatch.delenv("ASI_LISTINGS_WORKER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", value)
+    settings_calls = {"count": 0}
+
+    def _tracking_get_settings(*_args, **_kwargs):
+        settings_calls["count"] += 1
+        return _test_settings()
+
+    monkeypatch.setattr("app.amazon.listings_worker.get_settings", _tracking_get_settings)
+    exit_code = main()
+    assert exit_code == EXIT_DISABLED
+    assert exit_code not in (EXIT_OK, EXIT_CONFIGURATION_ERROR)
+    # Fail closed *before* touching configuration at all — a disabled
+    # worker must never resolve Settings, let alone the database.
+    assert settings_calls["count"] == 0
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "True", " true ", "1 "])
+def test_main_proceeds_past_the_gate_when_explicitly_enabled(monkeypatch, value) -> None:
+    monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", value)
+
+    def _raise_invalid(*_args, **_kwargs):
+        # Stops execution at the very next step (configuration) rather
+        # than actually starting the full asyncio loop — this test only
+        # needs to prove the gate did not block, not run the worker.
+        raise ValidationError.from_exception_data("Settings", [])
+
+    monkeypatch.setattr("app.amazon.listings_worker.get_settings", _raise_invalid)
+    exit_code = main()
+    assert exit_code == EXIT_CONFIGURATION_ERROR  # reached past the gate
+
+
+def test_disabled_worker_log_never_leaks_the_env_var_value(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", "definitely-not-a-real-token-but-should-still-never-appear")
+    with caplog.at_level("ERROR", logger="app.amazon.listings_worker"):
+        main()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "definitely-not-a-real-token-but-should-still-never-appear" not in log_text
 
 
 # --- sanitized logging -----------------------------------------------------
