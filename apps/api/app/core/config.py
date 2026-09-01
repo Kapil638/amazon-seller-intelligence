@@ -113,6 +113,67 @@ class Settings(BaseSettings):
         ),
     )
 
+    # 12B.3G — durable Listings synchronization job: retry/backoff and
+    # concurrency defaults. Deliberately typed settings, not constants
+    # buried in the worker/service, so operators can tune them per
+    # environment without a code change.
+    listings_sync_max_attempts: int = Field(
+        default=5, ge=1, le=20,
+        description="Total attempts (first try + retries) before a retryable Listings sync failure becomes the terminal 'rate_limited' outcome.",
+    )
+    listings_sync_base_backoff_seconds: float = Field(
+        default=30.0, gt=0,
+        description="Base delay for bounded exponential backoff with jitter when Amazon gives no usable Retry-After signal.",
+    )
+    listings_sync_max_backoff_seconds: float = Field(
+        default=900.0, gt=0,
+        description="Hard cap on any single computed retry delay (including a Retry-After value from Amazon), in seconds.",
+    )
+    listings_sync_max_total_retry_seconds: float = Field(
+        default=3600.0, gt=0,
+        description="Hard cap on total elapsed time (from first attempt) a Listings job may spend retrying before exhausting to a terminal failure.",
+    )
+    listings_sync_lease_duration_seconds: int = Field(
+        default=300, ge=30, le=3600,
+        description="How long a worker's exclusive claim on a Listings job is valid before it is eligible for stale-lease recovery by another worker.",
+    )
+    listings_sync_heartbeat_interval_pages: int = Field(
+        default=1, ge=1,
+        description="Renew the worker's lease/heartbeat after this many fetched pages (1 = every page). Progress-reporting cadence only — see listings_sync_heartbeat_time_interval_seconds for the actual lease-safety guarantee.",
+    )
+    listings_sync_heartbeat_time_interval_seconds: float = Field(
+        default=60.0, gt=0,
+        description=(
+            "Wall-clock cadence (independent of page completion) at which the lease is renewed "
+            "WHILE a single page fetch is in flight — this, not listings_sync_heartbeat_interval_pages, "
+            "is what actually guarantees a lease cannot expire mid-request no matter how slow one "
+            "Amazon call is. Must be kept comfortably below listings_sync_lease_duration_seconds."
+        ),
+    )
+    listings_sync_max_global_concurrent_jobs: int = Field(
+        default=4, ge=1, le=100,
+        description="Maximum number of Listings jobs any worker fleet may run simultaneously, across all organizations.",
+    )
+    listings_sync_max_concurrent_jobs_per_organization: int = Field(
+        default=1, ge=1, le=20,
+        description="Maximum number of Listings jobs one organization may run simultaneously.",
+    )
+    listings_sync_trigger_cooldown_seconds: int = Field(
+        default=30, ge=0, le=3600,
+        description="Minimum time after a Listings job's own creation before the trigger endpoint accepts another request for the same marketplace participation, independent of the single-active-job guarantee.",
+    )
+    listings_sync_max_queued_per_organization: int = Field(
+        default=25, ge=1, le=1000,
+        description=(
+            "Queue-backlog safety valve: maximum number of status='queued' Listings jobs one "
+            "organization may have outstanding at once (across distinct participations). "
+            "Deliberately NOT a worker-execution-capacity limit — a legitimate new job is never "
+            "rejected merely because workers are busy; only an unreasonably large unclaimed backlog "
+            "triggers this. Execution capacity is enforced separately, only at claim time, by "
+            "listings_sync_max_global_concurrent_jobs / listings_sync_max_concurrent_jobs_per_organization."
+        ),
+    )
+
     def consent_application_id(self) -> str:
         """Application id for website authorization. Production/Draft wins over sandbox."""
         production = self.sp_api_production_application_id.strip()

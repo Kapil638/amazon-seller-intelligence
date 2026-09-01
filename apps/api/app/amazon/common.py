@@ -7,6 +7,7 @@ Ads API is a future advertising collection source, not implemented here.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -33,6 +34,20 @@ SECRET_KEY_FRAGMENTS = (
 # Authorization header or authorization_code.
 # `authorization_code_present` is a boolean flag (12B.1C.4A), not the code.
 PUBLIC_KEY_ALLOWLIST = frozenset({"authorization_url", "authorization_code_present"})
+
+
+def ensure_utc(value: datetime) -> datetime:
+    """Every `DateTime(timezone=True)` column in this codebase is written
+    and reasoned about as UTC (see `AmazonIngestionRun`'s docstring in
+    `models.py`), but SQLite — used throughout this test suite — silently
+    drops timezone info on round-trip, returning a naive `datetime` for a
+    value that was genuinely written as UTC. PostgreSQL (production)
+    returns it already tz-aware. This makes arithmetic against
+    `datetime.now(UTC)` safe regardless of which backend produced the
+    value, without ever reinterpreting a value's actual instant in time."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 def contains_secret_key(key: str) -> bool:

@@ -1429,6 +1429,12 @@ export type AmazonAdsConnectionPlaceholder = {
 };
 
 export type AmazonSellerMarketplace = {
+  // 12B.3F: the marketplace participation's own id — the value the
+  // Seller Listings Read API's `{marketplace_participation_id}` path
+  // segment expects. Optional only so a response from before this field
+  // existed doesn't crash older cached data; the UI must not attempt to
+  // address the Listings API for a marketplace missing this field.
+  id?: string;
   marketplace_id: string;
   name: string | null;
   country_code: string | null;
@@ -1437,6 +1443,215 @@ export type AmazonSellerMarketplace = {
   has_suspended_listings: boolean;
   is_active: boolean;
   last_seen_at: string;
+};
+
+// --- 12B.3F: Seller Listings Read API (12B.3E backend contract) -----------
+
+export type ListingsSyncStatus =
+  | "never_synchronized"
+  | "queued"
+  | "running"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "failed"
+  | "partial"
+  | "timed_out";
+
+export type ListingIssueSeverity = "ERROR" | "WARNING" | "INFO";
+
+export type ListingSortField =
+  | "last_seen_at"
+  | "first_seen_at"
+  | "seller_sku"
+  | "asin"
+  | "issue_count"
+  | "price_amount";
+
+export type SortDirection = "asc" | "desc";
+
+export type ListingsSyncEvidence = {
+  status: ListingsSyncStatus;
+  failure_class: string | null;
+  // 12B.3G follow-up: the only truthful "how long has this been waiting"
+  // signal while `status === "queued"` (started_at is null until a
+  // worker actually claims the run) — used to detect a stale queue.
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  pages_fetched: number | null;
+  records_received: number | null;
+  records_accepted: number | null;
+  records_rejected: number | null;
+  reported_total_results: number | null;
+  pagination_complete: boolean | null;
+  last_successful_synchronized_at: string | null;
+  // 12B.3G: only meaningful while `status === "waiting_to_retry"`.
+  next_retry_at: string | null;
+};
+
+export type ListingsSummary = {
+  marketplace_participation_id: string;
+  total_listings: number;
+  active_count: number;
+  inactive_count: number;
+  buyable_count: number;
+  not_buyable_count: number;
+  discoverable_count: number;
+  not_discoverable_count: number;
+  with_issues_count: number;
+  without_issues_count: number;
+  issue_severity_error_count: number;
+  issue_severity_warning_count: number;
+  issue_severity_info_count: number;
+  with_asin_count: number;
+  with_consumer_price_count: number;
+  with_fulfillment_availability_count: number;
+  sync: ListingsSyncEvidence;
+};
+
+export type ListingCollectionItem = {
+  id: string;
+  seller_sku: string;
+  asin: string | null;
+  product_type: string | null;
+  is_active: boolean;
+  is_buyable: boolean;
+  is_discoverable: boolean;
+  // Serialized as a decimal string by the backend (never a float), so
+  // precision is never lost in transit. Format for display; never treat
+  // a missing value as zero.
+  price_amount: string | null;
+  price_currency: string | null;
+  issue_count: number;
+  highest_issue_severity: ListingIssueSeverity | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_successful_sync_at: string | null;
+};
+
+export type ListingCollectionResponse = {
+  items: ListingCollectionItem[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+// Approved, already-normalized SP-API shapes (12B.3D/12B.3E). Fields are
+// optional/nullable defensively — these are Amazon's own reported
+// structures, not something ASI controls the shape of, and the UI must
+// never crash rendering one it hasn't seen before.
+export type ListingOfferPrice = {
+  amount: string;
+  currencyCode: string;
+};
+
+export type ListingOffer = {
+  marketplaceId: string;
+  offerType: string;
+  price?: ListingOfferPrice | null;
+  points?: unknown;
+  audience?: { value: string; displayName: string } | null;
+};
+
+export type ListingFulfillmentAvailability = {
+  fulfillmentChannelCode: string;
+  quantity?: number | null;
+};
+
+export type ListingIssue = {
+  code: string;
+  message: string;
+  severity: ListingIssueSeverity | string;
+  categories?: string[];
+  enforcements?: unknown;
+  attributeNames?: string[] | null;
+  marketplaceIds?: string[] | null;
+};
+
+export type ListingProductTypeEntry = {
+  productType: string;
+  marketplaceId: string;
+};
+
+export type ListingDetail = {
+  id: string;
+  seller_sku: string;
+  asin: string | null;
+  item_name: string | null;
+  product_type: string | null;
+  is_active: boolean;
+  is_buyable: boolean;
+  is_discoverable: boolean;
+  price_amount: string | null;
+  price_currency: string | null;
+  status: string[];
+  offers: ListingOffer[];
+  fulfillment_availability: ListingFulfillmentAvailability[];
+  issues: ListingIssue[];
+  product_types: ListingProductTypeEntry[];
+  issue_count: number;
+  highest_issue_severity: ListingIssueSeverity | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_successful_sync_at: string | null;
+};
+
+// The durable run's own raw status vocabulary — distinct from
+// `ListingsSyncStatus`, which is the *summary* endpoint's display-mapped
+// vocabulary (`started` -> `running`, plus a synthetic `never_synchronized`
+// that no actual run row ever has). The job-status endpoint and trigger
+// response return this raw vocabulary directly from `AmazonIngestionRun.
+// status` — see `_job_status_from_row` in `app.amazon.listings_sync`.
+export type ListingsRunStatus =
+  | "queued"
+  | "started"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "partial"
+  | "failed"
+  | "timed_out";
+
+// 12B.3G: the trigger no longer runs synchronization itself — it enqueues
+// (or reports the existing) durable job and returns immediately. Never
+// carries an organization id, seller id, connection id, lease owner,
+// credential, token reference, or page token.
+export type ListingsSyncJobStatus = {
+  run_id: string;
+  run_type: string;
+  status: ListingsRunStatus;
+  marketplace_participation_id: string;
+  pages_fetched: number;
+  records_received: number;
+  records_accepted: number;
+  records_rejected: number;
+  reported_total_results: number | null;
+  pagination_complete: boolean;
+  attempt_count: number;
+  queued_at: string;
+  started_at: string | null;
+  last_heartbeat_at: string | null;
+  next_retry_at: string | null;
+  completed_at: string | null;
+  failure_class: string | null;
+};
+
+export type ListingsSyncTriggerReason =
+  | "queued"
+  | "already_running"
+  | "cooldown"
+  // Queue-backlog safety valve only — never a worker-execution-capacity
+  // rejection. A legitimate new job is never rejected merely because
+  // workers are busy; only an unreasonably large *queue* triggers this.
+  | "queue_backlog_limit_reached"
+  | "scope_not_found"
+  | "scope_inactive"
+  | "identity_missing"
+  | "connection_unresolvable";
+
+export type ListingsSyncTriggerResponse = {
+  reason: ListingsSyncTriggerReason;
+  message: string | null;
+  job: ListingsSyncJobStatus | null;
 };
 
 export type AmazonIngestionRunStatus = "started" | "succeeded" | "partial" | "failed" | "timed_out";

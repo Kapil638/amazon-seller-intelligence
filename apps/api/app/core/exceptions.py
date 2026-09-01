@@ -272,8 +272,19 @@ class SpApiAuthenticationError(Exception):
 
 
 class SpApiRateLimitedError(Exception):
-    def __init__(self, message: str = "Amazon SP-API rate limit reached.") -> None:
+    """`retry_after_seconds` is populated (12B.3G) only when Amazon's
+    response included a usable `Retry-After` header, so a higher-level
+    durable-retry scheduler can honor it. `None` means no such signal was
+    present — never guessed or defaulted here; the caller decides its own
+    fallback (bounded exponential backoff with jitter)."""
+
+    def __init__(
+        self,
+        message: str = "Amazon SP-API rate limit reached.",
+        retry_after_seconds: float | None = None,
+    ) -> None:
         super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class SpApiRequestFailedError(Exception):

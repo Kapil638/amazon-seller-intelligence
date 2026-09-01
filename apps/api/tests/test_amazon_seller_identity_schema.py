@@ -92,10 +92,65 @@ def test_alembic_has_a_single_head() -> None:
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0010_amazon_seller_listings"
-    revision = script.get_revision("0010_amazon_seller_listings")
+    assert heads[0] == "0011_listings_job_lifecycle"
+    revision = script.get_revision("0011_listings_job_lifecycle")
     assert revision is not None
-    assert revision.down_revision == "0009_amazon_seller_identity"
+    assert revision.down_revision == "0010_amazon_seller_listings"
+
+
+# Alembic's own bookkeeping table, `alembic_version`, stores the revision
+# id in a `VARCHAR(32)` column by default — a value this repository
+# genuinely hit live on 2026-08-29 (`0011_amazon_listings_job_lifecycle`,
+# 34 chars, renamed to `0011_listings_job_lifecycle`, 27 chars). Nothing
+# else in this offline suite would ever catch that: it only fails at the
+# very last statement of a real `alembic upgrade`, against a real
+# database, after every DDL statement in the migration has already
+# succeeded (and then rolls back, since Postgres DDL is transactional —
+# but only after every prior schema check reported this migration as fine).
+_ALEMBIC_VERSION_NUM_MAX_LENGTH = 32
+
+
+def test_every_revision_id_fits_the_alembic_version_column() -> None:
+    """Generic, permanent guard — walks *every* revision currently in the
+    repository via `script.walk_revisions()` (works across branches/
+    merges, not just a single linear chain), not a hardcoded check for
+    any one revision id. Passes today only because `0011_listings_job_
+    lifecycle` (27 chars) replaced the original `0011_amazon_listings_
+    job_lifecycle` (34 chars) — see the parametrized unit test below for
+    direct proof the check itself would have failed on that original
+    value."""
+    cfg = _alembic_config("sqlite://")
+    script = ScriptDirectory.from_config(cfg)
+    too_long = [
+        revision.revision
+        for revision in script.walk_revisions()
+        if len(revision.revision) > _ALEMBIC_VERSION_NUM_MAX_LENGTH
+    ]
+    assert too_long == [], (
+        f"revision id(s) exceed alembic_version.version_num's default "
+        f"VARCHAR({_ALEMBIC_VERSION_NUM_MAX_LENGTH}): {too_long}"
+    )
+
+
+@pytest.mark.parametrize(
+    "revision_id,fits",
+    [
+        # The exact 34-character id that failed live against real
+        # PostgreSQL on 2026-08-29 with `StringDataRightTruncation`
+        # ("value too long for type character varying(32)") on the very
+        # last statement of `alembic upgrade` — after every DDL statement
+        # in the migration had already succeeded and then rolled back
+        # (Postgres DDL is transactional). No offline SQLite-based check
+        # existed before this test to catch that ahead of time.
+        ("0011_amazon_listings_job_lifecycle", False),
+        # The corrected id actually used in this repository today.
+        ("0011_listings_job_lifecycle", True),
+        ("a" * 32, True),  # exactly at the boundary — fits
+        ("a" * 33, False),  # one character over — does not fit
+    ],
+)
+def test_revision_id_length_check_logic_matches_the_real_postgres_failure(revision_id: str, fits: bool) -> None:
+    assert (len(revision_id) <= _ALEMBIC_VERSION_NUM_MAX_LENGTH) is fits
 
 
 def test_migration_0009_upgrades_and_downgrades_in_isolation_from_0008(tmp_path) -> None:

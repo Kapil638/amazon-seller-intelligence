@@ -701,33 +701,64 @@ class AmazonIngestionRun(Base):
     enforced behavior match the declared behavior: a direct, legible
     foreign-key violation instead of an indirect CHECK failure.
 
-    Lease semantics (12B.3B, schema only): the partial unique index
-    `uq_amazon_ingestion_runs_active_listings_scope` below treats *every*
-    `run_type='listings', status='started'` row as holding the scope,
-    regardless of whether `lease_expires_at` has already passed. This is
-    intentional, not an oversight — a partial index predicate is evaluated
-    against a row's own column values when that row is written, not
-    continuously against wall-clock time, so `lease_expires_at < now()`
-    cannot be expressed in the predicate at all (and would not do what it
-    looks like even if it compiled). A lease past `lease_expires_at` is
-    therefore **not** self-releasing. Recovering it requires a future
-    service (12B.3D) to run a transactional, race-safe reclaim — e.g. a
-    conditional `UPDATE amazon_ingestion_runs SET status = 'timed_out'
-    WHERE id = :id AND status = 'started' AND lease_expires_at < now()`,
-    checking the affected row count — that terminalizes the stale row
-    *before* any new claim attempt, so two recovery attempts can never both
-    believe they reclaimed the same row. "The scope is released once the
-    row reaches a terminal status" is the only guarantee this schema makes;
-    "an expired lease automatically unlocks the scope" is not true and must
-    not be asserted by any test or doc.
+    Lease semantics (12B.3B schema, extended 12B.3G for the durable job
+    lifecycle): the partial unique index
+    `uq_amazon_ingestion_runs_active_listings_scope` treats *every*
+    `run_type='listings'` row whose status is in `('queued', 'started',
+    'waiting_to_retry')` — every *nonterminal* state — as holding the
+    scope, regardless of whether `lease_expires_at` has already passed.
+    This is intentional, not an oversight — a partial index predicate is
+    evaluated against a row's own column values when that row is written,
+    not continuously against wall-clock time, so `lease_expires_at <
+    now()` cannot be expressed in the predicate at all (and would not do
+    what it looks like even if it compiled). A lease past
+    `lease_expires_at` is therefore **not** self-releasing. Recovering it
+    requires a transactional, race-safe reclaim (`claim_listings_run`,
+    `claim_next_listings_job` in `app.persistence.repositories`) that
+    terminalizes or re-queues the stale row *before* any new claim
+    attempt, so two recovery attempts can never both believe they
+    reclaimed the same row. "The scope is released once the row reaches a
+    terminal status, or is legitimately re-queued" is the guarantee this
+    schema makes; "an expired lease automatically unlocks the scope" is
+    not true and must not be asserted by any test or doc.
+
+    12B.3G durable job lifecycle: a Listings run's status is one of
+    `queued` (created by the trigger endpoint, not yet claimed by any
+    worker — `lease_owner`/`lease_expires_at` are NULL), `started` (a
+    worker holds the lease and is actively fetching/reconciling —
+    `started_at` is set at the *first* claim, `last_heartbeat_at` updates
+    on every heartbeat), `waiting_to_retry` (Amazon throttled or a
+    transient failure occurred; the lease is released — `lease_owner`/
+    `lease_expires_at` NULL again — and `next_retry_at` names when a
+    worker may reclaim it; `retry_count` increments on each reclaim from
+    this state), or one of the pre-existing terminal states `succeeded` /
+    `partial` / `failed` / `timed_out`. `queued_at` is the existing
+    `created_at` column (the row's insertion moment is already exactly
+    "when this job was queued"); no separate column was added for it.
+    There is no `cancelled` state: nothing in this codebase ever produces
+    a transition into it, and an unreachable state is worse than no state
+    (see 12B.3F/12B.3G instructions: do not add states without defined
+    transitions).
     """
 
     __tablename__ = "amazon_ingestion_runs"
     __table_args__ = (
         Index("ix_amazon_ingestion_runs_org", "organization_id"),
         Index("ix_amazon_ingestion_runs_seller_account", "seller_account_id"),
+        # Supports the worker's claim query: eligible rows are
+        # `run_type='listings' AND status IN ('queued','waiting_to_retry')`,
+        # ordered/filtered by `next_retry_at`.
+        Index(
+            "ix_amazon_ingestion_runs_listings_claimable",
+            "run_type",
+            "status",
+            "next_retry_at",
+        ),
         CheckConstraint(
-            "status IN ('started', 'succeeded', 'partial', 'failed', 'timed_out')",
+            "status IN ("
+            "'queued', 'started', 'waiting_to_retry', "
+            "'succeeded', 'partial', 'failed', 'timed_out'"
+            ")",
             name="ck_amazon_ingestion_runs_status",
         ),
         CheckConstraint(
@@ -739,23 +770,29 @@ class AmazonIngestionRun(Base):
             "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
             name="ck_amazon_ingestion_runs_listings_scope_required",
         ),
-        # Single-writer guarantee (12B.3 product decision): at most one
-        # 'started' listings run may exist per (seller_account_id,
-        # marketplace_participation_id) at a time. This is the actual claim
-        # mechanism — a concurrent second INSERT into this scope fails on
-        # this constraint — not a separately-implemented lease service.
-        # Terminal statuses (succeeded/partial/failed/timed_out) fall
-        # outside the partial predicate, so the scope is never permanently
-        # locked: any transition out of 'started' frees it for reclaim. See
-        # the class docstring: this is a status-based release only, never
-        # an automatic, lease-expiry-based one.
+        # Single-writer guarantee (12B.3 product decision, widened 12B.3G):
+        # at most one *nonterminal* listings run may exist per
+        # (seller_account_id, marketplace_participation_id) at a time —
+        # covering queued, started, and waiting_to_retry. This is the
+        # actual claim mechanism — a concurrent second INSERT into this
+        # scope fails on this constraint — not a separately-implemented
+        # lease service. Terminal statuses (succeeded/partial/failed/
+        # timed_out) fall outside the partial predicate, so the scope is
+        # never permanently locked: any transition into a terminal status
+        # frees it for a brand-new job. See the class docstring: this is a
+        # status-based release only, never an automatic, lease-expiry-based
+        # one.
         Index(
             "uq_amazon_ingestion_runs_active_listings_scope",
             "seller_account_id",
             "marketplace_participation_id",
             unique=True,
-            postgresql_where=text("run_type = 'listings' AND status = 'started'"),
-            sqlite_where=text("run_type = 'listings' AND status = 'started'"),
+            postgresql_where=text(
+                "run_type = 'listings' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+            sqlite_where=text(
+                "run_type = 'listings' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
         ),
         # Widens the PK into a composite unique key so amazon_seller_listings
         # can hold a composite FK guaranteeing a listing's last ingestion
@@ -786,12 +823,18 @@ class AmazonIngestionRun(Base):
     region: Mapped[str] = mapped_column(String(8), nullable=False)
     environment: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="started")
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Nullable + no server_default since 12B.3G: a `queued` row has not
+    # been claimed by any worker yet, so it has no start time. Set
+    # explicitly at claim time (first claim only — a retry reclaim does
+    # not reset it, so it always reflects the *original* first attempt).
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     request_correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     records_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     records_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     records_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Reused (12B.3G) as the Listings job's attempt counter — already
+    # existed, unused by any listings-run code path before now.
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pagination_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -799,6 +842,9 @@ class AmazonIngestionRun(Base):
     reported_total_results: Mapped[int | None] = mapped_column(Integer, nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 12B.3G additions for the durable job lifecycle.
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     organization: Mapped[Organization] = relationship()

@@ -117,12 +117,17 @@ def _seed_org_seller_account_and_participation(engine):
     return org_id, seller_account_id, participation_id
 
 
-# 1: fresh empty PostgreSQL upgrades cleanly to 0010, single head.
+# 1: historical boundary — a fresh empty PostgreSQL upgrades cleanly to the
+# 0010 revision specifically. This is intentionally pinned to the explicit
+# revision string rather than "head": 0011_listings_job_lifecycle later
+# became the real repository head, and upgrading to "head" here would
+# upgrade past 0010 and make this assertion fail for a reason unrelated to
+# what the test actually checks (that 0010 itself applies cleanly).
 def test_empty_postgres_upgrades_cleanly_to_0010(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0010_amazon_seller_listings")
 
     with disposable_engine.connect() as conn:
         current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()

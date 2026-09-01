@@ -42,13 +42,24 @@ from app.persistence.repositories import AmazonIngestionRunRepository, AmazonSel
 MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 25
 
-ListingsSyncStatus = Literal["never_synchronized", "running", "succeeded", "failed", "partial", "timed_out"]
+ListingsSyncStatus = Literal[
+    "never_synchronized", "queued", "running", "waiting_to_retry", "succeeded", "failed", "partial", "timed_out"
+]
 ListingSortField = Literal["last_seen_at", "first_seen_at", "seller_sku", "asin", "issue_count", "price_amount"]
 SortDirection = Literal["asc", "desc"]
 IssueSeverity = Literal["ERROR", "WARNING", "INFO"]
 
+# 12B.3G: `queued`/`waiting_to_retry` are new durable-job lifecycle states
+# (see `AmazonIngestionRun`'s docstring in `models.py`) that did not exist
+# when this mapping was first written — added here rather than left to
+# fall through to the `.get(..., "never_synchronized")` default, which
+# would otherwise mislabel an actively-queued or retry-pending job as "no
+# synchronization has ever run", the one status this evidence exists to
+# rule out truthfully.
 _RUN_STATUS_TO_SYNC_STATUS: dict[str, ListingsSyncStatus] = {
+    "queued": "queued",
     "started": "running",
+    "waiting_to_retry": "waiting_to_retry",
     "succeeded": "succeeded",
     "failed": "failed",
     "partial": "partial",
@@ -65,6 +76,14 @@ class ListingsSyncEvidence(BaseModel):
 
     status: ListingsSyncStatus = "never_synchronized"
     failure_class: str | None = None
+    # 12B.3G follow-up: when the latest run is `queued` (never claimed,
+    # `started_at` is null), this is the only truthful "how long has this
+    # actually been waiting" signal available — needed so the frontend can
+    # detect a stale queue (no worker running) from server-truthful
+    # evidence rather than from its own client-local wall clock, which
+    # would reset on every reload and misreport a job that has genuinely
+    # been queued for a long time as freshly queued.
+    queued_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     pages_fetched: int | None = None
@@ -79,6 +98,8 @@ class ListingsSyncEvidence(BaseModel):
     # signal; `status`/`completed_at` describe the latest attempt, which
     # is not always the same thing.
     last_successful_synchronized_at: datetime | None = None
+    # 12B.3G: only meaningful while `status == "waiting_to_retry"`.
+    next_retry_at: datetime | None = None
 
 
 class ListingsSummary(BaseModel):
@@ -179,6 +200,7 @@ def _sync_evidence(
     return ListingsSyncEvidence(
         status=_RUN_STATUS_TO_SYNC_STATUS.get(latest_run.status, "never_synchronized"),
         failure_class=latest_run.failure_class,
+        queued_at=latest_run.created_at,
         started_at=latest_run.started_at,
         completed_at=latest_run.completed_at,
         pages_fetched=latest_run.pages_fetched,
@@ -190,6 +212,7 @@ def _sync_evidence(
         last_successful_synchronized_at=(
             latest_successful_run.completed_at if latest_successful_run is not None else None
         ),
+        next_retry_at=latest_run.next_retry_at,
     )
 
 
