@@ -1321,6 +1321,10 @@ describe("Sync listings action", () => {
       setup(`participation=${US_ID}`);
       await vi.waitFor(() => expect(screen.getByText(/still queued/i)).toBeInTheDocument());
       expect(screen.getByText(/processing has not started yet/i)).toBeInTheDocument();
+      // 12B.3H: honest about the actual limits of what this page can know —
+      // never implies a worker is confirmed to be running when the only
+      // real signal available is the job's own recorded (queued) status.
+      expect(screen.getByText(/no way to confirm whether a synchronization worker is currently running/i)).toBeInTheDocument();
       // Existing data remains visible and truthful throughout.
       expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument();
       expect(screen.getByText(/last successful sync:\s*29 aug 2026/i)).toBeInTheDocument();

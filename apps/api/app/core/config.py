@@ -1,7 +1,7 @@
 from functools import lru_cache
 from uuid import UUID
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_DEVELOPMENT_ORGANIZATION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -185,6 +185,47 @@ class Settings(BaseSettings):
             "listings_sync_max_global_concurrent_jobs / listings_sync_max_concurrent_jobs_per_organization."
         ),
     )
+    listings_worker_idle_poll_seconds: float = Field(
+        default=5.0, gt=0, le=300,
+        description=(
+            "How long the Listings worker sleeps between claim attempts when no eligible job was "
+            "found. Distinct from listings_sync_base_backoff_seconds/listings_sync_max_backoff_seconds "
+            "(Amazon-throttling retry delay for a job already in flight) — this is the worker's own "
+            "idle-poll cadence, unrelated to any single job."
+        ),
+    )
+    listings_worker_poll_error_base_backoff_seconds: float = Field(
+        default=2.0, gt=0,
+        description=(
+            "12B.3H — base delay for the Listings worker's own bounded exponential backoff after a "
+            "recoverable error in the claim/poll step itself (e.g. a database connectivity failure — "
+            "distinct from a job-processing failure, which claim_next_listings_job never raises for "
+            "and which process_claimed_job already records as a normal terminal/retry outcome). "
+            "Doubles on each consecutive poll failure, capped at listings_worker_poll_error_max_"
+            "backoff_seconds, and resets to this base the moment a poll succeeds (finds a job or "
+            "genuinely finds none) — so a transient outage (e.g. Supabase pausing/resuming) does not "
+            "permanently degrade the worker's responsiveness once the database is reachable again."
+        ),
+    )
+    listings_worker_poll_error_max_backoff_seconds: float = Field(
+        default=60.0, gt=0,
+        description="Hard cap on the Listings worker's own poll-error backoff delay — see listings_worker_poll_error_base_backoff_seconds.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_listings_worker_poll_error_backoff_bounds(self) -> "Settings":
+        # `gt=0` on each field already rules out zero/negative individually;
+        # this additionally rules out a base that exceeds its own cap — an
+        # inverted configuration that would make every single poll failure
+        # immediately jump to (and get clamped at) the max delay, silently
+        # discarding the intended gradual doubling, rather than raising a
+        # clear configuration error at startup.
+        if self.listings_worker_poll_error_base_backoff_seconds > self.listings_worker_poll_error_max_backoff_seconds:
+            raise ValueError(
+                "listings_worker_poll_error_base_backoff_seconds must not exceed "
+                "listings_worker_poll_error_max_backoff_seconds"
+            )
+        return self
 
     def consent_application_id(self) -> str:
         """Application id for website authorization. Production/Draft wins over sandbox."""
