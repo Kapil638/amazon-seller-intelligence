@@ -1,0 +1,54 @@
+{
+  "order": {
+    "orderId": "902-1000015-1000015",
+    "createdTime": "2026-01-16T10:00:00Z",
+    "lastUpdatedTime": "2026-01-16T14:00:00Z",
+    "salesChannel": {
+      "channelName": "AMAZON",
+      "marketplaceId": "ATVPDKIKX0DER",
+      "marketplaceName": "Amazon.com"
+    },
+    "fulfillment": {
+      "fulfillmentStatus": "SHIPPED",
+      "fulfilledBy": "MERCHANT",
+      "fulfillmentServiceLevel": "STANDARD"
+    },
+    "proceeds": {
+      "grandTotal": { "amount": "45.98", "currencyCode": "USD" },
+      "breakdowns": [
+        { "type": "ITEM", "subtotal": { "amount": "39.98", "currencyCode": "USD" } },
+        { "type": "SHIPPING", "subtotal": { "amount": "6.00", "currencyCode": "USD" } }
+      ]
+    },
+    "packages": [
+      {
+        "packageReferenceId": "FIXTURE-PKG-001",
+        "createdTime": "2026-01-16T11:00:00Z",
+        "packageStatus": { "status": "SHIPPED", "detailedStatus": "IN_TRANSIT" },
+        "carrier": "FIXTURE-CARRIER",
+        "shipTime": "2026-01-16T12:00:00Z",
+        "shippingService": "FIXTURE-GROUND",
+        "trackingNumber": "FIXTURE-TRACKING-0000001"
+      }
+    ],
+    "orderItems": [
+      {
+        "orderItemId": "10000000000151",
+        "quantityOrdered": 2,
+        "product": {
+          "asin": "B0TESTFIX15",
+          "sellerSku": "FIXTURE-SKU-015",
+          "title": "Fixture getOrder Product",
+          "price": { "unitPrice": { "amount": "19.99", "currencyCode": "USD" } }
+        },
+        "proceeds": {
+          "proceedsTotal": { "amount": "39.98", "currencyCode": "USD" }
+        },
+        "fulfillment": {
+          "quantityFulfilled": 2,
+          "quantityUnfulfilled": 0
+        }
+      }
+    ]
+  }
+}
