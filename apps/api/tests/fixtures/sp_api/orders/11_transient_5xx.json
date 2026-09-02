@@ -1,0 +1,8 @@
+{
+  "errors": [
+    {
+      "code": "InternalFailure",
+      "message": "An unexpected condition occurred that prevented the server from fulfilling the request."
+    }
+  ]
+}

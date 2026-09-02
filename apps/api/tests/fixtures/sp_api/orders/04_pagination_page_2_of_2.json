@@ -1,0 +1,21 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000006-1000006",
+      "createdTime": "2026-01-08T08:05:00Z",
+      "lastUpdatedTime": "2026-01-08T08:05:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000061",
+          "quantityOrdered": 1,
+          "product": { "asin": "B0TESTFIX06", "sellerSku": "FIXTURE-SKU-006" }
+        }
+      ]
+    }
+  ]
+}

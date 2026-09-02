@@ -1,0 +1,26 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000007-1000007",
+      "createdTime": "2026-01-09T10:00:00Z",
+      "lastUpdatedTime": "2026-01-09T16:45:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "fulfillment": {
+        "fulfillmentStatus": "SHIPPED",
+        "fulfilledBy": "MERCHANT"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000071",
+          "quantityOrdered": 2,
+          "product": { "asin": "B0TESTFIX07", "sellerSku": "FIXTURE-SKU-007" },
+          "fulfillment": { "quantityFulfilled": 2, "quantityUnfulfilled": 0 }
+        }
+      ]
+    }
+  ]
+}

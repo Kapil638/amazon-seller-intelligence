@@ -1,0 +1,24 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000009-1000009",
+      "createdTime": "2026-01-11T09:00:00Z",
+      "lastUpdatedTime": "2026-01-11T09:00:00Z",
+      "programs": [],
+      "associatedOrders": [],
+      "orderAliases": [],
+      "salesChannel": {
+        "channelName": "AMAZON"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000091",
+          "quantityOrdered": 1,
+          "product": {
+            "sellerSku": "FIXTURE-SKU-009"
+          }
+        }
+      ]
+    }
+  ]
+}

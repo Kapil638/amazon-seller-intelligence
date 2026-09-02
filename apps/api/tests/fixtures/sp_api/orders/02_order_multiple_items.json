@@ -1,0 +1,69 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000002-1000002",
+      "orderAliases": [
+        {
+          "aliasId": "FIXTURE-SELLER-ORDER-002",
+          "aliasType": "SELLER_ORDER_ID"
+        }
+      ],
+      "createdTime": "2026-01-06T12:00:00Z",
+      "lastUpdatedTime": "2026-01-06T15:30:00Z",
+      "programs": ["PRIME"],
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "proceeds": {
+        "grandTotal": { "amount": "89.97", "currencyCode": "USD" },
+        "breakdowns": [
+          { "type": "ITEM", "subtotal": { "amount": "84.97", "currencyCode": "USD" } },
+          { "type": "TAX", "subtotal": { "amount": "5.00", "currencyCode": "USD" } }
+        ]
+      },
+      "fulfillment": {
+        "fulfillmentStatus": "SHIPPED",
+        "fulfilledBy": "MERCHANT",
+        "fulfillmentServiceLevel": "STANDARD"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000021",
+          "quantityOrdered": 1,
+          "product": {
+            "asin": "B0TESTFIX02",
+            "sellerSku": "FIXTURE-SKU-002A",
+            "title": "Fixture Test Product A",
+            "price": { "unitPrice": { "amount": "24.99", "currencyCode": "USD" } }
+          },
+          "proceeds": {
+            "proceedsTotal": { "amount": "24.99", "currencyCode": "USD" }
+          },
+          "fulfillment": {
+            "quantityFulfilled": 1,
+            "quantityUnfulfilled": 0
+          }
+        },
+        {
+          "orderItemId": "10000000000022",
+          "quantityOrdered": 2,
+          "product": {
+            "asin": "B0TESTFIX03",
+            "sellerSku": "FIXTURE-SKU-002B",
+            "title": "Fixture Test Product B",
+            "price": { "unitPrice": { "amount": "29.99", "currencyCode": "USD" } }
+          },
+          "proceeds": {
+            "proceedsTotal": { "amount": "59.98", "currencyCode": "USD" }
+          },
+          "fulfillment": {
+            "quantityFulfilled": 2,
+            "quantityUnfulfilled": 0
+          }
+        }
+      ]
+    }
+  ]
+}

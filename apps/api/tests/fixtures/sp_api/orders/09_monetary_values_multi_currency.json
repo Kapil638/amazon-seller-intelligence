@@ -1,0 +1,65 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000010-1000010",
+      "createdTime": "2026-01-12T02:00:00Z",
+      "lastUpdatedTime": "2026-01-12T02:00:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "A1VC38T7YXB528",
+        "marketplaceName": "Amazon.co.jp"
+      },
+      "proceeds": {
+        "grandTotal": { "amount": "19940", "currencyCode": "JPY" },
+        "breakdowns": [
+          { "type": "ITEM", "subtotal": { "amount": "19940", "currencyCode": "JPY" } }
+        ]
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000101",
+          "quantityOrdered": 1,
+          "product": {
+            "asin": "B0TESTFIX10",
+            "sellerSku": "FIXTURE-SKU-010-JP",
+            "price": { "unitPrice": { "amount": "19940", "currencyCode": "JPY" } }
+          },
+          "proceeds": {
+            "proceedsTotal": { "amount": "19940", "currencyCode": "JPY" }
+          }
+        }
+      ]
+    },
+    {
+      "orderId": "902-1000011-1000011",
+      "createdTime": "2026-01-12T03:00:00Z",
+      "lastUpdatedTime": "2026-01-12T03:00:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "A1PA6795UKMFR9",
+        "marketplaceName": "Amazon.de"
+      },
+      "proceeds": {
+        "grandTotal": { "amount": "34.95", "currencyCode": "EUR" },
+        "breakdowns": [
+          { "type": "ITEM", "subtotal": { "amount": "29.36", "currencyCode": "EUR" } },
+          { "type": "TAX", "subtotal": { "amount": "5.59", "currencyCode": "EUR" } }
+        ]
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000111",
+          "quantityOrdered": 1,
+          "product": {
+            "asin": "B0TESTFIX11",
+            "sellerSku": "FIXTURE-SKU-011-DE",
+            "price": { "unitPrice": { "amount": "29.36", "currencyCode": "EUR" } }
+          },
+          "proceeds": {
+            "proceedsTotal": { "amount": "29.36", "currencyCode": "EUR" }
+          }
+        }
+      ]
+    }
+  ]
+}
