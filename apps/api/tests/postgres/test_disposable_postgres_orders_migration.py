@@ -18,6 +18,21 @@ rounds rather than rejecting; see
 
 No SP-API client, ingestion service, read API, worker, or UI code is
 exercised here — schema-level proof only.
+
+**Migration-boundary rule, found and fixed after a real CI failure:**
+whenever a test intentionally pins the database below `head` (e.g.
+upgrading only to `0011_listings_job_lifecycle` to seed pre-0012 rows),
+never instantiate or query the *current* ORM model for a table that
+migration `0012` changed — `AmazonIngestionRun`'s six new counter columns
+(`orders_received`/`orders_accepted`/`orders_rejected`/`items_received`/
+`items_accepted`/`items_rejected`) each carry a Python-side `default=0`,
+so SQLAlchemy includes them in any ORM-generated `INSERT` regardless of
+whether the caller mentioned them — and PostgreSQL rejects that `INSERT`
+with `UndefinedColumn` against a table that doesn't have those columns
+yet. Seed and read back such rows with raw SQL restricted to the columns
+that genuinely existed at the pinned revision instead; only use the
+current ORM once the test has actually upgraded to `head` (or whichever
+revision first introduces every column that model maps).
 """
 
 from __future__ import annotations
@@ -242,19 +257,39 @@ def test_existing_0011_database_upgrades_to_0012_preserving_data(disposable_engi
         disposable_engine
     )
     run_id = uuid4()
-    with Session(disposable_engine) as session:
-        session.add(
-            AmazonIngestionRun(
-                id=run_id, organization_id=org_id, seller_account_id=seller_account_id,
-                marketplace_participation_id=participation_id, connection_id=connection_id,
-                run_type="listings", domain="listings_items", region="na", environment="PRODUCTION",
-                status="succeeded",
-            )
+    # Raw SQL restricted to columns that genuinely exist at 0011 — NOT the
+    # current `AmazonIngestionRun` ORM. The database is still pinned at
+    # 0011 here (upgraded to "head" only below); the current ORM class
+    # maps six additional 0012 columns (`orders_received`/`orders_accepted`/
+    # `orders_rejected`/`items_received`/`items_accepted`/`items_rejected`),
+    # each with a Python-side `default=0` — SQLAlchemy therefore includes
+    # them explicitly in any ORM-generated INSERT, which PostgreSQL would
+    # reject with `UndefinedColumn` against a table that doesn't have them
+    # yet. This is exactly the class of bug this file's own module
+    # docstring warns about: never instantiate a current model against a
+    # database intentionally pinned below the revision that model reflects.
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO amazon_ingestion_runs ("
+                "id, organization_id, seller_account_id, marketplace_participation_id, connection_id, "
+                "run_type, domain, region, environment, status"
+                ") VALUES ("
+                ":id, :organization_id, :seller_account_id, :marketplace_participation_id, :connection_id, "
+                "'listings', 'listings_items', 'na', 'PRODUCTION', 'succeeded'"
+                ")"
+            ),
+            {
+                "id": run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+                "marketplace_participation_id": participation_id, "connection_id": connection_id,
+            },
         )
-        session.commit()
 
     with _alembic_environment(url):
         command.upgrade(cfg, "head")
+
+    # Only now — after the upgrade to head — is the current `AmazonIngestionRun`
+    # ORM safe to use again: the database genuinely has every column it maps.
 
     with Session(disposable_engine) as session:
         assert session.get(Organization, org_id) is not None
