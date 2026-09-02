@@ -1,0 +1,40 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000003-1000003",
+      "createdTime": "2026-01-07T09:00:00Z",
+      "lastUpdatedTime": "2026-01-07T09:05:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "fulfillment": { "fulfillmentStatus": "UNSHIPPED", "fulfilledBy": "MERCHANT" },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000031",
+          "quantityOrdered": 1,
+          "product": { "asin": "B0TESTFIX04", "sellerSku": "FIXTURE-SKU-003-US" }
+        }
+      ]
+    },
+    {
+      "orderId": "902-1000004-1000004",
+      "createdTime": "2026-01-07T09:10:00Z",
+      "lastUpdatedTime": "2026-01-07T09:12:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "A2EUQ1WTGCTBG2",
+        "marketplaceName": "Amazon.ca"
+      },
+      "fulfillment": { "fulfillmentStatus": "PENDING", "fulfilledBy": "MERCHANT" },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000041",
+          "quantityOrdered": 1,
+          "product": { "asin": "B0TESTFIX04", "sellerSku": "FIXTURE-SKU-003-CA" }
+        }
+      ]
+    }
+  ]
+}

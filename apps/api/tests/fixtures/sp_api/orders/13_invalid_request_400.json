@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "code": "InvalidInput",
+      "message": "You must provide exactly one of createdAfter and lastUpdatedAfter.",
+      "details": "FIXTURE: illustrates the documented mutual-exclusivity rule between createdAfter/createdBefore and lastUpdatedAfter/lastUpdatedBefore."
+    }
+  ]
+}

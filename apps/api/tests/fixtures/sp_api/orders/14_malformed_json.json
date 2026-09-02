@@ -1,0 +1,10 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000012-1000012",
+      "createdTime": "2026-01-13T00:00:00Z"
+      "lastUpdatedTime": "2026-01-13T00:00:00Z",
+      "salesChannel": { "channelName": "AMAZON" }
+      "orderItems": [
+    }
+  ]

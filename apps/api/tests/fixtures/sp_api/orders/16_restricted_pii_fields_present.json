@@ -1,0 +1,75 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000014-1000014",
+      "createdTime": "2026-01-15T00:00:00Z",
+      "lastUpdatedTime": "2026-01-15T00:00:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "buyer": {
+        "buyerName": "FIXTURE Test Buyer",
+        "buyerEmail": "fixture-buyer@example.invalid",
+        "buyerCompanyName": "FIXTURE Test Company LLC",
+        "buyerPurchaseOrderNumber": "FIXTURE-PO-0001"
+      },
+      "recipient": {
+        "deliveryAddress": {
+          "name": "FIXTURE Test Recipient",
+          "addressLine1": "1 Fixture Test Way",
+          "city": "Faketown",
+          "stateOrRegion": "ZZ",
+          "postalCode": "00000",
+          "countryCode": "US",
+          "phone": "000-000-0000",
+          "addressType": "RESIDENTIAL"
+        }
+      },
+      "payment": {
+        "paymentExecutions": [
+          {
+            "paymentMethod": "CreditCard",
+            "paymentAmount": { "amount": "10.00", "currencyCode": "USD" },
+            "cardBrand": "FIXTURE-VISA",
+            "authorizationCode": "FIXTURE-AUTH-CODE-000"
+          }
+        ]
+      },
+      "tax": {
+        "taxRegistrations": [
+          {
+            "entityType": "BUYER",
+            "legalName": "FIXTURE Test Buyer",
+            "taxRegistrationType": "VAT",
+            "taxRegistrationNumber": "FIXTURE-VAT-000000000"
+          }
+        ]
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000141",
+          "quantityOrdered": 1,
+          "product": {
+            "asin": "B0TESTFIX14",
+            "sellerSku": "FIXTURE-SKU-014",
+            "customization": {
+              "customizedUrl": "https://example.invalid/fixture-custom-order-not-real"
+            }
+          },
+          "fulfillment": {
+            "quantityFulfilled": 1,
+            "quantityUnfulfilled": 0,
+            "packing": {
+              "giftOption": {
+                "giftMessage": "FIXTURE gift message text — must never be persisted or logged.",
+                "giftWrapLevel": "PREMIUM"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

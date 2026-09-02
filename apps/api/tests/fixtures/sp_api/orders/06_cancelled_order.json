@@ -1,0 +1,35 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000008-1000008",
+      "createdTime": "2026-01-10T11:00:00Z",
+      "lastUpdatedTime": "2026-01-10T13:20:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "fulfillment": {
+        "fulfillmentStatus": "CANCELLED",
+        "fulfilledBy": "MERCHANT"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000081",
+          "quantityOrdered": 1,
+          "product": { "asin": "B0TESTFIX08", "sellerSku": "FIXTURE-SKU-008" },
+          "cancellation": {
+            "cancellationRequest": {
+              "requester": "BUYER",
+              "cancelReason": "FIXTURE free-text buyer-authored cancellation reason — must never be persisted or logged; only requester/cancelledBy are allowed fields per 12B.4A privacy boundary."
+            },
+            "cancellationExecution": {
+              "cancelledBy": "BUYER",
+              "cancelReason": "FIXTURE free-text execution reason — same exclusion rule applies."
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "orders": [
+    {
+      "orderId": "902-1000013-1000013",
+      "createdTime": "2026-01-14T00:00:00Z",
+      "lastUpdatedTime": "2026-01-14T00:00:00Z",
+      "salesChannel": {
+        "channelName": "AMAZON",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "marketplaceName": "Amazon.com"
+      },
+      "futureFieldNotYetDocumented": {
+        "someNewAttribute": "FIXTURE: simulates Amazon adding an undocumented field in a future model revision"
+      },
+      "orderItems": [
+        {
+          "orderItemId": "10000000000131",
+          "quantityOrdered": 1,
+          "product": {
+            "asin": "B0TESTFIX13",
+            "sellerSku": "FIXTURE-SKU-013",
+            "anotherFutureAttribute": "FIXTURE: item-level unknown field"
+          }
+        }
+      ]
+    }
+  ]
+}
