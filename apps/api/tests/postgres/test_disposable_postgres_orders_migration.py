@@ -161,11 +161,22 @@ def test_empty_postgres_upgrades_cleanly_to_0011(disposable_engine) -> None:
 
 
 # 2: expected new tables/columns/constraints/FKs exist after 0012.
+#
+# Pinned to the exact "0012_orders_foundation" revision, not "head" —
+# this test's name and every assertion below are specifically about what
+# migration 0012 delivers (reflection-only: `inspect()`, never the current
+# ORM/`Base.metadata`), so it must keep proving exactly that fact
+# regardless of what a future 0013+ migration later adds. Upgrading to
+# "head" instead would silently let this test start validating "whatever
+# schema head currently has" — the same latent boundary defect already
+# found and fixed once in this file (see `test_existing_0011_database_
+# upgrades_to_0012_preserving_data`), just with reflection instead of the
+# ORM as the vector this time.
 def test_empty_postgres_upgrade_produces_expected_orders_schema(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0012_orders_foundation")
 
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
@@ -225,7 +236,12 @@ def test_empty_postgres_upgrade_produces_expected_orders_schema(disposable_engin
     }
 
 
-# 3: full drift parity after 0012.
+# 3: full drift parity — deliberately kept on "head", not pinned to
+# "0012_orders_foundation": this test's own purpose is comparing the
+# reflected schema against `Base.metadata` (the current ORM), so it must
+# always track whatever head currently is to remain a meaningful drift
+# check for every future migration, not just 0012. Its name says
+# "_after_0012" only because 0012 was head at authoring time.
 def test_empty_postgres_upgrade_matches_orm_metadata_exactly_after_0012(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
@@ -286,10 +302,18 @@ def test_existing_0011_database_upgrades_to_0012_preserving_data(disposable_engi
         )
 
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0012_orders_foundation")
 
-    # Only now — after the upgrade to head — is the current `AmazonIngestionRun`
-    # ORM safe to use again: the database genuinely has every column it maps.
+    # Pinned to the exact "0012_orders_foundation" revision, not "head" —
+    # this test's own name and purpose are specifically the 0011 -> 0012
+    # boundary. Using "head" here would let this test silently start
+    # exercising whatever a future 0013+ migration adds instead, on top of
+    # the ORM this test uses below (which will itself grow past 0012 once
+    # such a migration ships) — recreating the exact class of latent
+    # boundary defect already found and fixed once in this file, just one
+    # revision later. Only now — after upgrading to exactly 0012 — is the
+    # current `AmazonIngestionRun` ORM safe to use again: the database
+    # genuinely has every column it maps, today.
 
     with Session(disposable_engine) as session:
         assert session.get(Organization, org_id) is not None
@@ -309,11 +333,19 @@ def test_existing_0011_database_upgrades_to_0012_preserving_data(disposable_engi
 
 # 6: downgrade ordering — 0012 -> 0011 removes only what 0012 added, when
 # no Orders data exists (the safe case).
+#
+# Upgrades to exactly "0012_orders_foundation" first, not "head" — this
+# test's name is specifically the 0012 -> 0011 boundary; starting from
+# "head" would route the downgrade through every migration after 0012 too
+# once one exists, testing "does head fully unwind to 0011" rather than
+# the precise fact this test claims to prove. Safe regardless either way
+# (only `inspect()` is used below, never the current ORM), but pinning
+# keeps this test's proof exact as new migrations are added.
 def test_downgrade_0012_to_0011_is_clean_when_no_orders_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0012_orders_foundation")
         command.downgrade(cfg, "0011_listings_job_lifecycle")
 
     inspector = inspect(disposable_engine)
@@ -341,11 +373,18 @@ def test_downgrade_0012_to_0011_is_clean_when_no_orders_data_exists(disposable_e
 
 # 7: downgrade refuses when Orders data would be discarded — never
 # silently reinterpreted as Listings data.
+#
+# Same reasoning as the previous test: pinned to exactly
+# "0012_orders_foundation" rather than "head", since this test's name and
+# purpose are specifically the 0012 -> 0011 boundary. Only raw SQL/
+# `inspect()` are used for `amazon_ingestion_runs` throughout (never the
+# current ORM), so this is safe either way — pinning simply keeps the
+# proof exact regardless of what a future 0013+ migration later adds.
 def test_downgrade_0012_to_0011_refuses_when_orders_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0012_orders_foundation")
 
     org_id, seller_account_id, connection_id, _ = _seed_org_seller_connection_and_participation(disposable_engine)
     run_id = uuid4()
