@@ -490,6 +490,24 @@ class AmazonConnection(Base):
             "environment",
             name="uq_amazon_connections_org_provider_env",
         ),
+        # 12B.4B remediation — lets `amazon_ingestion_runs` hold a composite
+        # FK pinning `(connection_id, organization_id, region, environment)`
+        # to this exact row, making it structurally impossible for a run to
+        # claim a region/environment that disagrees with its own
+        # `connection_id`'s authoritative values. Safe to add unconditionally
+        # (not just for Orders): the only existing code path that sets a
+        # run's `region`/`environment` (`AmazonListingsIngestionService.
+        # _check_scope`) already always copies them directly from the
+        # resolved connection object, so this is a no-op for every row any
+        # current code can produce and only rejects a genuinely inconsistent
+        # future write.
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            "region",
+            "environment",
+            name="uq_amazon_connections_id_org_region_environment",
+        ),
         Index("ix_amazon_connections_org", "organization_id"),
         CheckConstraint(
             "status IN ("
@@ -631,6 +649,27 @@ class AmazonMarketplaceParticipation(Base):
             "seller_account_id",
             "is_active",
         ),
+        # 12B.4B (remediated) — the participation-side anchor for
+        # `amazon_ingestion_run_marketplace_participations`'s composite FK.
+        # Pins the entire (organization, seller_account, region,
+        # connection_id) tuple — `connection_id` was added in remediation
+        # specifically so an association row's FK can force this
+        # participation's connection to be the *same row* as the covering
+        # Orders run's own connection (see `AmazonIngestionRunMarketplace
+        # Participation`'s docstring). `connection_id` is nullable on this
+        # table already; a participation with no resolved connection simply
+        # cannot satisfy this constraint's non-null half when referenced by
+        # a composite FK requiring a specific connection_id value — which is
+        # exactly the desired effect: a participation with no known
+        # connection is structurally ineligible for any Orders run.
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            "seller_account_id",
+            "region",
+            "connection_id",
+            name="uq_amazon_marketplace_participations_id_org_seller_region_conn",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
@@ -762,13 +801,34 @@ class AmazonIngestionRun(Base):
             name="ck_amazon_ingestion_runs_status",
         ),
         CheckConstraint(
-            "run_type IN ('marketplace_participations', 'listings')",
+            "run_type IN ('marketplace_participations', 'listings', 'orders')",
             name="ck_amazon_ingestion_runs_run_type",
         ),
         CheckConstraint(
             "run_type <> 'listings' OR "
             "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
             name="ck_amazon_ingestion_runs_listings_scope_required",
+        ),
+        # 12B.4B — an Orders run is scoped coarser than a Listings run: one
+        # run may cover every active marketplace participation for a given
+        # (seller_account, region, environment) in a single searchOrders
+        # traversal (Amazon's 0.0056 req/s budget is shared per seller
+        # account regardless of participation count, so one run per
+        # participation would divide an already-scarce budget needlessly —
+        # see docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md's Phase 4
+        # point 11). This is why `marketplace_participation_id` is
+        # deliberately required to be NULL for `run_type='orders'` — unlike
+        # a Listings run, no single participation column can name "the"
+        # participation an Orders run covers, because it may cover several.
+        # Which participations an Orders run actually covered is instead
+        # recorded as one row per participation in
+        # `amazon_ingestion_run_marketplace_participations` below — never
+        # inferred from this column.
+        CheckConstraint(
+            "run_type <> 'orders' OR "
+            "(marketplace_participation_id IS NULL AND seller_account_id IS NOT NULL "
+            "AND region IS NOT NULL AND environment IS NOT NULL AND connection_id IS NOT NULL)",
+            name="ck_amazon_ingestion_runs_orders_scope_required",
         ),
         # Single-writer guarantee (12B.3 product decision, widened 12B.3G):
         # at most one *nonterminal* listings run may exist per
@@ -794,6 +854,25 @@ class AmazonIngestionRun(Base):
                 "run_type = 'listings' AND status IN ('queued', 'started', 'waiting_to_retry')"
             ),
         ),
+        # 12B.4B — the Orders equivalent of the index above, scoped to
+        # (seller_account, region, environment) instead of a single
+        # participation, matching the coarser Orders run scope. This *is*
+        # the concurrency control for Orders jobs (a second concurrent
+        # INSERT into the same scope fails on this constraint), exactly the
+        # same technique as Listings, just at a different granularity.
+        Index(
+            "uq_amazon_ingestion_runs_active_orders_scope",
+            "seller_account_id",
+            "region",
+            "environment",
+            unique=True,
+            postgresql_where=text(
+                "run_type = 'orders' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+            sqlite_where=text(
+                "run_type = 'orders' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+        ),
         # Widens the PK into a composite unique key so amazon_seller_listings
         # can hold a composite FK guaranteeing a listing's last ingestion
         # run belongs to the same marketplace participation (see
@@ -802,6 +881,52 @@ class AmazonIngestionRun(Base):
             "id",
             "marketplace_participation_id",
             name="uq_amazon_ingestion_runs_id_marketplace_participation",
+        ),
+        # 12B.4B (remediated) — lets `amazon_ingestion_run_marketplace_
+        # participations` hold a composite FK back to this run that pins
+        # the entire (organization, seller_account, region, connection_id)
+        # tuple, not just the run's `id` — so an association row can never
+        # be inserted pointing at a run from a different organization/
+        # seller/region/connection than the association row's own
+        # denormalized copies of those columns claim. `connection_id` was
+        # added in remediation: pinning it here, together with the same
+        # pin on the participation side (see `AmazonMarketplaceParticipation`),
+        # forces a run and every participation it covers to share the
+        # *exact same* `amazon_connections` row — which the composite FK
+        # below (`uq_amazon_connections_id_org_region_environment`) already
+        # proves carries a self-consistent (organization, region,
+        # environment). This is what makes a PRODUCTION run pairing with a
+        # SANDBOX-backed participation, or an `na` run pairing with an
+        # `eu`/`fe` participation, structurally impossible rather than only
+        # conventionally avoided.
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            "seller_account_id",
+            "region",
+            "connection_id",
+            name="uq_amazon_ingestion_runs_id_org_seller_region_conn",
+        ),
+        # 12B.4B remediation — proves this run's own `region`/`environment`
+        # actually match its own `connection_id`'s authoritative values.
+        # `ondelete="RESTRICT"`, not `SET NULL` like the plain single-column
+        # FK on `connection_id` below: `organization_id`/`region`/
+        # `environment` are all `NOT NULL` on this table, so `SET NULL`
+        # cannot be satisfied for a composite FK including them — RESTRICT
+        # makes the enforced behavior legible instead of failing as a
+        # confusing NOT NULL violation at delete time. No code anywhere in
+        # this repository deletes an `amazon_connections` row today, so
+        # this changes no currently-exercised behavior.
+        ForeignKeyConstraint(
+            ["connection_id", "organization_id", "region", "environment"],
+            [
+                "amazon_connections.id",
+                "amazon_connections.organization_id",
+                "amazon_connections.region",
+                "amazon_connections.environment",
+            ],
+            name="fk_amazon_ingestion_runs_connection_org_region_env",
+            ondelete="RESTRICT",
         ),
     )
 
@@ -845,6 +970,20 @@ class AmazonIngestionRun(Base):
     # 12B.3G additions for the durable job lifecycle.
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 12B.4B — Orders-specific counters. `records_received/accepted/
+    # rejected` above were sized for Listings, where one record == one
+    # listing/SKU. An Orders page truthfully contains two distinct
+    # countable entities (orders and their items), which a single generic
+    # counter triple cannot represent without conflating the two — so these
+    # are additive, not a reuse of the existing columns. Meaningful only
+    # for `run_type='orders'`; always `0` (their deterministic default) for
+    # every other run_type, including every pre-12B.4B row after migration.
+    orders_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    orders_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    orders_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     organization: Mapped[Organization] = relationship()
@@ -980,3 +1119,358 @@ class AmazonSellerListing(Base):
     )
 
     marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()
+
+
+class AmazonIngestionRunMarketplaceParticipation(Base):
+    """Which marketplace participations one Orders ingestion run covered.
+
+    12B.4B. A Listings run covers exactly one participation, named directly
+    by `amazon_ingestion_runs.marketplace_participation_id`. An Orders run
+    covers a whole `(seller_account, region, environment)` scope in one
+    `searchOrders` traversal (see `AmazonIngestionRun.__table_args__`'s
+    `ck_amazon_ingestion_runs_orders_scope_required` docstring) — this
+    table is the only place that membership is recorded, one row per
+    participation actually included in the run.
+
+    Composite primary key `(ingestion_run_id, marketplace_participation_id)`
+    gives the exact "no duplicate run/participation pair" uniqueness this
+    table exists for, and is also the FK target `amazon_seller_orders`/
+    `amazon_seller_order_items`/`amazon_orders_sync_checkpoints` reference
+    from `last_ingestion_run_id` — proving, at the database level, that the
+    run named there actually included that exact participation. A row
+    whose `last_ingestion_run_id` names a run that never covered its own
+    `marketplace_participation_id` cannot be inserted; the composite FK
+    rejects it.
+
+    Both composite foreign keys below pin the full `(organization_id,
+    seller_account_id, region, connection_id)` tuple, not just the bare id
+    — so this table cannot associate a run and a participation that
+    disagree on organization, seller account, region, *or connection*,
+    structurally, not only by convention. Pinning `connection_id` on both
+    sides (added in 12B.4B remediation) forces the run and every
+    participation it covers to share the exact same `amazon_connections`
+    row — and since that row's own `(organization, region, environment)`
+    is itself proven self-consistent by
+    `uq_amazon_connections_id_org_region_environment` and
+    `fk_amazon_ingestion_runs_connection_org_region_env`, this transitively
+    makes a PRODUCTION run pairing with a SANDBOX-backed participation, or
+    an `na` run pairing with an `eu`/`fe` participation, structurally
+    impossible — not merely disallowed by convention. `run_type='orders'`
+    on the referenced run is *not* database-enforced here, for the same
+    reason `amazon_seller_listings` does not database-enforce its
+    referenced run's `run_type='listings'` (see that class's docstring) —
+    a composite FK cannot pin the referenced side to a literal constant;
+    that check is deferred to repository/service-layer validation,
+    consistent with the existing precedent.
+    """
+
+    __tablename__ = "amazon_ingestion_run_marketplace_participations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["ingestion_run_id", "organization_id", "seller_account_id", "region", "connection_id"],
+            [
+                "amazon_ingestion_runs.id",
+                "amazon_ingestion_runs.organization_id",
+                "amazon_ingestion_runs.seller_account_id",
+                "amazon_ingestion_runs.region",
+                "amazon_ingestion_runs.connection_id",
+            ],
+            name="fk_amazon_ingestion_run_parts_run_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["marketplace_participation_id", "organization_id", "seller_account_id", "region", "connection_id"],
+            [
+                "amazon_marketplace_participations.id",
+                "amazon_marketplace_participations.organization_id",
+                "amazon_marketplace_participations.seller_account_id",
+                "amazon_marketplace_participations.region",
+                "amazon_marketplace_participations.connection_id",
+            ],
+            name="fk_amazon_ingestion_run_parts_participation_scope",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_amazon_ingestion_run_participations_participation",
+            "marketplace_participation_id",
+        ),
+    )
+
+    ingestion_run_id: Mapped[UUID] = mapped_column(Guid(), primary_key=True)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(Guid(), primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    seller_account_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    region: Mapped[str] = mapped_column(String(8), nullable=False)
+    # NOT NULL: see this class's docstring — pinning this alongside the run
+    # and participation's own connection_id is the actual environment/
+    # region enforcement mechanism for 12B.4B's remediated design.
+    connection_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AmazonSellerOrder(Base):
+    """Canonical seller-owned order (current-state) for one marketplace
+    participation. 12B.4B schema foundation only — no SP-API client,
+    ingestion service, read API, or UI reads/writes this table yet.
+
+    Current-state, not event history: this row always reflects Amazon's
+    latest known state for the order, upserted in place. There is no
+    per-status-transition history table — see
+    docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md Phase 5's explicit
+    "history/change tracking... deferred" decision, reconfirmed unchanged
+    by 12B.4B.
+
+    No customer PII column exists here by design: no buyer name/email,
+    no recipient/shipping address, no payment instrument data, no
+    tax-registration identifiers, no gift message, no cancellation
+    free-text reason, no raw order payload. See
+    `tests/test_amazon_seller_orders_schema.py` for the automated assertion
+    that these columns stay absent.
+
+    `amazon_order_id` is a confidential business identifier — like
+    `amazon_seller_listings.seller_sku`/`asin`, it is safe to store and to
+    return through a future authenticated, org-scoped read API, but must
+    never appear in logs, exception text, or generic diagnostics (see
+    docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md Phase 3, answer 6).
+
+    Monetary precision: `order_total_amount` (and `unit_price_amount`/
+    `item_proceeds_amount` on `AmazonSellerOrderItem`) use `Numeric(19,4)`,
+    not this repository's more common `Numeric(14,2)` — the pinned
+    contract's own `Decimal` type is documented as "a decimal number with
+    no loss of precision" and is transmitted as a JSON *string*
+    specifically to avoid float rounding, which is direct evidence against
+    assuming every supported currency has exactly two fractional digits.
+    `Numeric(19,4)` comfortably covers three-decimal currencies (e.g.
+    BHD/KWD/OMR) with a margin of safety, while `19` total digits exceeds
+    any realistic order amount. This is a deliberately scoped exception
+    for the *new* Orders columns only — it does not retrofit
+    `amazon_seller_listings.price_amount` or the Profit/Advertising
+    models' existing `Numeric(14,2)` columns, which are unrelated to this
+    milestone and already proven adequate for their own inputs.
+
+    Ownership integrity: like `amazon_seller_listings`, this table has no
+    `organization_id`/`seller_account_id` column — ownership is derived
+    exclusively through `marketplace_participation_id`.
+
+    Provenance integrity: `last_ingestion_run_id` uses a composite foreign
+    key to `amazon_ingestion_run_marketplace_participations(ingestion_run_
+    id, marketplace_participation_id)` rather than directly to
+    `amazon_ingestion_runs.id` — this is the key difference from
+    `amazon_seller_listings`'s pattern, made necessary because one Orders
+    run can cover several participations (unlike one Listings run, which
+    covers exactly one). Referencing the association table instead of the
+    run directly proves, at the database level, that the referenced run
+    actually included *this row's own* participation — not merely that the
+    run exists.
+    """
+
+    __tablename__ = "amazon_seller_orders"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace_participation_id",
+            "amazon_order_id",
+            name="uq_amazon_seller_orders_participation_order_id",
+        ),
+        # Widens into a composite unique key so amazon_seller_order_items
+        # can hold a composite FK guaranteeing an item's order belongs to
+        # the same marketplace participation as the item itself — the same
+        # technique amazon_ingestion_runs already uses for
+        # amazon_seller_listings.
+        UniqueConstraint(
+            "id",
+            "marketplace_participation_id",
+            name="uq_amazon_seller_orders_id_marketplace_participation",
+        ),
+        CheckConstraint(
+            "fulfillment_status IS NULL OR fulfillment_status IN ("
+            "'PENDING_AVAILABILITY', 'PENDING', 'UNSHIPPED', 'PARTIALLY_SHIPPED', "
+            "'SHIPPED', 'CANCELLED', 'UNFULFILLABLE'"
+            ")",
+            name="ck_amazon_seller_orders_fulfillment_status",
+        ),
+        CheckConstraint(
+            "fulfilled_by IS NULL OR fulfilled_by IN ('MERCHANT', 'AMAZON')",
+            name="ck_amazon_seller_orders_fulfilled_by",
+        ),
+        Index("ix_amazon_seller_orders_participation_updated", "marketplace_participation_id", "amazon_last_updated_at"),
+        Index("ix_amazon_seller_orders_participation_status", "marketplace_participation_id", "fulfillment_status"),
+        Index("ix_amazon_seller_orders_last_ingestion_run", "last_ingestion_run_id"),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            [
+                "amazon_ingestion_run_marketplace_participations.ingestion_run_id",
+                "amazon_ingestion_run_marketplace_participations.marketplace_participation_id",
+            ],
+            name="fk_amazon_seller_orders_last_run_same_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    amazon_order_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # "Order status" in product language; named after the contract's own
+    # `Order.fulfillment.fulfillmentStatus` field for traceability.
+    fulfillment_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    fulfilled_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    sales_channel_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sales_channel_marketplace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sales_channel_marketplace_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    items_shipped_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    items_unshipped_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    order_total_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    order_total_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    is_business_order: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_prime: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    was_cancelled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    amazon_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    amazon_last_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # No inline ForeignKey() here: the actual constraint is the composite
+    # ForeignKeyConstraint in __table_args__ — see the class docstring.
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()
+
+
+class AmazonSellerOrderItem(Base):
+    """One product line within a canonical seller-owned order. 12B.4B.
+
+    Natural key `(order_id, amazon_order_item_id)`: `orderItemId` is
+    documented by the pinned Orders API `2026-01-01` contract as "a unique
+    identifier for this specific item within the order" — an evidenced
+    natural key, not one invented from `seller_sku`/`asin` alone (the same
+    SKU legitimately repeats across many orders, and even within one order
+    a substitution/associated item could in principle share an ASIN with
+    another line — neither is a safe uniqueness boundary on its own).
+
+    No customer PII column exists here by design — see
+    `AmazonSellerOrder`'s docstring and
+    `tests/test_amazon_seller_orders_schema.py`.
+    """
+
+    __tablename__ = "amazon_seller_order_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "amazon_order_item_id",
+            name="uq_amazon_seller_order_items_order_item_id",
+        ),
+        Index("ix_amazon_seller_order_items_participation_asin", "marketplace_participation_id", "asin"),
+        Index("ix_amazon_seller_order_items_participation_sku", "marketplace_participation_id", "seller_sku"),
+        Index("ix_amazon_seller_order_items_last_ingestion_run", "last_ingestion_run_id"),
+        # Prevents an item from ever pointing at an order in a different
+        # marketplace participation than its own `marketplace_participation_
+        # id` column — the same cross-marketplace-provenance guard
+        # `amazon_seller_listings` gets from amazon_ingestion_runs, applied
+        # here one level down, against amazon_seller_orders instead.
+        ForeignKeyConstraint(
+            ["order_id", "marketplace_participation_id"],
+            ["amazon_seller_orders.id", "amazon_seller_orders.marketplace_participation_id"],
+            name="fk_amazon_seller_order_items_order_same_participation",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            [
+                "amazon_ingestion_run_marketplace_participations.ingestion_run_id",
+                "amazon_ingestion_run_marketplace_participations.marketplace_participation_id",
+            ],
+            name="fk_amazon_seller_order_items_last_run_same_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    order_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    amazon_order_item_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    seller_sku: Mapped[str] = mapped_column(String(180), nullable=False)
+    asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    item_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    condition_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quantity_ordered: Mapped[int] = mapped_column(Integer, nullable=False)
+    quantity_fulfilled: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quantity_unfulfilled: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit_price_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    unit_price_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    item_proceeds_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    item_proceeds_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # No inline ForeignKey() here: the actual constraints are the composite
+    # ForeignKeyConstraints in __table_args__ — see the class docstring.
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AmazonOrdersSyncCheckpoint(Base):
+    """Durable, per-participation Orders incremental high-water mark. 12B.4B.
+
+    One row per `marketplace_participation_id`; absence of a row (not a
+    shared default/zero value) is what makes a newly-active participation
+    start with no inherited history — there is nothing to inherit from,
+    structurally, until this participation's own first successful run
+    creates its own row.
+
+    `synced_through_at` stores the raw watermark only — no overlap window
+    is baked into the stored value. The future ingestion service applies a
+    configurable overlap window (subtracted from this value) when
+    constructing the next `lastUpdatedAfter` request; this table has no
+    opinion on how large that window is (see
+    docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md Phase 4 point 2).
+
+    `last_successful_run_id`'s composite foreign key to
+    `amazon_ingestion_run_marketplace_participations` is the mechanism that
+    proves, at the database level, this checkpoint can never reference a
+    run that did not actually cover its own `marketplace_participation_id`
+    — a service-layer bug that tried to advance a checkpoint using an
+    unrelated run's id would fail this FK, not merely fail a code review.
+
+    No `paginationToken`/`nextToken` column exists here, deliberately — see
+    docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md Phase 4's default
+    recommendation, adopted as-is: a failed/partial traversal restarts from
+    the unchanged high-water mark rather than resuming a remembered page,
+    relying on idempotent upserts and the overlap window for correctness.
+    """
+
+    __tablename__ = "amazon_orders_sync_checkpoints"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["last_successful_run_id", "marketplace_participation_id"],
+            [
+                "amazon_ingestion_run_marketplace_participations.ingestion_run_id",
+                "amazon_ingestion_run_marketplace_participations.marketplace_participation_id",
+            ],
+            name="fk_amazon_orders_sync_checkpoints_run_same_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), primary_key=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    seller_account_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    synced_through_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # No inline ForeignKey() here: the actual constraint is the composite
+    # ForeignKeyConstraint in __table_args__ — see the class docstring.
+    last_successful_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
