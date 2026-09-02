@@ -838,9 +838,12 @@ milestones only.
 
 ## Phase 7 — Sanitized fixture plan (delivered)
 
-16 fixture files + `README.md` created at
-`apps/api/tests/fixtures/sp_api/orders/` (listed in that directory's own
-`README.md`, mirroring the 12B.3A/Listings convention exactly). Coverage:
+16 numbered scenarios, delivered as **18 fixture JSON files** (two
+scenarios — pagination and the mutable-order before/after pair — each
+require two physical files) + `README.md`, created at
+`apps/api/tests/fixtures/sp_api/orders/` (19 files total in that
+directory; listed in the directory's own `README.md`, mirroring the
+12B.3A/Listings convention exactly). Coverage:
 minimal valid order, multi-item order, multi-marketplace page, 2-page
 pagination (`nextToken` present then absent), mutable-order before/after
 update pair, cancelled order (with the excluded free-text fields present,
@@ -931,9 +934,10 @@ earliest:
 Re-run in full during this correction pass (not only asserted from the
 original pass):
 
-- **Fixture JSON validated:** all 15 non-malformed fixtures re-parsed
-  cleanly with `python3 -m json.tool`; `14_malformed_json.json` re-confirmed
-  invalid by design (documented above and in the fixtures' own `README.md`)
+- **Fixture JSON validated:** all 17 non-malformed fixtures (of 18 total
+  fixture JSON files) re-parsed cleanly with `python3 -m json.tool`;
+  `14_malformed_json.json` re-confirmed invalid by design (documented
+  above and in the fixtures' own `README.md`)
   and explicitly excluded from the validation pass by name, not silently
   skipped.
 - **Fixture re-audit against this correction's 9-point checklist:** (1)
