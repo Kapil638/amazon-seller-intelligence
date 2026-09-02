@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -33,10 +34,14 @@ from app.persistence.models import (
     AdvertisingSnapshot,
     AmazonConnection,
     AmazonIngestionRun,
+    AmazonIngestionRunMarketplaceParticipation,
     AmazonMarketplaceParticipation,
     AmazonOAuthState,
+    AmazonOrdersSyncCheckpoint,
     AmazonSellerAccount,
     AmazonSellerListing,
+    AmazonSellerOrder,
+    AmazonSellerOrderItem,
 )
 
 
@@ -3130,6 +3135,879 @@ class AmazonSellerListingRepository:
                 AmazonSellerListing.marketplace_participation_id == marketplace_participation_id,
             )
         ).first()
+
+
+@dataclass(frozen=True)
+class OrdersRunClaim:
+    """Outcome of an atomic Orders-run enqueue/claim attempt. Never carries
+    a lease owner or any identifier beyond what the caller already
+    supplied."""
+
+    claimed: bool
+    run_id: UUID | None = None
+    reason: str | None = None  # "already_running" / "no_eligible_job"
+
+
+class OrdersRunFinalizationIncomplete(RuntimeError):
+    """Raised by `finalize_successful_orders_run` if it cannot advance the
+    checkpoint for every requested participation. All-or-nothing: this is
+    a hard failure, not a partial-success return value — the caller must
+    roll back its transaction on this exception, which undoes the run's
+    already-applied `succeeded` status flip together with every checkpoint
+    this call already advanced earlier in the same batch. Never carries
+    which participation failed — that would be a business identifier in
+    exception text, the same standard already enforced for `amazon_order_
+    id` and every other Orders identifier."""
+
+
+@dataclass(frozen=True)
+class OrdersRunFinalization:
+    """Outcome of `finalize_successful_orders_run` when it does not raise.
+    `finalized=True` means *every* requested participation's checkpoint
+    was advanced — `advanced_participation_ids` always equals the full set
+    of keys in the caller's `participation_watermarks` on success. A
+    partial result is never returned as success; see
+    `OrdersRunFinalizationIncomplete`."""
+
+    finalized: bool
+    advanced_participation_ids: tuple[UUID, ...] = ()
+    reason: str | None = None  # e.g. "run_not_started" when finalized is False
+
+
+class AmazonIngestionRunMarketplaceParticipationRepository:
+    """Persistence primitives for 12B.4B's Orders run-scope design.
+
+    No HTTP client, pagination, or orchestration lives here — see
+    `docs/AI_HANDOVER/12B4B_ORDERS_SCHEMA.md`. The lifecycle mirrors
+    Listings' durable job architecture exactly (`API/service trigger →
+    queued job → worker claim → started lease → processing → terminal`):
+
+    - `enqueue_orders_run` creates a `queued` row (no lease, no
+      `started_at`) plus one `amazon_ingestion_run_marketplace_
+      participations` row per covered participation — the only way an
+      Orders run comes into existence. No API/service path creates a
+      `started` row directly.
+    - `claim_orders_run` is the *only* method that transitions a row to
+      `started` — a worker-only, compare-and-set operation (mirrors
+      `AmazonIngestionRunRepository.claim_next_listings_job`'s stale-reclaim
+      step, simplified: this scope's own partial unique index already
+      guarantees at most one non-terminal row per `(seller_account, region,
+      environment)`, so claiming by exact scope rather than a global
+      cross-organization candidate scan is sufficient here — see that
+      method's own docstring for the fuller capacity-limited version this
+      deliberately does not duplicate, per 12B.4B's own "do not duplicate
+      the entire worker implementation unless essential" instruction).
+    - `finalize_successful_orders_run` is the *only* method that marks a
+      run `succeeded` — and it advances every included participation's
+      checkpoint in the same call, atomically, rather than leaving
+      checkpoint advancement as a separately-callable, permissively-gated
+      operation. See that method's own docstring for the exact gating
+      predicate.
+
+    The active-scope partial unique index
+    (`uq_amazon_ingestion_runs_active_orders_scope`) already covers
+    `queued`, `started`, and `waiting_to_retry` together, so it is the
+    single concurrency control for the whole lifecycle, not just the
+    `started` state.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _validate_scope(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        connection_id: UUID,
+        marketplace_participation_ids: list[UUID],
+        region: str,
+        environment: str,
+    ) -> tuple[AmazonConnection, list[AmazonMarketplaceParticipation]]:
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+            organization_id, seller_account_id
+        )
+        if seller_account is None:
+            raise TypeError("Amazon orders run cannot bind a seller account from another organization.")
+        connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+        if connection is None:
+            raise TypeError("Amazon orders run cannot bind a connection from another organization.")
+        if connection.region != region or connection.environment != environment:
+            raise TypeError(
+                "Amazon orders run region/environment does not match the given connection's own region/environment."
+            )
+        if not marketplace_participation_ids:
+            raise TypeError("Amazon orders run requires at least one marketplace participation.")
+        participation_repo = AmazonMarketplaceParticipationRepository(self.session)
+        participations: list[AmazonMarketplaceParticipation] = []
+        for participation_id in marketplace_participation_ids:
+            participation = participation_repo.get_by_id(organization_id, participation_id)
+            if participation is None:
+                raise TypeError(
+                    "Amazon orders run cannot bind a marketplace participation from another organization."
+                )
+            if participation.seller_account_id != seller_account_id:
+                raise TypeError(
+                    "Amazon orders run marketplace participation does not belong to the given seller account."
+                )
+            if participation.region != region:
+                raise TypeError("Amazon orders run marketplace participation does not belong to the given region.")
+            if participation.connection_id != connection_id:
+                raise TypeError(
+                    "Amazon orders run marketplace participation is not backed by the given connection — a "
+                    "PRODUCTION run cannot cover a SANDBOX-backed participation or vice versa, and every "
+                    "covered participation must share the run's own connection."
+                )
+            participations.append(participation)
+        return connection, participations
+
+    def enqueue_orders_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        connection_id: UUID,
+        marketplace_participation_ids: list[UUID],
+        region: str,
+        environment: str,
+    ) -> OrdersRunClaim:
+        """Creates a `queued` Orders run plus its participation-membership
+        rows. No lease, no `started_at` — a worker must separately call
+        `claim_orders_run` before any processing may begin. A second
+        concurrent enqueue for the same `(seller_account, region,
+        environment)` scope — while one is already `queued`, `started`, or
+        `waiting_to_retry` — fails on `uq_amazon_ingestion_runs_active_
+        orders_scope`, surfaced as `claimed=False`, the same savepoint-
+        isolated pattern as `AmazonIngestionRunRepository.claim_listings_
+        run`.
+        """
+        connection, participations = self._validate_scope(
+            organization_id=organization_id,
+            seller_account_id=seller_account_id,
+            connection_id=connection_id,
+            marketplace_participation_ids=marketplace_participation_ids,
+            region=region,
+            environment=environment,
+        )
+        run = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection.id,
+            seller_account_id=seller_account_id,
+            marketplace_participation_id=None,
+            run_type="orders",
+            domain="orders",
+            region=region,
+            environment=environment,
+            status="queued",
+            started_at=None,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(run)
+                self.session.flush()
+                for participation in participations:
+                    self.session.add(
+                        AmazonIngestionRunMarketplaceParticipation(
+                            ingestion_run_id=run.id,
+                            marketplace_participation_id=participation.id,
+                            organization_id=organization_id,
+                            seller_account_id=seller_account_id,
+                            region=region,
+                            connection_id=connection.id,
+                        )
+                    )
+                self.session.flush()
+        except IntegrityError:
+            return OrdersRunClaim(claimed=False, reason="already_running")
+        return OrdersRunClaim(claimed=True, run_id=run.id)
+
+    def claim_orders_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        region: str,
+        environment: str,
+        lease_owner: str,
+        lease_duration_seconds: int,
+    ) -> OrdersRunClaim:
+        """Worker-only transition of the eligible `queued`/`waiting_to_
+        retry` Orders run for this exact scope to `started`. This is the
+        *only* method in this codebase that writes `status='started'` for
+        `run_type='orders'` — no API or service path may start work
+        directly. Stale `started` rows (lease expired, no worker ever
+        finished them) are reclaimed to `timed_out` first, exactly like
+        `AmazonIngestionRunRepository.claim_listings_run`'s own
+        stale-reclaim step, so their scope is freed before any new
+        candidate is considered.
+
+        Compare-and-set: the final `UPDATE` is conditioned on `id` *and*
+        the exact `status` value observed by the preceding candidate
+        `SELECT`. If a concurrent claim already won (or a stale-reclaim
+        already changed the row) between the two statements, this
+        `UPDATE` matches zero rows and `claimed=False` is returned — the
+        row is never double-claimed. This does not use `FOR UPDATE SKIP
+        LOCKED`/global capacity limiting the way `claim_next_listings_job`
+        does: `uq_amazon_ingestion_runs_active_orders_scope` already
+        guarantees at most one non-terminal row exists for this exact
+        scope at any time, so at most one candidate can ever be found —
+        the additional machinery that method needs (to fairly distribute
+        *many* simultaneously-eligible candidates across workers) does not
+        apply here, per 12B.4B's "do not duplicate the entire worker
+        implementation unless essential" instruction.
+        """
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(
+            organization_id, seller_account_id
+        )
+        if seller_account is None:
+            raise TypeError("Amazon orders run cannot bind a seller account from another organization.")
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        candidate = self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status.in_(("queued", "waiting_to_retry")),
+                or_(
+                    AmazonIngestionRun.next_retry_at.is_(None),
+                    AmazonIngestionRun.next_retry_at <= func.now(),
+                ),
+            )
+            .order_by(AmazonIngestionRun.created_at.asc())
+        ).first()
+        if candidate is None:
+            return OrdersRunClaim(claimed=False, reason="no_eligible_job")
+
+        was_retry = candidate.status == "waiting_to_retry"
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == candidate.id,
+                AmazonIngestionRun.status == candidate.status,
+            )
+            .values(
+                status="started",
+                started_at=func.coalesce(AmazonIngestionRun.started_at, func.now()),
+                lease_owner=lease_owner,
+                lease_expires_at=AmazonIngestionRunRepository(self.session)._lease_expiry_value(
+                    lease_duration_seconds
+                ),
+                last_heartbeat_at=func.now(),
+                retry_count=(AmazonIngestionRun.retry_count + 1) if was_retry else AmazonIngestionRun.retry_count,
+            )
+        )
+        self.session.flush()
+        if result.rowcount == 0:
+            return OrdersRunClaim(claimed=False, reason="already_running")
+        return OrdersRunClaim(claimed=True, run_id=candidate.id)
+
+    def is_participation_in_run(self, ingestion_run_id: UUID, marketplace_participation_id: UUID) -> bool:
+        """Membership check: did this specific run actually cover this
+        specific participation? Used by tests and by
+        `finalize_successful_orders_run`'s own internal predicate — never
+        the sole enforcement mechanism (see that method and
+        `AmazonOrdersSyncCheckpointRepository` for the SQL-predicate/
+        composite-FK enforcement that holds even if this check is
+        bypassed)."""
+        return (
+            self.session.scalars(
+                select(AmazonIngestionRunMarketplaceParticipation).where(
+                    AmazonIngestionRunMarketplaceParticipation.ingestion_run_id == ingestion_run_id,
+                    AmazonIngestionRunMarketplaceParticipation.marketplace_participation_id
+                    == marketplace_participation_id,
+                )
+            ).first()
+            is not None
+        )
+
+    def finalize_successful_orders_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        ingestion_run_id: UUID,
+        participation_watermarks: dict[UUID, datetime],
+    ) -> OrdersRunFinalization:
+        """The one atomic primitive that both completes an Orders run and
+        advances every included participation's checkpoint — steps 2-4 of
+        12B.4B's required transaction design, in one call, one transaction:
+
+        1. (caller's responsibility, not repeated here) the run's active
+           lease and scope were already verified at claim time.
+        2. Marks the run `succeeded` with `completed_at=now()` — but ONLY
+           if it is currently `started` (a single guarded `UPDATE ... WHERE
+           id=:id AND run_type='orders' AND status='started'`; zero rows
+           affected means rejection — a SQL predicate, not a Python
+           status check, decides this).
+        3. Clears `lease_owner`/`lease_expires_at`/`next_retry_at` as part
+           of that same `UPDATE`.
+        4. For every `(participation_id, watermark)` pair supplied,
+           advances that participation's checkpoint — gated by a second
+           SQL predicate requiring `amazon_ingestion_runs.status=
+           'succeeded'` (now true, from step 2, same transaction, same
+           session — no intervening commit) AND `run_type='orders'` AND
+           `completed_at IS NOT NULL` AND organization/seller ownership
+           AND (via `amazon_ingestion_run_marketplace_participations`,
+           itself composite-FK-enforced) that this run actually covered
+           this participation.
+        5. The caller commits (or rolls back) — this method never calls
+           `session.commit()` itself, matching this module's existing
+           convention; if the caller's commit fails or is never issued,
+           steps 2 and 4 are rolled back together, so the run is never
+           left `succeeded` with an unadvanced checkpoint or vice versa.
+
+        Returns `finalized=False` (never raises for an ordinary status
+        mismatch, and never touches any checkpoint) if the run does not
+        exist, does not belong to this organization/seller, is not
+        `run_type='orders'`, or is not currently `started` — covering
+        `queued`, `waiting_to_retry`, `failed`, `partial`, `timed_out`, a
+        `cancelled_before_start` `failed` row, a `listings` run, and a
+        `marketplace_participations` run, uniformly, through the same one
+        predicate, not a special case per status value.
+
+        **All-or-nothing for step 4.** If any `(participation_id,
+        watermark)` pair in `participation_watermarks` fails its own
+        eligibility check (most notably: a participation the run did not
+        actually cover — a caller bug, since every participation named
+        here should have come from the same run's own membership), this
+        method raises `OrdersRunFinalizationIncomplete` instead of
+        returning `finalized=True` with only the ones that succeeded.
+        This is a deliberate, hard failure: the run-succeeded `UPDATE` from
+        step 2 and every checkpoint already advanced earlier in this same
+        loop are still uncommitted in this same transaction when the
+        exception is raised, so the caller's own rollback (never a
+        swallow-and-commit) undoes all of it together — a caller must
+        never be able to observe a `succeeded` run with only some of its
+        covered participations' checkpoints actually advanced.
+        """
+        run_completion = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == ingestion_run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "started",
+            )
+            .values(
+                status="succeeded",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                next_retry_at=None,
+            )
+        )
+        self.session.flush()
+        if run_completion.rowcount == 0:
+            return OrdersRunFinalization(finalized=False, reason="run_not_started")
+
+        checkpoint_repo = AmazonOrdersSyncCheckpointRepository(self.session)
+        advanced: list[UUID] = []
+        for participation_id, watermark in participation_watermarks.items():
+            if not checkpoint_repo._advance_if_run_succeeded(
+                organization_id=organization_id,
+                seller_account_id=seller_account_id,
+                marketplace_participation_id=participation_id,
+                ingestion_run_id=ingestion_run_id,
+                synced_through_at=watermark,
+            ):
+                # All-or-nothing: raising here (rather than skipping this
+                # one participation and returning finalized=True for the
+                # rest) is deliberate. The run-succeeded UPDATE above and
+                # every checkpoint write already performed in this loop
+                # are still uncommitted, in this same transaction — the
+                # caller must roll back on this exception (never catch it
+                # and commit anyway), which undoes the run's status flip
+                # together with every checkpoint this call already
+                # advanced. A caller must never observe `finalized=True`
+                # with only some of the requested participations actually
+                # advanced; either the whole batch succeeds, or none of it
+                # is left committed.
+                raise OrdersRunFinalizationIncomplete(
+                    "Amazon orders run finalization cannot advance a checkpoint for a participation "
+                    "the run did not actually cover — refusing to report partial success. Roll back "
+                    "this transaction; the run must not be left succeeded with only some checkpoints "
+                    "advanced."
+                )
+            advanced.append(participation_id)
+        return OrdersRunFinalization(finalized=True, advanced_participation_ids=tuple(advanced))
+
+
+# 12B.4B remediation (round 2) — `NUMERIC(19,4)` on real PostgreSQL does
+# NOT reject a value with more than 4 fractional digits; it silently
+# *rounds* it at type-coercion time (`numeric_field_overflow` is only
+# raised for excess *magnitude* — an integer part needing more than
+# precision-scale = 15 digits — never for excess scale). Relying on the
+# database to reject excess precision would be relying on behavior
+# PostgreSQL does not have. This validation is therefore the actual,
+# only enforcement point for "excess scale rejected rather than silently
+# rounded" — called before any Orders monetary value is bound into an
+# INSERT/UPDATE statement, in both `AmazonSellerOrderRepository.upsert`
+# and `AmazonSellerOrderItemRepository.upsert`.
+_MONEY_PRECISION = 19
+_MONEY_SCALE = 4
+_MONEY_MAGNITUDE_LIMIT = Decimal(10) ** (_MONEY_PRECISION - _MONEY_SCALE)  # 10**15
+
+
+def _validate_orders_money_amount(value: Decimal | None, *, field_name: str) -> None:
+    """Repository/DTO write-boundary validation for every `Numeric(19,4)`
+    Orders amount column (`order_total_amount`, `unit_price_amount`,
+    `item_proceeds_amount`). Raises `TypeError` for a non-`Decimal` value
+    (a `float` is explicitly rejected, never silently accepted and
+    implicitly converted — Amazon's own wire format is a lossless decimal
+    string specifically to avoid float rounding, so admitting a float here
+    would reintroduce the exact class of error this column type exists to
+    avoid) and `ValueError` for a `Decimal` with more than 4 fractional
+    digits or a magnitude PostgreSQL's real `NUMERIC(19,4)` would reject
+    with `numeric_field_overflow`. `None` (absence) always passes.
+    """
+    if value is None:
+        return
+    if isinstance(value, float):
+        raise TypeError(
+            f"Amazon Orders monetary field {field_name!r} must be a Decimal, never a float — "
+            "float cannot represent Amazon's own lossless decimal wire format exactly."
+        )
+    if not isinstance(value, Decimal):
+        raise TypeError(f"Amazon Orders monetary field {field_name!r} must be a Decimal.")
+    exponent = value.as_tuple().exponent
+    if not isinstance(exponent, int):
+        # A non-int exponent means a special value (NaN/sNaN/Infinity) —
+        # Decimal.as_tuple() returns the strings 'n'/'N'/'F' for those.
+        raise ValueError(f"Amazon Orders monetary field {field_name!r} must be a finite Decimal.")
+    if exponent < -_MONEY_SCALE:
+        raise ValueError(
+            f"Amazon Orders monetary field {field_name!r} has more than {_MONEY_SCALE} fractional "
+            "digits — PostgreSQL's NUMERIC(19,4) would silently round this rather than reject it, "
+            "so it is rejected here instead, before any SQL is executed."
+        )
+    if abs(value) >= _MONEY_MAGNITUDE_LIMIT:
+        raise ValueError(
+            f"Amazon Orders monetary field {field_name!r} exceeds NUMERIC(19,4)'s representable "
+            "magnitude."
+        )
+
+
+class AmazonSellerOrderRepository:
+    """Marketplace-participation-scoped canonical orders. 12B.4B.
+
+    Mirrors `AmazonSellerListingRepository`'s ownership pattern exactly:
+    `amazon_seller_orders` has no `organization_id` column by design, so
+    every public method takes `organization_id` and validates it against
+    `marketplace_participation_id` via `AmazonMarketplaceParticipationRepository.
+    get_by_id` before touching any row. Possession of a participation UUID
+    alone is never sufficient.
+
+    `upsert` is the one validated write path (idempotent by
+    `(marketplace_participation_id, amazon_order_id)`). It intentionally
+    accepts only an explicit, named-field parameter list — never a raw
+    parsed-response object — so it is structurally impossible to pass
+    through an unrecognized/PII field this repository was never told about
+    (see docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md's bundled-
+    field-redaction section). There is no field on this signature, and
+    none on `AmazonSellerOrder`, for buyer/recipient/payment/tax data, a
+    gift message, or a cancellation reason.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> None:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon seller order access cannot bind a marketplace participation from another organization."
+            )
+
+    def get_by_natural_key(
+        self, organization_id: UUID, marketplace_participation_id: UUID, amazon_order_id: str
+    ) -> AmazonSellerOrder | None:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        return self._get_by_natural_key_unchecked(marketplace_participation_id, amazon_order_id)
+
+    def _get_by_natural_key_unchecked(
+        self, marketplace_participation_id: UUID, amazon_order_id: str
+    ) -> AmazonSellerOrder | None:
+        return self.session.scalars(
+            select(AmazonSellerOrder).where(
+                AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id,
+                AmazonSellerOrder.amazon_order_id == amazon_order_id,
+            )
+        ).first()
+
+    def list_for_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> list[AmazonSellerOrder]:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        statement: Select[tuple[AmazonSellerOrder]] = (
+            select(AmazonSellerOrder)
+            .where(AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id)
+            .order_by(AmazonSellerOrder.amazon_created_at.desc().nullslast())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def upsert(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        amazon_order_id: str,
+        fulfillment_status: str | None,
+        fulfilled_by: str | None,
+        sales_channel_name: str | None,
+        sales_channel_marketplace_id: str | None,
+        sales_channel_marketplace_name: str | None,
+        items_shipped_count: int | None,
+        items_unshipped_count: int | None,
+        order_total_amount: Decimal | None,
+        order_total_currency: str | None,
+        is_business_order: bool,
+        is_prime: bool,
+        was_cancelled: bool,
+        amazon_created_at: datetime | None,
+        amazon_last_updated_at: datetime | None,
+        last_ingestion_run_id: UUID,
+    ) -> AmazonSellerOrder:
+        """Upsert by `(marketplace_participation_id, amazon_order_id)`.
+        Preserves `first_seen_at`. `last_ingestion_run_id` must already
+        cover this `marketplace_participation_id` in
+        `amazon_ingestion_run_marketplace_participations` — enforced by the
+        database's own composite foreign key
+        (`fk_amazon_seller_orders_last_run_same_participation`), not
+        re-validated here; an `IntegrityError` from a genuine caller bug
+        propagates rather than being silently swallowed.
+        """
+        _validate_orders_money_amount(order_total_amount, field_name="order_total_amount")
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        now = datetime.now(UTC)
+        existing = self._get_by_natural_key_unchecked(marketplace_participation_id, amazon_order_id)
+        if existing is not None:
+            existing.fulfillment_status = fulfillment_status
+            existing.fulfilled_by = fulfilled_by
+            existing.sales_channel_name = sales_channel_name
+            existing.sales_channel_marketplace_id = sales_channel_marketplace_id
+            existing.sales_channel_marketplace_name = sales_channel_marketplace_name
+            existing.items_shipped_count = items_shipped_count
+            existing.items_unshipped_count = items_unshipped_count
+            existing.order_total_amount = order_total_amount
+            existing.order_total_currency = order_total_currency
+            existing.is_business_order = is_business_order
+            existing.is_prime = is_prime
+            existing.was_cancelled = was_cancelled
+            existing.amazon_created_at = amazon_created_at
+            existing.amazon_last_updated_at = amazon_last_updated_at
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            existing.last_seen_at = now
+            self.session.flush()
+            return existing
+        row = AmazonSellerOrder(
+            marketplace_participation_id=marketplace_participation_id,
+            amazon_order_id=amazon_order_id,
+            fulfillment_status=fulfillment_status,
+            fulfilled_by=fulfilled_by,
+            sales_channel_name=sales_channel_name,
+            sales_channel_marketplace_id=sales_channel_marketplace_id,
+            sales_channel_marketplace_name=sales_channel_marketplace_name,
+            items_shipped_count=items_shipped_count,
+            items_unshipped_count=items_unshipped_count,
+            order_total_amount=order_total_amount,
+            order_total_currency=order_total_currency,
+            is_business_order=is_business_order,
+            is_prime=is_prime,
+            was_cancelled=was_cancelled,
+            amazon_created_at=amazon_created_at,
+            amazon_last_updated_at=amazon_last_updated_at,
+            last_ingestion_run_id=last_ingestion_run_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonSellerOrderItemRepository:
+    """Order-scoped canonical order items. 12B.4B.
+
+    Ownership flows through the parent order: every public method takes
+    `organization_id` and `marketplace_participation_id` and validates
+    ownership the same way `AmazonSellerOrderRepository` does, before ever
+    touching an item row. `upsert` is the one validated write path,
+    idempotent by `(order_id, amazon_order_item_id)` — the evidenced
+    natural key from the pinned contract, never invented from `seller_sku`/
+    `asin` alone. Like `AmazonSellerOrderRepository.upsert`, this accepts
+    only an explicit, named-field parameter list — there is no field here,
+    and none on `AmazonSellerOrderItem`, for a gift message or a
+    cancellation reason.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_order_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID, order_id: UUID
+    ) -> AmazonSellerOrder:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon seller order item access cannot bind a marketplace participation from another organization."
+            )
+        order = self.session.scalars(
+            select(AmazonSellerOrder).where(
+                AmazonSellerOrder.id == order_id,
+                AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id,
+            )
+        ).first()
+        if order is None:
+            raise TypeError("Amazon seller order item access cannot bind an order from another participation.")
+        return order
+
+    def _get_by_natural_key_unchecked(
+        self, order_id: UUID, amazon_order_item_id: str
+    ) -> AmazonSellerOrderItem | None:
+        return self.session.scalars(
+            select(AmazonSellerOrderItem).where(
+                AmazonSellerOrderItem.order_id == order_id,
+                AmazonSellerOrderItem.amazon_order_item_id == amazon_order_item_id,
+            )
+        ).first()
+
+    def list_for_order(
+        self, organization_id: UUID, marketplace_participation_id: UUID, order_id: UUID
+    ) -> list[AmazonSellerOrderItem]:
+        self._require_order_in_organization(organization_id, marketplace_participation_id, order_id)
+        statement: Select[tuple[AmazonSellerOrderItem]] = (
+            select(AmazonSellerOrderItem)
+            .where(AmazonSellerOrderItem.order_id == order_id)
+            .order_by(AmazonSellerOrderItem.amazon_order_item_id.asc())
+        )
+        return list(self.session.scalars(statement).all())
+
+    def upsert(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        order_id: UUID,
+        amazon_order_item_id: str,
+        seller_sku: str,
+        asin: str | None,
+        item_name: str | None,
+        condition_type: str | None,
+        quantity_ordered: int,
+        quantity_fulfilled: int | None,
+        quantity_unfulfilled: int | None,
+        unit_price_amount: Decimal | None,
+        unit_price_currency: str | None,
+        item_proceeds_amount: Decimal | None,
+        item_proceeds_currency: str | None,
+        last_ingestion_run_id: UUID,
+    ) -> AmazonSellerOrderItem:
+        _validate_orders_money_amount(unit_price_amount, field_name="unit_price_amount")
+        _validate_orders_money_amount(item_proceeds_amount, field_name="item_proceeds_amount")
+        self._require_order_in_organization(organization_id, marketplace_participation_id, order_id)
+        now = datetime.now(UTC)
+        existing = self._get_by_natural_key_unchecked(order_id, amazon_order_item_id)
+        if existing is not None:
+            existing.seller_sku = seller_sku
+            existing.asin = asin
+            existing.item_name = item_name
+            existing.condition_type = condition_type
+            existing.quantity_ordered = quantity_ordered
+            existing.quantity_fulfilled = quantity_fulfilled
+            existing.quantity_unfulfilled = quantity_unfulfilled
+            existing.unit_price_amount = unit_price_amount
+            existing.unit_price_currency = unit_price_currency
+            existing.item_proceeds_amount = item_proceeds_amount
+            existing.item_proceeds_currency = item_proceeds_currency
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            existing.last_seen_at = now
+            self.session.flush()
+            return existing
+        row = AmazonSellerOrderItem(
+            order_id=order_id,
+            marketplace_participation_id=marketplace_participation_id,
+            amazon_order_item_id=amazon_order_item_id,
+            seller_sku=seller_sku,
+            asin=asin,
+            item_name=item_name,
+            condition_type=condition_type,
+            quantity_ordered=quantity_ordered,
+            quantity_fulfilled=quantity_fulfilled,
+            quantity_unfulfilled=quantity_unfulfilled,
+            unit_price_amount=unit_price_amount,
+            unit_price_currency=unit_price_currency,
+            item_proceeds_amount=item_proceeds_amount,
+            item_proceeds_currency=item_proceeds_currency,
+            last_ingestion_run_id=last_ingestion_run_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonOrdersSyncCheckpointRepository:
+    """Durable, per-participation Orders high-water-mark primitives. 12B.4B
+    (remediated).
+
+    No overlap-window policy, pagination, or scheduling lives here — this
+    class only ever reads the stored watermark publicly. There is
+    deliberately **no public, permissive "advance whenever" method** — the
+    only way a checkpoint's watermark ever moves is through
+    `AmazonIngestionRunMarketplaceParticipationRepository.
+    finalize_successful_orders_run`, which calls this class's private
+    `_advance_if_run_succeeded` immediately after (same transaction, same
+    session) marking the covering run `succeeded`. This is a deliberate
+    remediation of an earlier design that exposed a public `advance()`
+    method gated only by "the run covered this participation," not by the
+    run's own terminal status — that design could accept a checkpoint
+    advance for a merely `started` (or `queued`, `waiting_to_retry`,
+    `failed`, `partial`, `timed_out`) run, permanently skipping order
+    updates if a caller ever invoked it too early or on the wrong run.
+
+    `_advance_if_run_succeeded`'s eligibility check is one SQL query — not
+    a Python-only status check — joining
+    `amazon_ingestion_run_marketplace_participations` to
+    `amazon_ingestion_runs` and requiring `run_type='orders'`,
+    `status='succeeded'`, `completed_at IS NOT NULL`, and matching
+    organization/seller — so the guarantee holds even if a future caller
+    reaches this method directly instead of through
+    `finalize_successful_orders_run` (exactly what
+    `tests/test_amazon_seller_orders_schema.py`'s rejection tests exercise
+    directly). The checkpoint row's own composite foreign key
+    (`fk_amazon_orders_sync_checkpoints_run_same_participation`) enforces
+    the run/participation membership fact again at the database level as a
+    second, independent layer.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonMarketplaceParticipation:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon orders sync checkpoint access cannot bind a marketplace participation from "
+                "another organization."
+            )
+        return participation
+
+    def get(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonOrdersSyncCheckpoint | None:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        return self.session.get(AmazonOrdersSyncCheckpoint, marketplace_participation_id)
+
+    def _advance_if_run_succeeded(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        ingestion_run_id: UUID,
+        synced_through_at: datetime,
+    ) -> bool:
+        """Private. Returns `True` if the checkpoint was created/updated,
+        `False` if the gating predicate was not satisfied — the run does
+        not exist, is not `run_type='orders'`, is not `status='succeeded'`,
+        has no `completed_at`, does not belong to the given organization/
+        seller, or never covered this participation. Never raises for an
+        ordinary ineligibility case; `False` is the expected, correct
+        result for every rejection scenario this method is tested against.
+
+        Never moves the watermark backward: if the stored value is already
+        strictly after `synced_through_at` (a stale/replayed call with an
+        older watermark), the existing value is left untouched. An equal
+        watermark is idempotent — rewriting the same value and provenance
+        is treated as success, not a backward move.
+        """
+        eligible = self.session.execute(
+            select(AmazonIngestionRunMarketplaceParticipation.marketplace_participation_id)
+            .select_from(AmazonIngestionRunMarketplaceParticipation)
+            .join(
+                AmazonIngestionRun,
+                AmazonIngestionRun.id == AmazonIngestionRunMarketplaceParticipation.ingestion_run_id,
+            )
+            .where(
+                AmazonIngestionRunMarketplaceParticipation.ingestion_run_id == ingestion_run_id,
+                AmazonIngestionRunMarketplaceParticipation.marketplace_participation_id
+                == marketplace_participation_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "succeeded",
+                AmazonIngestionRun.completed_at.is_not(None),
+            )
+        ).first()
+        if eligible is None:
+            return False
+
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return False
+
+        existing = self.session.get(AmazonOrdersSyncCheckpoint, marketplace_participation_id)
+        if existing is None:
+            self.session.add(
+                AmazonOrdersSyncCheckpoint(
+                    marketplace_participation_id=marketplace_participation_id,
+                    organization_id=organization_id,
+                    seller_account_id=participation.seller_account_id,
+                    synced_through_at=synced_through_at,
+                    last_successful_run_id=ingestion_run_id,
+                )
+            )
+            self.session.flush()
+            return True
+        # SQLite (unlike PostgreSQL) does not round-trip `tzinfo` on a
+        # `DateTime(timezone=True)` column — a value read back is naive but
+        # still genuinely UTC (this application never stores any other
+        # zone). Normalize before comparing so this comparison behaves
+        # identically on both backends, the same pattern already used for
+        # lease-expiry comparisons elsewhere in this module.
+        stored = existing.synced_through_at
+        if stored is not None and stored.tzinfo is None:
+            stored = stored.replace(tzinfo=UTC)
+        if stored is None or synced_through_at >= stored:
+            existing.synced_through_at = synced_through_at
+            existing.last_successful_run_id = ingestion_run_id
+        self.session.flush()
+        return True
 
 
 def file_sha256(data: bytes) -> str:

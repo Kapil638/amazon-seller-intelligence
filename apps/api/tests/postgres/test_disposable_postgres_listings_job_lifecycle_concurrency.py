@@ -702,17 +702,46 @@ _INSERT_0010_INGESTION_RUN_SQL = text(
     """
 )
 
+# Column set restricted to what genuinely exists at 0011 — safe to read
+# back with while the database is pinned there. Does NOT select via the
+# current `AmazonIngestionRun` ORM class, which (after 12B.4B) also maps
+# six 0012-only counter columns; `session.get`/`session.query` against
+# that class issue a `SELECT` naming every mapped column, which PostgreSQL
+# would reject with `UndefinedColumn` for a table that doesn't have them
+# yet. See this file's use below for the full explanation.
+_SELECT_0011_INGESTION_RUN_SQL = text(
+    """
+    SELECT status, started_at, completed_at, records_accepted, failure_class,
+           next_retry_at, last_heartbeat_at
+    FROM amazon_ingestion_runs
+    WHERE id = :id
+    """
+)
+
 
 def test_migration_0011_upgrade_preserves_existing_0010_rows_and_widens_constraints(disposable_engine) -> None:
-    """Pinned to the genuine `0010` schema for its seeding phase — the
-    CURRENT `AmazonIngestionRun` ORM class is never used until *after*
-    the upgrade below, because its mapped columns include `next_retry_at`/
-    `last_heartbeat_at`, which do not exist at `0010`; PostgreSQL
-    correctly rejects an INSERT referencing them. Historical rows are
-    seeded via raw SQL restricted to columns that genuinely existed at
-    `0010` instead. `Organization`/`AmazonSellerAccount`/`Amazon
+    """Pinned to the genuine `0010` schema for its seeding phase, and this
+    test's entire body stays at `0011` after that — it deliberately never
+    upgrades on to `0012` or `head`, to keep this test's proof exact to
+    the `0010 -> 0011` boundary it names. This means the CURRENT
+    `AmazonIngestionRun` ORM class is unsafe to use for `amazon_ingestion_
+    runs` reads *or* writes anywhere in this test, from the initial
+    `0010`-pinned seeding all the way through its final assertions —
+    that ORM class now maps not only `0011`'s `next_retry_at`/
+    `last_heartbeat_at` (absent at `0010`) but also `0012`'s six
+    `orders_received`/`orders_accepted`/`orders_rejected`/`items_received`/
+    `items_accepted`/`items_rejected` counters (absent at `0011` too, and
+    each carrying a Python-side `default=0` that SQLAlchemy includes in
+    every ORM-generated `INSERT` regardless of whether the caller
+    mentioned it). PostgreSQL correctly rejects any such `INSERT`/`SELECT`
+    with `UndefinedColumn` against a table that doesn't have those columns
+    yet — a real failure this test hit in CI once migration `0012` shipped,
+    fixed here by using raw SQL restricted to genuinely-`0011` columns for
+    every `amazon_ingestion_runs` interaction in this test, instead of
+    upgrading further (which would defeat the point of a test pinned to
+    this exact boundary). `Organization`/`AmazonSellerAccount`/`Amazon
     MarketplaceParticipation`/`AmazonSellerListing` are all untouched by
-    migration `0011`, so the current ORM remains valid for those
+    both `0011` and `0012`, so the current ORM remains valid for those
     regardless of which `amazon_ingestion_runs` revision is applied.
     """
     url = _guard.disposable_url()
@@ -765,25 +794,34 @@ def test_migration_0011_upgrade_preserves_existing_0010_rows_and_widens_constrai
     with _alembic_environment(url):
         command.upgrade(_alembic_config(url), "0011_listings_job_lifecycle")
 
-    # Only now — after the upgrade — is the current `AmazonIngestionRun`
-    # ORM used again.
-    with Session(disposable_engine) as session:
-        succeeded_row = session.get(AmazonIngestionRun, succeeded_run_id)
-        failed_row = session.get(AmazonIngestionRun, failed_run_id)
-        assert succeeded_row.status == "succeeded"
-        assert succeeded_row.started_at == succeeded_params["started_at"]
-        assert succeeded_row.completed_at == succeeded_params["completed_at"]
-        assert succeeded_row.records_accepted == 5
-        assert failed_row.status == "failed"
-        assert failed_row.failure_class == "malformed_page"
-        # New columns correctly NULL for historical rows — nothing before
-        # `0011` ever tracked either concept, so there is nothing to
-        # backfill; NULL is the truthful value, not a default guess.
-        assert succeeded_row.next_retry_at is None
-        assert succeeded_row.last_heartbeat_at is None
-        assert failed_row.next_retry_at is None
-        assert failed_row.last_heartbeat_at is None
+    # Still pinned at 0011 here (the upgrade above only reached
+    # 0011_listings_job_lifecycle) — read the two historical runs back with
+    # raw SQL restricted to genuinely-0011 columns, NOT the current
+    # `AmazonIngestionRun` ORM (see this test's own docstring for why).
+    with disposable_engine.connect() as conn:
+        succeeded_row = conn.execute(_SELECT_0011_INGESTION_RUN_SQL, {"id": succeeded_run_id}).mappings().one()
+        failed_row = conn.execute(_SELECT_0011_INGESTION_RUN_SQL, {"id": failed_run_id}).mappings().one()
+    assert succeeded_row["status"] == "succeeded"
+    assert succeeded_row["started_at"] == succeeded_params["started_at"]
+    assert succeeded_row["completed_at"] == succeeded_params["completed_at"]
+    assert succeeded_row["records_accepted"] == 5
+    assert failed_row["status"] == "failed"
+    assert failed_row["failure_class"] == "malformed_page"
+    # New columns correctly NULL for historical rows — nothing before
+    # `0011` ever tracked either concept, so there is nothing to
+    # backfill; NULL is the truthful value, not a default guess.
+    assert succeeded_row["next_retry_at"] is None
+    assert succeeded_row["last_heartbeat_at"] is None
+    assert failed_row["next_retry_at"] is None
+    assert failed_row["last_heartbeat_at"] is None
 
+    # `amazon_seller_listings` is untouched by both 0011 and 0012, so the
+    # current `AmazonSellerListing` ORM remains genuinely safe here even
+    # while `amazon_ingestion_runs` itself is still pinned to 0011 — this
+    # one read is deliberately still ORM-based, in contrast to the raw-SQL
+    # reads immediately above, to make that distinction concrete rather
+    # than implying every ORM class became unsafe.
+    with Session(disposable_engine) as session:
         listing_row = session.get(AmazonSellerListing, listing_id)
         assert listing_row.last_ingestion_run_id == succeeded_run_id
         assert listing_row.seller_sku == "HIST-SKU-1"
@@ -791,34 +829,65 @@ def test_migration_0011_upgrade_preserves_existing_0010_rows_and_widens_constrai
     # Terminal historical rows (both are terminal — succeeded/failed —
     # for this exact scope) never block a *new* queued job: the widened
     # partial unique index only ever covers queued/started/waiting_to_retry.
-    with Session(disposable_engine) as session:
-        claim = AmazonIngestionRunRepository(session).enqueue_listings_run(
-            organization_id=org_id, seller_account_id=seller_account_id,
-            marketplace_participation_id=participation_id, region="na", environment="PRODUCTION",
-            connection_id=None,
+    #
+    # `AmazonIngestionRunRepository.enqueue_listings_run` cannot be called
+    # here — it constructs a current `AmazonIngestionRun(...)` internally
+    # and `session.add()`s it, which (per this test's docstring) is unsafe
+    # while the database is pinned at 0011. This is not a gap in proof: a
+    # bare `INSERT` succeeding under the widened partial unique index and
+    # widened CHECK constraint *is* the schema-level fact this step needs
+    # to prove — the repository method's own validation/ownership logic is
+    # already covered elsewhere in this file against a fully-upgraded
+    # (head) database, where that ORM usage is genuinely safe.
+    queued_run_id = uuid4()
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            _INSERT_0010_INGESTION_RUN_SQL,
+            {
+                "id": queued_run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+                "marketplace_participation_id": participation_id, "status": "queued",
+                "started_at": None, "completed_at": None,
+                "records_received": 0, "records_accepted": 0, "records_rejected": 0,
+                "failure_class": None, "pagination_complete": True, "pages_fetched": 0,
+                "reported_total_results": None,
+            },
         )
-        session.commit()
-    assert claim.claimed is True
+    with disposable_engine.connect() as conn:
+        queued_status = conn.execute(
+            text("SELECT status FROM amazon_ingestion_runs WHERE id = :id"), {"id": queued_run_id}
+        ).scalar_one()
+    assert queued_status == "queued"
 
     # The widened CHECK constraint now genuinely accepts the new states.
     # A second, genuinely seeded scope is used here (reusing the same org)
     # rather than a fabricated participation id — the FK to
     # `amazon_marketplace_participations` is real, and the original
-    # `participation_id` already has a queued row from `enqueue_listings_run`
-    # above, so reusing it here would collide with the widened partial
-    # unique index instead of proving anything new.
+    # `participation_id` already has a queued row from the insert above,
+    # so reusing it here would collide with the widened partial unique
+    # index instead of proving anything new. Raw SQL again, for the same
+    # 0011-pinned-database reason as above — not the current
+    # `AmazonIngestionRun(...)` ORM constructor.
     _, seller_account_id_2, participation_id_2 = _seed_scope(disposable_engine, org_id=org_id)
-    with Session(disposable_engine) as session:
-        queued_row = AmazonIngestionRun(
-            id=uuid4(), organization_id=org_id, seller_account_id=seller_account_id_2,
-            marketplace_participation_id=participation_id_2, run_type="listings", domain="listings_items",
-            region="na", environment="PRODUCTION", status="queued", started_at=None,
+    second_queued_run_id = uuid4()
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            _INSERT_0010_INGESTION_RUN_SQL,
+            {
+                "id": second_queued_run_id, "organization_id": org_id, "seller_account_id": seller_account_id_2,
+                "marketplace_participation_id": participation_id_2, "status": "queued",
+                "started_at": None, "completed_at": None,
+                "records_received": 0, "records_accepted": 0, "records_rejected": 0,
+                "failure_class": None, "pagination_complete": True, "pages_fetched": 0,
+                "reported_total_results": None,
+            },
         )
-        session.add(queued_row)
-        session.commit()
-        session.refresh(queued_row)
-        assert queued_row.status == "queued"
-        assert queued_row.started_at is None
+    with disposable_engine.connect() as conn:
+        second_row = conn.execute(
+            text("SELECT status, started_at FROM amazon_ingestion_runs WHERE id = :id"),
+            {"id": second_queued_run_id},
+        ).mappings().one()
+    assert second_row["status"] == "queued"
+    assert second_row["started_at"] is None
 
 
 def test_migration_0011_downgrade_refuses_to_discard_queued_or_waiting_rows(disposable_engine) -> None:
