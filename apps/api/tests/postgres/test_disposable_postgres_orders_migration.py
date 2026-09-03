@@ -1,6 +1,7 @@
 """12B.4B — Disposable PostgreSQL validation for migration 0012 (remediated).
-Extended (12B.4D remediation) with one test for migration 0013's own
-downgrade-refusal boundary (durable Orders pagination continuation).
+Extended (12B.4D remediation) with tests for migration 0013's own
+upgrade-preservation and downgrade-refusal boundaries (durable Orders
+pagination continuation).
 
 Opt-in only. See `_guard.py` for the two conditions that must both hold
 before anything here runs. Written and statically reasoned through
@@ -35,6 +36,18 @@ yet. Seed and read back such rows with raw SQL restricted to the columns
 that genuinely existed at the pinned revision instead; only use the
 current ORM once the test has actually upgraded to `head` (or whichever
 revision first introduces every column that model maps).
+
+**Recurrence, found and fixed again for migration 0013:** the exact same
+bug reappeared one migration later — `test_existing_0011_database_
+upgrades_to_0012_preserving_data` was pinned correctly to exactly `0012_
+orders_foundation`, but still called `session.get(AmazonIngestionRun,
+run_id)` after 0013 (12B.4D remediation) added three more columns to
+that same model. The fix is identical in kind: replace the post-upgrade
+ORM read with raw SQL restricted to the columns that exist at the pinned
+revision. Every `AmazonIngestionRun` reference in this file was
+re-audited for the same pattern when 0013 was added — see `test_
+existing_0012_database_upgrades_to_0013_preserving_data` for the new
+0012 -> 0013 boundary's own equivalent proof.
 """
 
 from __future__ import annotations
@@ -313,24 +326,45 @@ def test_existing_0011_database_upgrades_to_0012_preserving_data(disposable_engi
     # the ORM this test uses below (which will itself grow past 0012 once
     # such a migration ships) — recreating the exact class of latent
     # boundary defect already found and fixed once in this file, just one
-    # revision later. Only now — after upgrading to exactly 0012 — is the
-    # current `AmazonIngestionRun` ORM safe to use again: the database
-    # genuinely has every column it maps, today.
-
+    # revision later.
+    #
+    # `Organization`/`AmazonSellerAccount`/`AmazonMarketplaceParticipation`
+    # are unchanged by every migration after 0012 (including 0013), so
+    # `session.get(...)` against those three remains safe here. The
+    # current `AmazonIngestionRun` ORM is NOT safe to use at this boundary
+    # any more: migration 0013 (12B.4D remediation) added three columns to
+    # it (`orders_window_last_updated_after`, `orders_window_captured_at`,
+    # `orders_pagination_next_token`), so `session.get(AmazonIngestionRun,
+    # ...)` would generate a SELECT naming all three — columns that do not
+    # exist on a database still pinned at exactly 0012 — and PostgreSQL
+    # would correctly reject it with `UndefinedColumn`. This is exactly
+    # the class of bug this file's own module docstring warns about,
+    # recurring one migration later: the fix is the same technique already
+    # used for the INSERT above (raw SQL restricted to columns that
+    # genuinely exist at the pinned revision), not upgrading this test to
+    # "head".
     with Session(disposable_engine) as session:
         assert session.get(Organization, org_id) is not None
         assert session.get(AmazonSellerAccount, seller_account_id) is not None
         assert session.get(AmazonMarketplaceParticipation, participation_id) is not None
-        run = session.get(AmazonIngestionRun, run_id)
-        assert run is not None
-        assert run.run_type == "listings"
-        assert run.status == "succeeded"
-        assert run.orders_received == 0
-        assert run.orders_accepted == 0
-        assert run.orders_rejected == 0
-        assert run.items_received == 0
-        assert run.items_accepted == 0
-        assert run.items_rejected == 0
+
+    with disposable_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT run_type, status, orders_received, orders_accepted, orders_rejected, "
+                "items_received, items_accepted, items_rejected "
+                "FROM amazon_ingestion_runs WHERE id = :id"
+            ),
+            {"id": run_id},
+        ).one()
+    assert row.run_type == "listings"
+    assert row.status == "succeeded"
+    assert row.orders_received == 0
+    assert row.orders_accepted == 0
+    assert row.orders_rejected == 0
+    assert row.items_received == 0
+    assert row.items_accepted == 0
+    assert row.items_rejected == 0
 
 
 # 6: downgrade ordering — 0012 -> 0011 removes only what 0012 added, when
@@ -414,6 +448,134 @@ def test_downgrade_0012_to_0011_refuses_when_orders_data_exists(disposable_engin
             {"id": run_id},
         ).scalar()
     assert still_there == 1
+
+
+# 7a (12B.4D CI remediation): the explicit 0012 -> 0013 upgrade proof —
+# existing pre-0013 Orders/run data survives, the three new columns exist
+# and start NULL, the orders-only pagination-scope check constraint
+# behaves correctly in both directions, and the database reports exactly
+# "0013_orders_durable_pagination" afterward.
+#
+# Pinned to exactly "0012_orders_foundation" before seeding, then upgraded
+# exactly once to "0013_orders_durable_pagination" — never "head" — since
+# this test's own name and purpose are specifically the 0012 -> 0013
+# boundary. The seed INSERT below is raw SQL restricted to columns that
+# genuinely exist at 0012 (see this file's own module docstring and
+# `test_existing_0011_database_upgrades_to_0012_preserving_data`'s
+# comment for why the current `AmazonIngestionRun` ORM must not be used
+# before that upgrade — it would generate a SELECT/INSERT naming the
+# three 0013-only columns, which PostgreSQL would correctly reject as
+# `UndefinedColumn` against a database still pinned at 0012). The current
+# ORM (`AmazonIngestionRun`) is used only after the upgrade to 0013, once
+# every column it maps genuinely exists.
+def test_existing_0012_database_upgrades_to_0013_preserving_data(disposable_engine) -> None:
+    url = _guard.disposable_url()
+    cfg = _alembic_config(url)
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0012_orders_foundation")
+
+    org_id, seller_account_id, connection_id, participation_id = _seed_org_seller_connection_and_participation(
+        disposable_engine
+    )
+    run_id = uuid4()
+    other_run_id = uuid4()
+    with disposable_engine.begin() as conn:
+        # A representative pre-0013 Orders run — exactly the 0012-era
+        # amazon_ingestion_runs column set for run_type='orders'.
+        conn.execute(
+            text(
+                "INSERT INTO amazon_ingestion_runs ("
+                "id, organization_id, seller_account_id, marketplace_participation_id, connection_id, "
+                "run_type, domain, region, environment, status"
+                ") VALUES ("
+                ":id, :organization_id, :seller_account_id, NULL, :connection_id, "
+                "'orders', 'orders', 'na', 'PRODUCTION', 'succeeded'"
+                ")"
+            ),
+            {
+                "id": run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+                "connection_id": connection_id,
+            },
+        )
+        # A second, non-orders run — used below to prove the pagination
+        # columns stay structurally forbidden for any run_type other than
+        # 'orders', both before and after this upgrade.
+        conn.execute(
+            text(
+                "INSERT INTO amazon_ingestion_runs ("
+                "id, organization_id, seller_account_id, marketplace_participation_id, connection_id, "
+                "run_type, domain, region, environment, status"
+                ") VALUES ("
+                ":id, :organization_id, :seller_account_id, :participation_id, :connection_id, "
+                "'listings', 'listings_items', 'na', 'PRODUCTION', 'succeeded'"
+                ")"
+            ),
+            {
+                "id": other_run_id, "organization_id": org_id, "seller_account_id": seller_account_id,
+                "participation_id": participation_id, "connection_id": connection_id,
+            },
+        )
+
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0013_orders_durable_pagination")
+
+    with disposable_engine.connect() as conn:
+        current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    assert current == "0013_orders_durable_pagination"
+
+    # Existing data survived the upgrade untouched, and the three new
+    # columns exist and begin NULL for a pre-existing row — an ADD COLUMN
+    # migration must never invent a value for rows that predate it.
+    with disposable_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT run_type, status, orders_window_last_updated_after, "
+                "orders_window_captured_at, orders_pagination_next_token "
+                "FROM amazon_ingestion_runs WHERE id = :id"
+            ),
+            {"id": run_id},
+        ).mappings().first()
+    assert row is not None
+    assert row["run_type"] == "orders"
+    assert row["status"] == "succeeded"
+    assert row["orders_window_last_updated_after"] is None
+    assert row["orders_window_captured_at"] is None
+    assert row["orders_pagination_next_token"] is None
+
+    # The orders-only pagination-scope check constraint
+    # (`ck_amazon_ingestion_runs_orders_pagination_scope_required`)
+    # rejects a non-'orders' row that has any pagination column set...
+    with disposable_engine.connect() as conn, pytest.raises(IntegrityError):
+        with conn.begin():
+            conn.execute(
+                text(
+                    "UPDATE amazon_ingestion_runs SET orders_pagination_next_token = 'SHOULD-BE-REJECTED' "
+                    "WHERE id = :id"
+                ),
+                {"id": other_run_id},
+            )
+
+    # ...but permits it for a genuine 'orders' row — proving the
+    # constraint is scoped correctly, not merely always-failing.
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE amazon_ingestion_runs SET orders_pagination_next_token = 'ALLOWED' WHERE id = :id"),
+            {"id": run_id},
+        )
+    with disposable_engine.connect() as conn:
+        allowed_value = conn.execute(
+            text("SELECT orders_pagination_next_token FROM amazon_ingestion_runs WHERE id = :id"),
+            {"id": run_id},
+        ).scalar()
+    assert allowed_value == "ALLOWED"
+
+    # Now — and only now, after the upgrade to 0013 — the current
+    # `AmazonIngestionRun` ORM is safe to use: the database genuinely has
+    # every column it maps.
+    with Session(disposable_engine) as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        assert run is not None
+        assert run.orders_pagination_next_token == "ALLOWED"
 
 
 # 7b (12B.4D remediation): migration 0013's own downgrade refusal — an
