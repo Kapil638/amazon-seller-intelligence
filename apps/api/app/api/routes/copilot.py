@@ -89,7 +89,12 @@ async def create_conversation_plan(
 ) -> Plan:
     """Propose and validate a Plan. Does not execute tools or synthesize a seller answer."""
     try:
-        return await service.plan_turn(conversation_id, payload.user_message)
+        return await service.plan_turn(
+            conversation_id,
+            payload.user_message,
+            marketplace_participation_id=payload.marketplace_participation_id,
+            period_days=payload.period_days,
+        )
     except Exception as copilot_exc:
         raise _http_error(copilot_exc) from copilot_exc
 

@@ -4571,6 +4571,54 @@ class AmazonSellerOrderItemRepository:
         )
         return list(self.session.scalars(statement).all())
 
+    def list_items_for_window(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 2000,
+    ) -> list[tuple[AmazonSellerOrderItem, AmazonSellerOrder]] | None:
+        """12B.5A — every order item in this participation whose parent
+        order's `amazon_created_at` falls in `[created_after, created_before)`,
+        paired with its parent order. Returns `None` (never raises) for a
+        foreign or nonexistent participation, matching `AmazonSellerOrder
+        Repository.get_summary_counts`'s own contract — a caller-visible
+        404, not an internal error.
+
+        Added for the 12B.5A Copilot skills, which need item-level
+        aggregation (units/exposure per SKU, fulfillment-status
+        distribution) across every order in a window — data `list_orders`
+        deliberately does not expose per row (`OrderCollectionItem` carries
+        only `item_count`, never the items themselves, to keep that
+        endpoint's response bounded). One JOIN query here, ownership-
+        validated exactly like every other method in this module, is the
+        smallest extension that avoids either an N+1 `get_order()` call
+        per order or letting the Copilot layer touch these ORM models
+        directly. `limit` is a defensive ceiling only (2000 covers any
+        realistic single-window seller volume today) — never raised
+        silently past what a caller explicitly asks for.
+        """
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        conditions = [AmazonSellerOrderItem.marketplace_participation_id == marketplace_participation_id]
+        if created_after is not None:
+            conditions.append(AmazonSellerOrder.amazon_created_at >= created_after)
+        if created_before is not None:
+            conditions.append(AmazonSellerOrder.amazon_created_at < created_before)
+        statement = (
+            select(AmazonSellerOrderItem, AmazonSellerOrder)
+            .join(AmazonSellerOrder, AmazonSellerOrder.id == AmazonSellerOrderItem.order_id)
+            .where(*conditions)
+            .order_by(AmazonSellerOrder.amazon_created_at.asc())
+            .limit(limit)
+        )
+        return list(self.session.execute(statement).tuples().all())
+
     def upsert(
         self,
         *,

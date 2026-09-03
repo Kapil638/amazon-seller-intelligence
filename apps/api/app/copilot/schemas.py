@@ -86,3 +86,60 @@ class GetAdvertisingSnapshotInput(AdvertisingDomainToolInput):
 
 class AnalyzeAdvertisingImpactInput(AdvertisingDomainToolInput):
     pass
+
+
+# --- 12B.5A Listings + Orders skill tools -----------------------------------
+#
+# `marketplace_participation_id` is always required and explicit — never
+# inferred, never defaulted server-side. The planner/frontend must supply
+# it (see `app/copilot/planner/validator.py`'s `ExtractedSlots.
+# marketplace_participation_id` and `PlanTurnRequest.marketplace_
+# participation_id`); the handler still re-validates ownership through
+# `AmazonListingsReadService`/`AmazonOrdersReadService` on every call, so
+# a stale or foreign id from an old turn can never leak another
+# organization's or another participation's evidence.
+#
+# `period_days` mirrors `app.copilot.skills.shared.clamp_period_days` —
+# bounded here too so an out-of-range value fails fast at the tool
+# boundary with a clear Pydantic error, not a silently clamped surprise
+# three layers down.
+_MAX_PERIOD_DAYS = 90
+
+
+class MarketplaceScopedSkillInput(CopilotToolInput):
+    marketplace_participation_id: UUID
+    period_days: int = Field(default=30, ge=1, le=_MAX_PERIOD_DAYS)
+
+
+class PrioritizeListingHealthInput(MarketplaceScopedSkillInput):
+    limit: int = Field(default=25, ge=1, le=100)
+
+
+class InvestigateNonBuyableListingInput(MarketplaceScopedSkillInput):
+    """`seller_sku`/`asin` are both optional: when neither is given, the
+    tool returns a prioritized selection of not-buyable listings instead
+    of guessing a target (see `NonBuyableListingEvidenceService.
+    _select_candidates`) — this is deliberate, not a missing
+    validation."""
+
+    seller_sku: str | None = None
+    asin: str | None = None
+
+    @field_validator("asin")
+    @classmethod
+    def _normalize_asin(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        return normalize_asin(value)
+
+
+class AnalyzeOrderTrendsInput(MarketplaceScopedSkillInput):
+    pass
+
+
+class DetectCancellationAnomaliesInput(MarketplaceScopedSkillInput):
+    pass
+
+
+class RankListingRiskByOrderExposureInput(MarketplaceScopedSkillInput):
+    limit: int = Field(default=25, ge=1, le=100)

@@ -223,6 +223,30 @@ class OrderDetail(BaseModel):
     items: list[OrderItemRow]
 
 
+class OrderItemWindowRow(BaseModel):
+    """12B.5A — one order item plus the sanitized subset of its parent
+    order's fields needed for cross-order aggregation (units/exposure per
+    SKU, fulfillment-status distribution, cancellation counting). Never
+    carries anything `OrderItemRow`/`OrderCollectionItem` don't already
+    expose — this is a join of two already-approved shapes, not a new
+    field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seller_sku: str
+    asin: str | None
+    quantity_ordered: int
+    item_proceeds_amount: Decimal | None
+    item_proceeds_currency: str | None
+    order_id: UUID
+    amazon_order_id: str
+    order_amazon_created_at: datetime | None
+    order_fulfillment_status: str | None
+    order_was_cancelled: bool
+    order_total_amount: Decimal | None
+    order_total_currency: str | None
+
+
 def _sync_evidence(
     latest_run: AmazonIngestionRun | None,
     latest_successful_run: AmazonIngestionRun | None,
@@ -424,6 +448,51 @@ class AmazonOrdersReadService:
                 last_seen_at=row.last_seen_at,
                 items=[_item_row(item) for item in item_rows],
             )
+
+    def list_order_items_for_window(
+        self,
+        marketplace_participation_id: UUID,
+        *,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 2000,
+    ) -> list[OrderItemWindowRow]:
+        """12B.5A — every order item in this window, joined with its
+        parent order's sanitized fields, for the Copilot skills'
+        deterministic aggregation (units/exposure per SKU, fulfillment
+        distribution, cancellation counting). Raises `AmazonListings
+        ParticipationNotFoundError` for a foreign or nonexistent
+        participation, matching every other method in this service.
+        Read-only; makes no Amazon call."""
+        self._require_persistence()
+        organization_id = self._org_id()
+        with session_scope() as session:
+            rows = AmazonSellerOrderItemRepository(session).list_items_for_window(
+                organization_id,
+                marketplace_participation_id,
+                created_after=created_after,
+                created_before=created_before,
+                limit=limit,
+            )
+            if rows is None:
+                raise AmazonListingsParticipationNotFoundError(str(marketplace_participation_id))
+            return [
+                OrderItemWindowRow(
+                    seller_sku=item.seller_sku,
+                    asin=item.asin,
+                    quantity_ordered=item.quantity_ordered,
+                    item_proceeds_amount=item.item_proceeds_amount,
+                    item_proceeds_currency=item.item_proceeds_currency,
+                    order_id=order.id,
+                    amazon_order_id=order.amazon_order_id,
+                    order_amazon_created_at=order.amazon_created_at,
+                    order_fulfillment_status=order.fulfillment_status,
+                    order_was_cancelled=order.was_cancelled,
+                    order_total_amount=order.order_total_amount,
+                    order_total_currency=order.order_total_currency,
+                )
+                for item, order in rows
+            ]
 
 
 def get_amazon_orders_read_service() -> AmazonOrdersReadService:

@@ -1,6 +1,6 @@
 # Listings + Orders Copilot Scenario Matrix
 
-Status: **Planning document only.** No code, no Copilot tools, and no Skill implementation exist yet for anything described below. This document is the candidate backlog for wiring already-ingested Listings and Orders data into Copilot via `ToolRegistry` + `EvidenceEnvelope`, once that work is explicitly approved (per `CLAUDE.md`'s milestone roadmap, that is **12B.9 — Connect stable seller-data tools to intelligence/Copilot**, not yet started).
+Status: **Partially implemented.** Five of the 23 scenarios below (1, 2, 7, 12, 17) were implemented as launch skills under **12B.5A — Listings + Orders Copilot Launch Skills** (see the 12B.5A implementation-status addendum at the end of this document for exactly what changed, what did not, and a milestone-naming note). The remaining 18 scenarios are still planning-only, pending explicit approval of a later slice (originally scoped in this document to **12B.9 — Connect stable seller-data tools to intelligence/Copilot**). Scenario text below is preserved as originally written and is **not** rewritten to match the as-built code — see the addendum for the delta.
 
 ## Scope and non-negotiable constraints
 
@@ -483,3 +483,32 @@ Every scenario uses the same 11-field template:
 - **Later:** 4 — Scenarios 5, 19, 20, 22.
 
 This document is the authoritative next-implementation backlog for surfacing Listings and Orders data through Copilot, and every scenario above respects the existing deterministic-Python/AI-synthesis split, the `ToolRegistry` execution boundary, and `EvidenceEnvelope` provenance requirements. No LLM Skill implementation exists yet anywhere in this backlog — this is planning only, pending explicit approval to begin 12B.9 (Connect stable seller-data tools to intelligence/Copilot) or any earlier milestone that precedes it on the approved roadmap.
+
+---
+
+## 12B.5A implementation-status addendum
+
+Added when Scenarios 1, 2, 7, 12, and 17 were implemented as Copilot launch skills. The scenario write-ups above are preserved exactly as originally drafted (per this document's own "preserve scenario history" convention) — this addendum records the delta between plan and as-built code rather than silently editing the scenarios themselves. Full architecture, contracts, and test coverage: `docs/AI_HANDOVER/12B5A_LISTINGS_ORDERS_COPILOT_SKILLS.md`.
+
+**Milestone-naming note.** This document originally tied all 23 scenarios, including these five, to **12B.9**. The user explicitly directed the five launch skills to be implemented as **12B.5A** instead — earlier in the roadmap than this document anticipated. That is the user's own prerogative to resequence the roadmap, not a correction of an error in this document; the scenario numbering and "Launch/Next/Later" priority tags above are otherwise unchanged and still describe the full 23-scenario backlog accurately for whatever slice implements the remaining 18.
+
+**Scenario → implemented skill mapping:**
+
+| Scenario | Implemented as | Tool name |
+| --- | --- | --- |
+| 1. Issue Prioritization | Listing Health Prioritizer | `prioritize_listing_health` |
+| 2. Buyability | Non-buyable Listing Investigator | `investigate_non_buyable_listing` |
+| 7. Order/Unit Trends | Order and Sales Trend Analyst | `analyze_order_trends` |
+| 12. Cancellations | Cancellation/Operational Anomaly Detector | `detect_cancellation_anomalies` |
+| 17. Revenue/Order Exposure Associated With Critical Listing Issues | Listing Risk by Order Exposure | `rank_listing_risk_by_order_exposure` |
+
+**Schema-reality correction — Scenario 12 (Cancellations).** This scenario's "Required data" and "Deterministic calculations" fields above describe `amazon_seller_order_items.was_cancelled` (item-level) and `.cancel_requester`/`.cancelled_by` (an enum grouping key). **Neither field exists** on the actual, already-approved `AmazonSellerOrderItem` schema (`app/persistence/models.py`) — only `amazon_seller_orders.was_cancelled` (order-level) exists, and Amazon's cancellation requester/reason is not part of this schema at all. The scenario text above is left as originally written (it was a reasonable, good-faith design against a schema that had not yet been implemented at the time this document was drafted), but the actual implementation necessarily differs:
+
+- Cancellation counting and rate are computed at **order granularity only**, using `amazon_seller_orders.was_cancelled`.
+- There is no requester/reason grouping anywhere in the implemented skill — that data does not exist to group by.
+- "Affected SKUs" means **SKUs present on a cancelled order** — a proxy (presence on a cancelled order), not proof that every unit on that order was itself cancelled, since no item-level cancellation flag exists to confirm that.
+- Anomaly labeling is a new, documented threshold rule (minimum sample size, floor rate, relative-increase factor — see `app/copilot/skills/cancellations.py`) that this scenario's original text did not specify, added because a bare rate comparison would have been misleading on small samples.
+
+**Scope actually implemented beyond the original scenario text.** All five as-built skills additionally: revalidate marketplace-participation ownership independently of the planner-supplied scope (never trust the model's own claim of scope); report a structured `confidence` category driven by evidence completeness (`high`/`medium`/`low`/`insufficient_data`), not model opinion; disclose Listings and/or Orders freshness and flag any newer incomplete (queued/running/failed/partial) sync run; and provide safe internal `/seller/listings`/`/seller/orders` deep links. These cross-cutting guarantees are part of the shared `SkillEvidence` contract (`app/copilot/skills/contracts.py`) used by all five, not scenario-specific.
+
+**Not implemented by 12B.5A.** The remaining 18 scenarios (3–6, 8–11, 13–16, 18–23) are unchanged from this document's original plan — still planning-only, not yet approved for implementation.

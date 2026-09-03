@@ -18,6 +18,15 @@ FREE_TOOLS = frozenset(
         "analyze_profitability",
         "get_advertising_snapshot",
         "analyze_advertising_impact",
+        # 12B.5A — Listings + Orders skills. Every one is a read-only
+        # wrapper over AmazonListingsReadService/AmazonOrdersReadService
+        # (no Amazon or OpenAI call), so all five belong here, never in
+        # PAID_TOOLS.
+        "prioritize_listing_health",
+        "investigate_non_buyable_listing",
+        "analyze_order_trends",
+        "detect_cancellation_anomalies",
+        "rank_listing_risk_by_order_exposure",
     }
 )
 ALLOWED_TOOLS = PAID_TOOLS | FREE_TOOLS
