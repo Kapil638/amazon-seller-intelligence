@@ -3,7 +3,7 @@ import { AmazonConnection } from "@/components/amazon-connection";
 
 export default function ConnectionPage() {
   return (
-    <AppShell current="connection">
+    <AppShell current="seller">
       <AmazonConnection />
     </AppShell>
   );

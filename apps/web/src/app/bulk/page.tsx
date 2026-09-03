@@ -3,7 +3,7 @@ import { BulkDueDiligence } from "@/components/bulk-due-diligence";
 
 export default function BulkPage() {
   return (
-    <AppShell current="bulk">
+    <AppShell current="analyze">
       <BulkDueDiligence />
     </AppShell>
   );

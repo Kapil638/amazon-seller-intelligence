@@ -52,6 +52,14 @@ import type {
   ListingsSummary,
   ListingsSyncTriggerResponse,
   SortDirection,
+  OrderCollectionResponse,
+  OrderDetail,
+  OrderFulfilledBy,
+  OrderFulfillmentStatus,
+  OrderSortField,
+  OrdersSummary,
+  OrdersSyncJobStatus,
+  OrdersSyncTriggerResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1390,6 +1398,144 @@ export async function triggerListingsSync(participationId: string): Promise<List
     return detail as ListingsSyncTriggerResponse;
   }
   throw new ListingsSyncError("Synchronization could not be started.", null, "unknown");
+}
+
+// --- 12B.4D: Seller Orders Read API + Sync Trigger -------------------------
+
+export class OrdersApiError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "not_found" | "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "OrdersApiError";
+  }
+}
+
+async function ordersRequest<T>(path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+  } catch {
+    throw new OrdersApiError("Orders could not reach the server. Make sure the API is running.", "unavailable");
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new OrdersApiError(detail || "This was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new OrdersApiError(detail || "Orders is not configured right now.", "unavailable");
+  }
+  throw new OrdersApiError(detail || "Orders could not complete this request.", "unknown");
+}
+
+export async function fetchOrdersSummary(participationId: string): Promise<OrdersSummary> {
+  return ordersRequest<OrdersSummary>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/orders/summary`,
+  );
+}
+
+export type OrdersQuery = {
+  q?: string;
+  fulfillmentStatus?: OrderFulfillmentStatus;
+  fulfilledBy?: OrderFulfilledBy;
+  createdAfter?: string;
+  createdBefore?: string;
+  sortBy?: OrderSortField;
+  sortDir?: SortDirection;
+  offset?: number;
+  limit?: number;
+};
+
+export async function fetchOrders(
+  participationId: string,
+  query: OrdersQuery = {},
+): Promise<OrderCollectionResponse> {
+  const params = new URLSearchParams();
+  if (query.q) params.set("q", query.q);
+  if (query.fulfillmentStatus) params.set("fulfillment_status", query.fulfillmentStatus);
+  if (query.fulfilledBy) params.set("fulfilled_by", query.fulfilledBy);
+  if (query.createdAfter) params.set("created_after", query.createdAfter);
+  if (query.createdBefore) params.set("created_before", query.createdBefore);
+  params.set("sort_by", query.sortBy ?? "amazon_last_updated_at");
+  params.set("sort_dir", query.sortDir ?? "desc");
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 25));
+  return ordersRequest<OrderCollectionResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/orders?${params.toString()}`,
+  );
+}
+
+export async function fetchOrderDetail(participationId: string, orderId: string): Promise<OrderDetail> {
+  return ordersRequest<OrderDetail>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/orders/${encodeURIComponent(orderId)}`,
+  );
+}
+
+export class OrdersSyncError extends Error {
+  constructor(
+    message: string,
+    readonly reason: string | null,
+    readonly kind: "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "OrdersSyncError";
+  }
+}
+
+// Mirrors `triggerListingsSync`'s own contract exactly: the trigger
+// endpoint enqueues a durable job and returns immediately, so every
+// outcome (queued, already-running, cooldown/backlog, scope failure) is a
+// normal structured response, not an exception. Only a genuine transport
+// failure or an unparseable response throws.
+export async function triggerOrdersSync(
+  sellerAccountId: string,
+  marketplaceParticipationIds: string[],
+): Promise<OrdersSyncTriggerResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon/orders/sync`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        seller_account_id: sellerAccountId,
+        marketplace_participation_ids: marketplaceParticipationIds,
+      }),
+    });
+  } catch {
+    throw new OrdersSyncError("Could not reach the server to start synchronization.", null, "unavailable");
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new OrdersSyncError("Synchronization could not be started.", null, "unknown");
+  }
+
+  if (response.ok) {
+    return body as OrdersSyncTriggerResponse;
+  }
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object") {
+    return detail as OrdersSyncTriggerResponse;
+  }
+  throw new OrdersSyncError("Synchronization could not be started.", null, "unknown");
+}
+
+export async function fetchOrdersSyncStatus(runId: string): Promise<OrdersSyncJobStatus | null> {
+  try {
+    return await ordersRequest<OrdersSyncJobStatus>(`/orders/sync/${encodeURIComponent(runId)}`);
+  } catch (err) {
+    if (err instanceof OrdersApiError && err.kind === "not_found") {
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function createProfitModel(payload: {

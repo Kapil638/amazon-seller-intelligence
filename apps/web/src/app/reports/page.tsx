@@ -3,7 +3,7 @@ import { SellerReports } from "@/components/seller-reports";
 
 export default function ReportsPage() {
   return (
-    <AppShell current="reports">
+    <AppShell current="analytics">
       <SellerReports />
     </AppShell>
   );

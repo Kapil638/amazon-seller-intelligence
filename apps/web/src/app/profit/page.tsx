@@ -3,7 +3,7 @@ import { SellerProfit } from "@/components/seller-profit";
 
 export default function ProfitPage() {
   return (
-    <AppShell current="profit">
+    <AppShell current="analytics">
       <SellerProfit />
     </AppShell>
   );

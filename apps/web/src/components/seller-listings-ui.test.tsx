@@ -664,16 +664,17 @@ describe("listing detail", () => {
 });
 
 describe("navigation", () => {
-  it("is reachable via a Seller Data link labeled distinctly from ASIN Analyzer", async () => {
+  it("is reachable via a Seller link (12B.4D: Seller Hub) distinct from ASIN Analyzer", async () => {
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
     const { AppShell } = await import("@/components/app-shell");
     render(
-      <AppShell current="seller-listings">
+      <AppShell current="seller">
         <div>content</div>
       </AppShell>,
     );
-    const link = screen.getByRole("link", { name: /seller data/i });
-    expect(link).toHaveAttribute("href", "/seller-listings");
-    expect(screen.getByRole("link", { name: /^analyze$/i })).toBeInTheDocument();
+    const links = screen.getAllByRole("link", { name: /^seller$/i });
+    expect(links.some((el) => el.getAttribute("href") === "/seller")).toBe(true);
+    expect(screen.getAllByRole("link", { name: /^analyze$/i }).length).toBeGreaterThan(0);
   });
 });
 

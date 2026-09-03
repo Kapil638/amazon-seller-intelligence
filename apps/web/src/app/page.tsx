@@ -3,7 +3,7 @@ import { ProductLookup } from "@/components/product-lookup";
 
 export default function Home() {
   return (
-    <AppShell current="asin">
+    <AppShell current="analyze">
       <ProductLookup />
     </AppShell>
   );
