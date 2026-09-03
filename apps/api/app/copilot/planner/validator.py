@@ -52,6 +52,32 @@ _OUT_OF_SCOPE = (
 )
 _PROFIT_WORDS = ("profit", "p&l", "cogs", "unit economics", "roi on cogs", "roi")
 _ADS_WORDS = ("acos", "tacos", "roas", "advertis", "after ads", "after-ads", "ad spend")
+# 12B.5A — Listings + Orders launch skills. Checked before the generic
+# _CHANGE_WORDS/_ANALYZE_WORDS/_EXPLAIN_WORDS/_HISTORY_WORDS buckets
+# below: these are the more specific match for their own domain
+# language (e.g. "which listings should I fix first" must route to
+# `prioritize_listing_health`, not the older single-ASIN
+# `explain_listing_score` flow that also happens to contain "fix
+# first") — but still after _ADS_WORDS/_PROFIT_WORDS, which stay the
+# more specific match for their own domain.
+_LISTING_HEALTH_WORDS = (
+    "fix first", "need attention", "which listings", "prioritize my listings", "listing health",
+    "listings should i fix",
+)
+_NON_BUYABLE_WORDS = (
+    "not buyable", "isn't buyable", "isnt buyable", "why isn't", "why isnt", "can't be bought",
+    "cannot be bought", "why is this not buyable",
+)
+_ORDER_TREND_WORDS = (
+    "orders trending", "sales trend", "how are my orders", "order trend", "units sold", "order volume",
+)
+_CANCELLATION_WORDS = (
+    "cancellation", "cancellations", "cancelled orders", "cancel rate", "unusually high",
+)
+_LISTING_RISK_WORDS = (
+    "issues affect", "revenue at risk", "order exposure", "orders affected by", "listing issues affect",
+    "most orders",
+)
 _CHANGE_WORDS = ("changed", "vs last", "versus last", "last month", "compared to last", "what changed")
 _ANALYZE_WORDS = ("analyze", "analyse", "look up")
 _REFRESH_WORDS = ("refresh", "re-analyze", "reanalyze", "new analysis")
@@ -59,12 +85,38 @@ _EXPLAIN_WORDS = ("why", "score", "low", "explain", "findings", "fix first")
 _HISTORY_WORDS = ("history", "saved report", "saved analysis", "past report")
 _SUMMARIZE_WORDS = ("summarize", "summarise", "what did we conclude", "last time")
 _FETCH_TOOLS = frozenset({"analyze_listing_v2", "get_product"})
+_SKILL_INTENTS = frozenset(
+    {
+        "prioritize_listing_health",
+        "investigate_non_buyable_listing",
+        "analyze_order_trends",
+        "detect_cancellation_anomalies",
+        "rank_listing_risk_by_order_exposure",
+    }
+)
 
 
 class ExtractedSlots:
-    def __init__(self, asin: str | None = None, report_id: UUID | None = None) -> None:
+    def __init__(
+        self,
+        asin: str | None = None,
+        report_id: UUID | None = None,
+        marketplace_participation_id: UUID | None = None,
+        period_days: int | None = None,
+    ) -> None:
         self.asin = asin
         self.report_id = report_id
+        # 12B.5A — the seller's currently selected marketplace, threaded
+        # in from `PlanValidator.validate()`'s own explicit parameter
+        # (never extracted from free text: a UUID typed into chat is not
+        # a trustworthy way to select a marketplace, and no seller would
+        # do that anyway — the frontend's marketplace selector is the
+        # only source for this).
+        self.marketplace_participation_id = marketplace_participation_id
+        # Same treatment as marketplace_participation_id: the seller's
+        # currently selected analysis window, never parsed from free
+        # text, threaded in from `PlanValidator.validate()`.
+        self.period_days = period_days
 
 
 def asin_from_message(user_message: str) -> str | None:
@@ -106,6 +158,16 @@ def infer_fallback_intent(
         return "explain_advertising_impact"
     if any(token in text for token in _PROFIT_WORDS) or "margin" in text:
         return "explain_profit"
+    if any(token in text for token in _NON_BUYABLE_WORDS):
+        return "investigate_non_buyable_listing"
+    if any(token in text for token in _CANCELLATION_WORDS):
+        return "detect_cancellation_anomalies"
+    if any(token in text for token in _LISTING_RISK_WORDS):
+        return "rank_listing_risk_by_order_exposure"
+    if any(token in text for token in _ORDER_TREND_WORDS):
+        return "analyze_order_trends"
+    if any(token in text for token in _LISTING_HEALTH_WORDS):
+        return "prioritize_listing_health"
     if any(token in text for token in _CHANGE_WORDS):
         return "what_changed"
     if any(token in text for token in _REFRESH_WORDS):
@@ -158,6 +220,41 @@ def fallback_tool_calls(intent: Intent, slots: ExtractedSlots) -> list[ProposedT
         if slots.asin:
             return [ProposedToolCall(name="get_advertising_snapshot", arguments={"asin": slots.asin})]
         return []
+    if intent in _SKILL_INTENTS:
+        return _skill_tool_calls(intent, slots)
+    return []
+
+
+def _skill_tool_calls(intent: Intent, slots: ExtractedSlots) -> list[ProposedToolCall]:
+    """12B.5A — every one of the five skills is marketplace-scoped, never
+    reachable without a selected participation (checked again, sanitized,
+    in `PlanValidator.validate()` right after this returns — see the
+    `marketplace_participation_id`-required guard there)."""
+    if slots.marketplace_participation_id is None:
+        return []
+    arguments: dict[str, Any] = {"marketplace_participation_id": str(slots.marketplace_participation_id)}
+    if slots.period_days is not None:
+        arguments["period_days"] = slots.period_days
+    if intent == "prioritize_listing_health":
+        return [ProposedToolCall(name="prioritize_listing_health", arguments=dict(arguments))]
+    if intent == "investigate_non_buyable_listing":
+        # A specific ASIN found in the message investigates that one
+        # listing. Otherwise — the seller asked the general "why are my
+        # listings not buyable?" question — the tool call still goes
+        # through with no locator: the tool itself returns a prioritized
+        # selection of not-buyable listings rather than guessing a
+        # target (see `NonBuyableListingEvidenceService._select_
+        # candidates`). A seller_sku locator is also accepted by the
+        # tool's own schema for an attached LLM planner to supply.
+        if slots.asin:
+            arguments["asin"] = slots.asin
+        return [ProposedToolCall(name="investigate_non_buyable_listing", arguments=dict(arguments))]
+    if intent == "analyze_order_trends":
+        return [ProposedToolCall(name="analyze_order_trends", arguments=dict(arguments))]
+    if intent == "detect_cancellation_anomalies":
+        return [ProposedToolCall(name="detect_cancellation_anomalies", arguments=dict(arguments))]
+    if intent == "rank_listing_risk_by_order_exposure":
+        return [ProposedToolCall(name="rank_listing_risk_by_order_exposure", arguments=dict(arguments))]
     return []
 
 
@@ -215,8 +312,12 @@ class PlanValidator:
         used_llm: bool,
         planner_model: str | None,
         planner_prompt_version: str | None,
+        marketplace_participation_id: UUID | None = None,
+        period_days: int | None = None,
     ) -> Plan:
         slots = extract_slots(user_message, compact)
+        slots.marketplace_participation_id = marketplace_participation_id
+        slots.period_days = period_days
         typed_asin = asin_from_message(user_message)
         fallback_intent = infer_fallback_intent(user_message, slots, compact.previous_intent)
         if fallback_intent == "analyze_asin" and typed_asin is None:
@@ -323,6 +424,12 @@ class PlanValidator:
         if intent in {"out_of_scope", "clarify"}:
             approved = []
         if intent in {"explain_profit", "explain_advertising_impact"} and not slots.asin:
+            approved = []
+            intent = "clarify"
+        if intent in _SKILL_INTENTS and slots.marketplace_participation_id is None:
+            # No selected marketplace at all — never guess one. Matches
+            # the same graceful-degrade-to-clarify shape as the profit/
+            # advertising intents above.
             approved = []
             intent = "clarify"
         if intent == "clarify" and not slots.asin and not slots.report_id:

@@ -431,6 +431,97 @@ def test_an_old_cancelled_before_start_row_does_not_hide_a_newer_real_run_from_c
     assert outcome.job.run_id == real_claim.run_id  # the real run, not the 3-day-old cancelled one
 
 
+# --- regression: a non-terminal sibling row must never be cooldown-relevant
+# (real-PostgreSQL concurrency incident: tests/postgres/test_disposable_
+# postgres_listings_sync_trigger_concurrency.py::
+# test_ten_concurrent_triggers_create_at_most_one_job) ----------------------
+
+
+def test_a_queued_sibling_run_is_never_cooldown_relevant() -> None:
+    """`get_latest_cooldown_relevant_listings_run` must only ever consider
+    terminal runs. A `queued` row — including one a concurrent trigger
+    call just created, an instant before this call's own transaction
+    reads it under real PostgreSQL's row-visibility timing — has no
+    `completed_at` yet, so before this fix its `created_at` fallback
+    computed a fresh cooldown window against a job that made no real
+    Amazon call at all, causing a losing concurrent caller to resolve to
+    `reason="cooldown"` instead of truthfully reporting the winner's job
+    as `already_running`. Proven directly at the repository layer
+    (dialect-independent — no NULLS-ordering dependency, unlike the
+    `cancelled_before_start` ordering defect) rather than by trying to
+    force the actual thread interleaving, which real concurrency alone
+    can produce; the real-PostgreSQL concurrency test proves the full
+    race is closed."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+        )
+    with session_scope() as session:
+        latest = AmazonIngestionRunRepository(session).get_latest_cooldown_relevant_listings_run(
+            scope["organization_id"], scope["marketplace_participation_id"]
+        )
+        assert latest is None
+
+    trigger = AmazonListingsSyncTriggerService(settings=_settings(listings_sync_trigger_cooldown_seconds=3600))
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+    # The pre-existing active-run check catches this queued row first in
+    # a normal (non-raced) call — this end-to-end assertion documents
+    # that the caller-visible behavior for a plain repeat trigger was
+    # already correct; the bug was specific to the race window where the
+    # active-run check runs before the sibling row exists but the
+    # cooldown check runs after.
+    assert outcome.reason == "already_running"
+
+
+def test_a_started_sibling_run_is_never_cooldown_relevant() -> None:
+    """Same defect, `started` status: a claimed-but-not-yet-completed run
+    has no `completed_at` either, and is just as non-terminal as
+    `queued` — must never be read as a cooldown anchor."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        latest = AmazonIngestionRunRepository(session).get_latest_cooldown_relevant_listings_run(
+            scope["organization_id"], scope["marketplace_participation_id"]
+        )
+        assert latest is None
+
+
+def test_a_waiting_to_retry_sibling_run_is_never_cooldown_relevant() -> None:
+    """Same defect, `waiting_to_retry` status — simulated directly since
+    reaching it through the real retry-reschedule path requires a failed
+    claimed attempt first; the status value itself is what this query's
+    `WHERE` clause must exclude, regardless of how a row got there."""
+    scope = _seed_scope()
+    with session_scope() as session:
+        claim = AmazonIngestionRunRepository(session).claim_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na", environment="PRODUCTION", connection_id=None,
+            lease_owner="worker-1", lease_duration_seconds=300,
+        )
+    with session_scope() as session:
+        row = session.get(AmazonIngestionRun, claim.run_id)
+        row.status = "waiting_to_retry"
+        row.next_retry_at = datetime.now(UTC) + timedelta(minutes=5)
+    with session_scope() as session:
+        latest = AmazonIngestionRunRepository(session).get_latest_cooldown_relevant_listings_run(
+            scope["organization_id"], scope["marketplace_participation_id"]
+        )
+        assert latest is None
+
+
 def test_cancelled_before_start_itself_never_imposes_a_cooldown() -> None:
     """The whole point of `terminalize-queued` is to unblock a stuck scope
     immediately — an operator should never have to additionally wait out

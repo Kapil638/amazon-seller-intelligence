@@ -82,7 +82,9 @@ class PlannerService:
     async def create_plan(self, request: PlannerRequest) -> Plan:
         catalog = request.available_tools or self._registry.list_tools()
         compact = request.compact_context
-        proposal, model_id, used_llm = await self._propose(request.user_message, compact, catalog)
+        proposal, model_id, used_llm = await self._propose(
+            request.user_message, compact, catalog, request.marketplace_participation_id
+        )
         plan = self._validator.validate(
             conversation_id=request.conversation_id,
             user_message=request.user_message,
@@ -92,17 +94,28 @@ class PlannerService:
             used_llm=used_llm,
             planner_model=model_id,
             planner_prompt_version=PROMPT_VERSION if used_llm else None,
+            marketplace_participation_id=request.marketplace_participation_id,
+            period_days=request.period_days,
         )
         await self._persist(request, plan)
         return plan
 
-    async def plan_turn(self, conversation_id: UUID, user_message: str) -> Plan:
+    async def plan_turn(
+        self,
+        conversation_id: UUID,
+        user_message: str,
+        *,
+        marketplace_participation_id: UUID | None = None,
+        period_days: int | None = None,
+    ) -> Plan:
         detail = self._conversations.get_conversation(conversation_id)
         request = PlannerRequest(
             user_message=user_message,
             conversation_id=conversation_id,
             compact_context=detail.compact_context,
             available_tools=self._registry.list_tools(),
+            marketplace_participation_id=marketplace_participation_id,
+            period_days=period_days,
         )
         return await self.create_plan(request)
 
@@ -111,6 +124,7 @@ class PlannerService:
         user_message: str,
         compact: CompactContext,
         catalog: list,
+        marketplace_participation_id: UUID | None = None,
     ) -> tuple[PlannerProposal | None, str | None, bool]:
         if self._proposer is None:
             return None, None, False
@@ -122,6 +136,9 @@ class PlannerService:
                 compact.pending_confirmation.model_dump() if compact.pending_confirmation else None
             ),
             "recent_user_snippets": list(compact.recent_user_snippets),
+            "marketplace_participation_id": (
+                str(marketplace_participation_id) if marketplace_participation_id else None
+            ),
         }
         tools = [item.model_dump() for item in catalog]
         try:

@@ -23,6 +23,12 @@ Intent = Literal[
     "explain_advertising_impact",
     "out_of_scope",
     "clarify",
+    # 12B.5A — Listings + Orders launch skills.
+    "prioritize_listing_health",
+    "investigate_non_buyable_listing",
+    "analyze_order_trends",
+    "detect_cancellation_anomalies",
+    "rank_listing_risk_by_order_exposure",
 ]
 
 INTENT_VALUES: tuple[str, ...] = (
@@ -35,6 +41,11 @@ INTENT_VALUES: tuple[str, ...] = (
     "explain_advertising_impact",
     "out_of_scope",
     "clarify",
+    "prioritize_listing_health",
+    "investigate_non_buyable_listing",
+    "analyze_order_trends",
+    "detect_cancellation_anomalies",
+    "rank_listing_risk_by_order_exposure",
 )
 
 PlanSource = Literal["planner_llm", "fallback_rules", "rewritten_history_first"]
@@ -63,12 +74,33 @@ class PlannerRequest(CopilotIgnoreExtra):
     conversation_id: UUID
     compact_context: CompactContext = Field(default_factory=CompactContext)
     available_tools: list[ToolCatalogEntry] = Field(default_factory=list)
+    marketplace_participation_id: UUID | None = None
+    period_days: int | None = Field(default=None, ge=1, le=90)
 
 
 class PlanTurnRequest(CopilotIgnoreExtra):
-    """HTTP body for a plan-only turn. organization_id is ignored if sent."""
+    """HTTP body for a plan-only turn. organization_id is ignored if sent.
+
+    `marketplace_participation_id` (12B.5A) is the seller's currently
+    selected marketplace in the Copilot UI — required to route any of
+    the five Listings/Orders skill intents. Deliberately per-turn, never
+    persisted into `CompactContext`: the frontend always knows which
+    marketplace is selected right now, so re-sending it here is simpler
+    and safer than trying to remember a "last selected marketplace"
+    across turns that could go stale. Ownership is still re-validated
+    inside the skill's own evidence service on every call — this field
+    is never trusted as proof of ownership by itself.
+
+    `period_days` is the seller's currently selected analysis window in
+    the Copilot UI — same per-turn, never-persisted treatment as
+    `marketplace_participation_id`. `None` lets each tool apply its own
+    default (30 days); the tool's own schema still bounds it to [1, 90]
+    regardless of what this field allows through.
+    """
 
     user_message: str = Field(min_length=1, max_length=8000)
+    marketplace_participation_id: UUID | None = None
+    period_days: int | None = Field(default=None, ge=1, le=90)
 
 
 class ApprovedToolCall(BaseModel):

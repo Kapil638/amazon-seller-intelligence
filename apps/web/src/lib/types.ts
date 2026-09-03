@@ -1121,6 +1121,34 @@ export type SavedAnalysisDetail = {
   meta: SavedAnalysisMetadata;
 };
 
+// 12B.5A — the structured payload carried by every Listings/Orders skill
+// tool's "skill_evidence" claim value. Mirrors `app.copilot.skills.
+// contracts.SkillEvidence` field-for-field.
+export type CopilotSkillDeepLink = {
+  label: string;
+  href: string;
+};
+
+export type CopilotSkillFreshness = {
+  status: string;
+  last_successful_synchronized_at?: string | null;
+} | null;
+
+export type CopilotSkillEvidence = {
+  skill_id: string;
+  skill_version: string;
+  marketplace_participation_ids: string[];
+  listings_freshness: CopilotSkillFreshness;
+  orders_freshness: CopilotSkillFreshness;
+  has_newer_incomplete_run: boolean;
+  metrics: Record<string, unknown>;
+  records: Record<string, unknown>[];
+  limitations: string[];
+  confidence: "high" | "medium" | "low" | "insufficient_data";
+  deep_links: CopilotSkillDeepLink[];
+  generated_at: string;
+};
+
 export type CopilotEvidenceClaim = {
   key: string;
   value: unknown;

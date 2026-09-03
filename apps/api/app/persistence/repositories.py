@@ -1837,16 +1837,38 @@ class AmazonIngestionRunRepository:
     def get_latest_cooldown_relevant_listings_run(
         self, organization_id: UUID, marketplace_participation_id: UUID
     ) -> AmazonIngestionRun | None:
-        """Like `get_latest_listings_run`, but excludes `cancelled_before_
-        start` rows. An administrative cancellation of a job that never
-        started never made an Amazon call and did zero work — the entire
-        point of `terminalize-queued` is to unblock a stuck scope so a
-        real attempt can proceed, so it must never itself impose a fresh
-        cooldown on top of the wait the operator just ended. Every other
-        terminal outcome (`succeeded`, `partial`, `timed_out`, and a
+        """Like `get_latest_listings_run`, but restricted to **terminal**
+        runs (`succeeded`, `partial`, `failed`, `timed_out`) and excluding
+        `cancelled_before_start` rows — mirrors `get_latest_cooldown_
+        relevant_orders_run`'s same terminal-only semantics (its own
+        docstring already says so; this method's status filter had
+        drifted from it). An administrative cancellation of a job that
+        never started never made an Amazon call and did zero work — the
+        entire point of `terminalize-queued` is to unblock a stuck scope
+        so a real attempt can proceed, so it must never itself impose a
+        fresh cooldown on top of the wait the operator just ended. Every
+        other terminal outcome (`succeeded`, `partial`, `timed_out`, and a
         genuine `failed` run that actually made an Amazon call before
         failing) still counts toward the cooldown, because each of those
         represents real, recent Amazon API usage worth pacing against.
+
+        The status restriction is not cosmetic: without it, a `queued` or
+        `started` sibling row — including one a *concurrent* trigger call
+        just created, an instant before this call's own transaction reads
+        it — is misread as "the latest cooldown-relevant run", and its
+        `created_at` (a queued row has no `completed_at` yet, so the
+        anchor falls back to `created_at`) computes a fresh multi-minute
+        cooldown window against a job that has not made any real Amazon
+        call at all. Under concurrent triggers for the same scope this
+        made a losing caller spuriously resolve to `reason="cooldown"`
+        instead of truthfully reporting the winner's job as
+        `"already_running"` — a real production race, not a test-only
+        concern, reproduced under real PostgreSQL by
+        `test_ten_concurrent_triggers_create_at_most_one_job`. Restricting
+        to terminal statuses closes it: a still-`queued`/`started`/
+        `waiting_to_retry` row can never again be mistaken for a genuine,
+        already-completed Amazon attempt.
+
         Same tie-safe ordering as `get_latest_listings_run` — see its
         docstring."""
         return self.session.scalars(
@@ -1855,6 +1877,7 @@ class AmazonIngestionRunRepository:
                 AmazonIngestionRun.organization_id == organization_id,
                 AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
                 AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status.in_(("succeeded", "partial", "failed", "timed_out")),
                 or_(
                     AmazonIngestionRun.failure_class.is_(None),
                     AmazonIngestionRun.failure_class != "cancelled_before_start",
@@ -4570,6 +4593,54 @@ class AmazonSellerOrderItemRepository:
             .order_by(AmazonSellerOrderItem.amazon_order_item_id.asc())
         )
         return list(self.session.scalars(statement).all())
+
+    def list_items_for_window(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 2000,
+    ) -> list[tuple[AmazonSellerOrderItem, AmazonSellerOrder]] | None:
+        """12B.5A — every order item in this participation whose parent
+        order's `amazon_created_at` falls in `[created_after, created_before)`,
+        paired with its parent order. Returns `None` (never raises) for a
+        foreign or nonexistent participation, matching `AmazonSellerOrder
+        Repository.get_summary_counts`'s own contract — a caller-visible
+        404, not an internal error.
+
+        Added for the 12B.5A Copilot skills, which need item-level
+        aggregation (units/exposure per SKU, fulfillment-status
+        distribution) across every order in a window — data `list_orders`
+        deliberately does not expose per row (`OrderCollectionItem` carries
+        only `item_count`, never the items themselves, to keep that
+        endpoint's response bounded). One JOIN query here, ownership-
+        validated exactly like every other method in this module, is the
+        smallest extension that avoids either an N+1 `get_order()` call
+        per order or letting the Copilot layer touch these ORM models
+        directly. `limit` is a defensive ceiling only (2000 covers any
+        realistic single-window seller volume today) — never raised
+        silently past what a caller explicitly asks for.
+        """
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        conditions = [AmazonSellerOrderItem.marketplace_participation_id == marketplace_participation_id]
+        if created_after is not None:
+            conditions.append(AmazonSellerOrder.amazon_created_at >= created_after)
+        if created_before is not None:
+            conditions.append(AmazonSellerOrder.amazon_created_at < created_before)
+        statement = (
+            select(AmazonSellerOrderItem, AmazonSellerOrder)
+            .join(AmazonSellerOrder, AmazonSellerOrder.id == AmazonSellerOrderItem.order_id)
+            .where(*conditions)
+            .order_by(AmazonSellerOrder.amazon_created_at.asc())
+            .limit(limit)
+        )
+        return list(self.session.execute(statement).tuples().all())
 
     def upsert(
         self,

@@ -88,10 +88,15 @@ def test_planner_catalog_hides_handlers_and_product_input() -> None:
         "analyze_advertising_impact",
         "analyze_listing_v2",
         "analyze_profitability",
+        "analyze_order_trends",
+        "detect_cancellation_anomalies",
         "get_advertising_snapshot",
         "get_product",
         "get_profit_snapshot",
         "get_saved_report",
+        "investigate_non_buyable_listing",
+        "prioritize_listing_health",
+        "rank_listing_risk_by_order_exposure",
         "list_saved_reports",
     }
     listing = registry.get_tool("analyze_listing_v2")

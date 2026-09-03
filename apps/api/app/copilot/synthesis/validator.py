@@ -31,7 +31,28 @@ _TOOL_LABELS = {
     "analyze_profitability": "Profit calculation",
     "get_advertising_snapshot": "Advertising snapshot",
     "analyze_advertising_impact": "Advertising impact",
+    # 12B.5A
+    "prioritize_listing_health": "Listing health ranking",
+    "investigate_non_buyable_listing": "Non-buyable listing investigation",
+    "analyze_order_trends": "Order and sales trend analysis",
+    "detect_cancellation_anomalies": "Cancellation analysis",
+    "rank_listing_risk_by_order_exposure": "Listing risk by order exposure",
 }
+
+_SKILL_SUMMARY_TEMPLATES: dict[str, str] = {
+    "listing_health_prioritizer": "Here is your Listing health ranking for this marketplace.",
+    "non_buyable_listing_investigator": "Here is what ASI observed about this listing.",
+    "order_and_sales_trend_analyst": "Here is your order and sales trend for this period.",
+    "cancellation_operational_anomaly_detector": "Here is your cancellation analysis for this period.",
+    "listing_risk_by_order_exposure": "Here are the Listings with the most verified order exposure tied to an open issue.",
+}
+# 12B.5A — the non_buyable_listing_investigator tool answers two shapes
+# of evidence: a single named listing's detail (metrics has
+# "is_buyable"), or — when the seller asks the general "why are my
+# listings not buyable?" question with no SKU/ASIN named — a prioritized
+# selection of not-buyable listings (metrics has "not_buyable_count"
+# instead). The summary line must say which one this is.
+_NON_BUYABLE_SELECTION_SUMMARY = "Here is a prioritized list of listings that are not currently buyable."
 
 _CONTEXT_KEYS = (
     "last_asin",
@@ -178,6 +199,10 @@ def template_response(
             extras=extras,
         )
 
+    skill_response = _skill_template_response(facts, extras=extras)
+    if skill_response is not None:
+        return skill_response
+
     findings: list[str] = []
     recommendations: list[str] = []
     citations: list[EvidenceCitation] = []
@@ -300,6 +325,154 @@ def template_response(
     )
     _ = user_message
     return response.model_copy(update={"message": format_seller_message(response)})
+
+
+def _skill_template_response(facts: list[AllowedFact], *, extras: list[str] | None) -> SynthesizedResponse | None:
+    """12B.5A — deterministic (no-LLM) seller answer for any of the five
+    Listings/Orders skills, built entirely from the one `skill_evidence`
+    fact each skill's tool always emits (see `app.copilot.skills.
+    contracts.skill_evidence_to_claims`). Returns `None` (never raises)
+    when no such fact is present, so every non-skill intent's existing
+    template path is completely unaffected.
+
+    This is the path every SQLite/CI run actually exercises for these
+    five skills (no LLM is attached there — see `planner/service.py`'s
+    `_sqlite_test_database` gate, and `synthesis/service.py`'s identical
+    one), so it must never merely echo raw JSON: every number here is
+    labeled in plain language, "order value" is never called "revenue,"
+    money is grouped by currency, and an anomaly is only ever named as
+    such when the evidence's own `is_anomalous` metric says so.
+    """
+    fact = _first(facts, "skill_evidence")
+    if fact is None or not isinstance(fact.value, dict):
+        return None
+    evidence = fact.value
+    skill_id = evidence.get("skill_id")
+    if skill_id not in _SKILL_SUMMARY_TEMPLATES:
+        return None
+
+    citation = _citation(fact)
+    findings: list[str] = [_freshness_finding(evidence)]
+    recommendations: list[str] = []
+    metrics = evidence.get("metrics") or {}
+    records = evidence.get("records") or []
+
+    if skill_id == "listing_health_prioritizer":
+        findings.append(
+            f"{metrics.get('with_issues_count', 0)} of {metrics.get('total_listings', 0)} listings have an "
+            f"open Amazon issue ({metrics.get('issue_severity_error_count', 0)} ERROR, "
+            f"{metrics.get('issue_severity_warning_count', 0)} WARNING)."
+        )
+        for row in records[:3]:
+            findings.append(
+                f"{row.get('seller_sku')}: highest issue severity {row.get('highest_issue_severity') or 'none'}, "
+                f"buyable={row.get('is_buyable')}, {row.get('recent_order_count', 0)} recent order(s)."
+            )
+        if records:
+            recommendations.append(f"Start with {records[0].get('seller_sku')} — it ranks first.")
+    elif skill_id == "non_buyable_listing_investigator" and "not_buyable_count" in metrics:
+        # Selection mode: no specific SKU/ASIN was named, so this is a
+        # prioritized list of candidates, not one listing's detail.
+        findings.append(
+            f"{metrics.get('not_buyable_count', 0)} listing(s) are currently not buyable in this marketplace."
+        )
+        for row in records[:5]:
+            findings.append(
+                f"{row.get('seller_sku')}: highest issue severity {row.get('highest_issue_severity') or 'none'}."
+            )
+        if records:
+            recommendations.append(
+                f"Ask about {records[0].get('seller_sku')} specifically for a full investigation."
+            )
+    elif skill_id == "non_buyable_listing_investigator":
+        findings.append(
+            f"is_buyable={metrics.get('is_buyable')}, is_active={metrics.get('is_active')}, "
+            f"is_discoverable={metrics.get('is_discoverable')}."
+        )
+        findings.append(
+            f"{metrics.get('issue_severity_error_count', 0)} ERROR and "
+            f"{metrics.get('issue_severity_warning_count', 0)} WARNING issue(s) on record."
+        )
+        for row in records:
+            if row.get("kind") in ("possible_explanation", "observed_fact") and row.get("note"):
+                findings.append(row["note"])
+        recommendations.append("Open this listing in Seller Listings to review Amazon's exact issue text.")
+    elif skill_id == "order_and_sales_trend_analyst":
+        change = metrics.get("order_count_percentage_change")
+        change_text = "no orders in the comparison period (new activity)" if change is None else f"{change:+.1f}% vs the prior period"
+        findings.append(
+            f"{metrics.get('order_count', 0)} orders and {metrics.get('unit_count', 0)} units this period "
+            f"({change_text})."
+        )
+        for currency, amount in (metrics.get("order_value_by_currency") or {}).items():
+            findings.append(f"Order value: {amount} {currency}.")
+        if metrics.get("orders_without_items_count"):
+            findings.append(f"{metrics['orders_without_items_count']} order(s) have no item rows on record.")
+    elif skill_id == "cancellation_operational_anomaly_detector":
+        findings.append(
+            f"{metrics.get('cancelled_orders', 0)} of {metrics.get('total_orders', 0)} orders were cancelled "
+            f"this period."
+        )
+        if metrics.get("is_anomalous"):
+            findings.append(f"This is anomalous: {metrics.get('anomaly_reason')}.")
+            recommendations.append("Review the cancelled orders for a common SKU or fulfillment pattern.")
+        else:
+            findings.append(f"Not labeled anomalous: {metrics.get('anomaly_reason')}.")
+    elif skill_id == "listing_risk_by_order_exposure":
+        findings.append(f"{metrics.get('at_risk_listing_count', 0)} listing(s) currently have an open issue.")
+        for currency, amount in (metrics.get("exposed_order_value_by_currency") or {}).items():
+            findings.append(f"Order value already observed for at-risk listings: {amount} {currency}.")
+        for row in records[:3]:
+            findings.append(
+                f"{row.get('seller_sku')}: {row.get('highest_issue_severity')} issue, "
+                f"{row.get('recent_order_count', 0)} recent order(s)."
+            )
+
+    limitations = [str(item) for item in (evidence.get("limitations") or [])]
+    summary = (
+        _NON_BUYABLE_SELECTION_SUMMARY
+        if skill_id == "non_buyable_listing_investigator" and "not_buyable_count" in metrics
+        else _SKILL_SUMMARY_TEMPLATES[skill_id]
+    )
+
+    response = SynthesizedResponse(
+        summary=summary,
+        findings=_unique(findings)[:MAX_FINDINGS],
+        recommendations=_unique(recommendations)[:MAX_RECOMMENDATIONS],
+        citations=[citation],
+        confidence=_map_confidence(evidence.get("confidence")),
+        unknowns=_unique((extras or []) + limitations)[:8],
+        source="template_fallback",
+        prompt_version=None,
+        synthesis_model=None,
+        message="",
+    )
+    return response.model_copy(update={"message": format_seller_message(response)})
+
+
+def _freshness_finding(evidence: dict) -> str:
+    parts: list[str] = []
+    listings = evidence.get("listings_freshness")
+    if isinstance(listings, dict):
+        parts.append(f"Listings data: {listings.get('status')}")
+        if listings.get("last_successful_synchronized_at"):
+            parts.append(f"(through {listings['last_successful_synchronized_at']})")
+    orders = evidence.get("orders_freshness")
+    if isinstance(orders, dict):
+        parts.append(f"Orders data: {orders.get('status')}")
+        if orders.get("last_successful_synchronized_at"):
+            parts.append(f"(through {orders['last_successful_synchronized_at']})")
+    if evidence.get("has_newer_incomplete_run"):
+        parts.append("A newer synchronization has not completed successfully yet.")
+    return "Data freshness — " + " ".join(parts) if parts else "Data freshness is unknown."
+
+
+def _map_confidence(value: object) -> str:
+    if value == "insufficient_data":
+        return "none"
+    if value in _CONFIDENCE:
+        return str(value)
+    return "medium"
 
 
 def format_seller_message(response: SynthesizedResponse) -> str:
