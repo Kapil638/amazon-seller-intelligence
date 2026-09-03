@@ -8,7 +8,7 @@ export default async function HistoricalAnalysisPage({
 }) {
   const { id } = await params;
   return (
-    <AppShell current="history">
+    <AppShell current="activity">
       <HistoricalAnalysis reportId={id} />
     </AppShell>
   );

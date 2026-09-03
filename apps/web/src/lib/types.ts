@@ -1712,3 +1712,150 @@ export type AmazonAuthorizationStart = {
   organization_id: string;
 };
 
+// --- 12B.4D: Seller Orders Read API + Sync Trigger (backend contract) -----
+
+export type OrdersSyncStatus =
+  | "never_synchronized"
+  | "queued"
+  | "running"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "failed"
+  | "partial"
+  | "timed_out";
+
+export type OrderSortField = "amazon_last_updated_at" | "amazon_created_at" | "order_total_amount";
+
+export type OrderFulfillmentStatus =
+  | "PENDING_AVAILABILITY"
+  | "PENDING"
+  | "UNSHIPPED"
+  | "PARTIALLY_SHIPPED"
+  | "SHIPPED"
+  | "CANCELLED"
+  | "UNFULFILLABLE";
+
+export type OrderFulfilledBy = "MERCHANT" | "AMAZON";
+
+export type OrdersSyncEvidence = {
+  status: OrdersSyncStatus;
+  failure_class: string | null;
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  pages_fetched: number | null;
+  orders_received: number | null;
+  orders_accepted: number | null;
+  orders_rejected: number | null;
+  items_received: number | null;
+  items_accepted: number | null;
+  items_rejected: number | null;
+  pagination_complete: boolean | null;
+  last_successful_synchronized_at: string | null;
+  next_retry_at: string | null;
+};
+
+export type OrdersSummary = {
+  marketplace_participation_id: string;
+  total_orders: number;
+  cancelled_count: number;
+  business_order_count: number;
+  prime_order_count: number;
+  status_counts: Record<string, number>;
+  // Serialized as a decimal string (never a float). Both are null
+  // together whenever orders in scope span more than one currency —
+  // never silently summed across currencies.
+  order_value_sum: string | null;
+  order_value_currency: string | null;
+  sync: OrdersSyncEvidence;
+};
+
+export type OrderCollectionItem = {
+  id: string;
+  amazon_order_id: string;
+  fulfillment_status: OrderFulfillmentStatus | null;
+  fulfilled_by: OrderFulfilledBy | null;
+  sales_channel_marketplace_name: string | null;
+  is_business_order: boolean;
+  is_prime: boolean;
+  was_cancelled: boolean;
+  order_total_amount: string | null;
+  order_total_currency: string | null;
+  amazon_created_at: string | null;
+  amazon_last_updated_at: string | null;
+  item_count: number;
+};
+
+export type OrderCollectionResponse = {
+  items: OrderCollectionItem[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type OrderItemRow = {
+  id: string;
+  seller_sku: string;
+  asin: string | null;
+  item_name: string | null;
+  condition_type: string | null;
+  quantity_ordered: number;
+  quantity_fulfilled: number | null;
+  quantity_unfulfilled: number | null;
+  unit_price_amount: string | null;
+  unit_price_currency: string | null;
+  item_proceeds_amount: string | null;
+  item_proceeds_currency: string | null;
+};
+
+export type OrderDetail = {
+  id: string;
+  amazon_order_id: string;
+  fulfillment_status: OrderFulfillmentStatus | null;
+  fulfilled_by: OrderFulfilledBy | null;
+  sales_channel_name: string | null;
+  sales_channel_marketplace_id: string | null;
+  sales_channel_marketplace_name: string | null;
+  is_business_order: boolean;
+  is_prime: boolean;
+  was_cancelled: boolean;
+  items_shipped_count: number | null;
+  items_unshipped_count: number | null;
+  order_total_amount: string | null;
+  order_total_currency: string | null;
+  amazon_created_at: string | null;
+  amazon_last_updated_at: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  items: OrderItemRow[];
+};
+
+export type OrdersSyncJobStatus = {
+  run_id: string;
+  run_type: string;
+  status: string;
+  marketplace_participation_ids: string[];
+  pages_fetched: number;
+  orders_received: number;
+  orders_accepted: number;
+  orders_rejected: number;
+  items_received: number;
+  items_accepted: number;
+  items_rejected: number;
+  pagination_complete: boolean;
+  attempt_count: number;
+  queued_at: string;
+  started_at: string | null;
+  last_heartbeat_at: string | null;
+  next_retry_at: string | null;
+  completed_at: string | null;
+  failure_class: string | null;
+};
+
+export type OrdersSyncTriggerResponse = {
+  reason: string;
+  message: string | null;
+  job: OrdersSyncJobStatus | null;
+  retry_allowed_at: string | null;
+};
+

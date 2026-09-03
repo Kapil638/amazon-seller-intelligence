@@ -2576,6 +2576,479 @@ class AmazonIngestionRunRepository:
         self.session.flush()
         return result.rowcount == 1
 
+    # --- 12B.4D: Orders run lifecycle (mirrors the Listings methods above,
+    # regrouped by Orders' coarser (seller_account, region, environment)
+    # scope instead of (seller_account, marketplace_participation)) -------
+
+    def get_latest_orders_run(
+        self, organization_id: UUID, seller_account_id: UUID, region: str, environment: str
+    ) -> AmazonIngestionRun | None:
+        """Mirrors `get_latest_listings_run`'s tie-safe ordering exactly
+        (`_LATEST_LISTINGS_RUN_ORDER_BY` — see that method's docstring for
+        the full reasoning): SQLite's `CURRENT_TIMESTAMP`
+        (`created_at`'s server default there) only has second-level
+        precision, so two rows genuinely created within the same second
+        can tie on `created_at` alone, and `id DESC` alone would compare
+        unrelated UUIDs with no relationship to actual recency. This
+        exact class of bug was already found and fixed once for Listings
+        in production — the identical fix is applied here from the
+        start, not discovered again the same way."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+            )
+            .order_by(*_LATEST_LISTINGS_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_latest_successful_orders_run(
+        self, organization_id: UUID, seller_account_id: UUID, region: str, environment: str
+    ) -> AmazonIngestionRun | None:
+        """Mirrors `get_latest_successful_listings_run`'s ordering: every
+        row here already has `status='succeeded'`, so `started_at` is
+        guaranteed non-null (set at first claim) — no `IS NOT NULL`
+        tie-break trick is needed, `id DESC` is a sufficient final
+        tiebreak for two runs that tied on `started_at` too."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "succeeded",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
+    def get_latest_cooldown_relevant_orders_run(
+        self, organization_id: UUID, seller_account_id: UUID, region: str, environment: str
+    ) -> AmazonIngestionRun | None:
+        """Mirrors `get_latest_cooldown_relevant_listings_run`. There is no
+        `cancelled_before_start` concept for Orders (no operator-cancel
+        method exists for this run_type), so this is currently equivalent
+        to the latest terminal run — kept as its own method for parity
+        with the trigger service and to isolate future divergence. Same
+        tie-safe ordering as `get_latest_orders_run`."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status.in_(("succeeded", "partial", "failed", "timed_out")),
+            )
+            .order_by(*_LATEST_LISTINGS_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_active_orders_run(
+        self, organization_id: UUID, seller_account_id: UUID, region: str, environment: str
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun).where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.region == region,
+                AmazonIngestionRun.environment == environment,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+        ).first()
+
+    def count_queued_orders_runs_for_organization(self, organization_id: UUID) -> int:
+        """Mirrors `count_queued_listings_runs_for_organization`'s own
+        queue-backlog-only (never worker-execution-capacity) semantics."""
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "queued",
+            )
+        )
+        return count or 0
+
+    def heartbeat_orders_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        pages_fetched: int,
+        orders_received: int,
+        orders_accepted: int,
+        orders_rejected: int,
+        items_received: int,
+        items_accepted: int,
+        items_rejected: int,
+        pagination_next_token: str | None,
+    ) -> bool:
+        """Compare-and-set heartbeat/progress update: only succeeds while
+        this exact `lease_owner` still holds the row in `started`. Mirrors
+        `heartbeat_listings_run`, extended with Orders' own counters
+        (`orders_*`/`items_*` — see `AmazonIngestionRun`'s docstring for
+        why these are additive to, not a reuse of, the generic
+        `records_*` columns Listings uses).
+
+        `pages_fetched` is now a run-cumulative count of pages
+        successfully committed across every attempt of this run (seeded
+        from the durable resume point at the start of a resumed attempt),
+        not an attempt-local count reset to zero on every retry — a more
+        honest "current page number" for both `AmazonOrdersReadService`'s
+        public evidence and this method's own durable-pagination
+        bookkeeping.
+
+        `pagination_next_token` (12B.4D remediation) is written on every
+        call, including the periodic in-flight keepalive from
+        `_renew_lease_while_awaiting` — which always passes back whatever
+        value is already current (no new page has been persisted since
+        the last write), making that call idempotent for this column.
+        The caller that just persisted a new page passes that page's own
+        `next_token` (`None` once pagination completes), atomically with
+        the order/item upserts already in the same transaction — this is
+        what "resume from the saved next token, not page one" is built
+        on. See `AmazonIngestionRun.orders_pagination_next_token`'s own
+        docstring for the full threat-model reasoning."""
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_owner == lease_owner,
+            )
+            .values(
+                last_heartbeat_at=func.now(),
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                pages_fetched=pages_fetched,
+                orders_received=orders_received,
+                orders_accepted=orders_accepted,
+                orders_rejected=orders_rejected,
+                items_received=items_received,
+                items_accepted=items_accepted,
+                items_rejected=items_rejected,
+                orders_pagination_next_token=pagination_next_token,
+            )
+        )
+        self.session.flush()
+        return result.rowcount > 0
+
+    def freeze_orders_window_if_needed(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        last_updated_after: datetime,
+        captured_at: datetime,
+    ) -> tuple[datetime, datetime]:
+        """One-time freeze of this run's `lastUpdatedAfter` search-window
+        start and "as of" completeness timestamp (12B.4D remediation —
+        see `AmazonIngestionRun.orders_window_last_updated_after`'s
+        docstring for why this must be frozen, not recomputed, once a
+        pagination token might be reused across attempts).
+
+        Idempotent by construction via `IS NULL` in the `WHERE` clause,
+        not a lease-owner compare-and-set: by the time any caller reaches
+        this, `claim_next_orders_job`'s own claim CAS has already ensured
+        exactly one worker holds this run_id as `started`, and no other
+        code path ever writes these two columns, so there is no
+        concurrent writer to guard against beyond "do not overwrite an
+        already-frozen value." Always returns the authoritative frozen
+        values — the ones this call just wrote, or the ones an earlier
+        attempt of the same run already wrote."""
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.orders_window_last_updated_after.is_(None),
+            )
+            .values(orders_window_last_updated_after=last_updated_after, orders_window_captured_at=captured_at)
+        )
+        self.session.flush()
+        frozen = self.session.execute(
+            select(
+                AmazonIngestionRun.orders_window_last_updated_after,
+                AmazonIngestionRun.orders_window_captured_at,
+            ).where(AmazonIngestionRun.id == run_id, AmazonIngestionRun.organization_id == organization_id)
+        ).one()
+        # SQLite (unlike PostgreSQL) does not round-trip `tzinfo` on a
+        # `DateTime(timezone=True)` column — a value just read back here
+        # is naive but still genuinely UTC (this application never stores
+        # any other zone). Normalize before returning so every caller
+        # gets a tz-aware value regardless of backend, matching the same
+        # pattern already used for checkpoint/lease comparisons elsewhere
+        # in this module.
+        last_updated_after, captured_at = frozen[0], frozen[1]
+        if last_updated_after.tzinfo is None:
+            last_updated_after = last_updated_after.replace(tzinfo=UTC)
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=UTC)
+        return last_updated_after, captured_at
+
+    def reschedule_orders_run_for_retry(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        next_retry_at: datetime,
+        failure_class: str,
+        pages_fetched: int,
+        orders_received: int,
+        orders_accepted: int,
+        orders_rejected: int,
+        items_received: int,
+        items_accepted: int,
+        items_rejected: int,
+        pagination_next_token: str | None,
+    ) -> bool:
+        """Mirrors `reschedule_listings_run_for_retry`: releases the lease
+        and moves the row to `waiting_to_retry`. Compare-and-set on
+        `lease_owner` + `lease_expires_at > now()` so a lease this caller
+        no longer verifiably holds (already reclaimed as `timed_out` by
+        someone else) can never be rescheduled by it.
+
+        `pagination_next_token`/`pages_fetched` (12B.4D remediation): the
+        ordinary case (throttled/transient/malformed-page) preserves
+        whatever durable continuation state the caller already committed
+        per-page — pass the same values back unchanged so a retried
+        attempt resumes exactly where the last committed page left off.
+        The one deliberate exception is a `pagination_token_rejected`
+        failure (Amazon rejected a resumed token, most plausibly because
+        of its documented 24-hour expiry — see
+        `AmazonOrdersIngestionService`'s module docstring): the caller
+        passes `pagination_next_token=None` and `pages_fetched=0` in that
+        case specifically, an explicit, classified, truthfully-recorded
+        fallback to a page-one restart *within the still-frozen window*
+        — never a silent one, and never a full watermark/window recompute
+        (the frozen `orders_window_last_updated_after` is untouched by
+        this method)."""
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="waiting_to_retry",
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                pages_fetched=pages_fetched,
+                orders_received=orders_received,
+                orders_accepted=orders_accepted,
+                orders_rejected=orders_rejected,
+                items_received=items_received,
+                items_accepted=items_accepted,
+                items_rejected=items_rejected,
+                orders_pagination_next_token=pagination_next_token,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def complete_orders_run_as_failed(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        status: str,
+        failure_class: str | None,
+        pages_fetched: int,
+        orders_received: int,
+        orders_accepted: int,
+        orders_rejected: int,
+        items_received: int,
+        items_accepted: int,
+        items_rejected: int,
+        pagination_complete: bool,
+    ) -> bool:
+        """Terminal, non-successful completion (`failed`/`partial`/
+        `timed_out`). Deliberately never accepts `status='succeeded'`:
+        that transition, together with checkpoint advancement, is the
+        sole responsibility of `AmazonIngestionRunMarketplaceParticipation
+        Repository.finalize_successful_orders_run` — see that method's
+        own docstring for why success and checkpoint advancement must
+        never be split into two separately-callable steps.
+
+        Always clears `orders_pagination_next_token` to `NULL` (12B.4D
+        remediation): this run has reached a terminal state, so any
+        continuation token it held is dead — a future retry of this exact
+        scope creates a brand-new run row with its own fresh pagination
+        state, never resumes this one."""
+        if status == "succeeded":
+            raise ValueError("use finalize_successful_orders_run for a successful completion")
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+            )
+            .values(
+                status=status,
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                next_retry_at=None,
+                orders_pagination_next_token=None,
+                failure_class=failure_class,
+                pages_fetched=pages_fetched,
+                orders_received=orders_received,
+                orders_accepted=orders_accepted,
+                orders_rejected=orders_rejected,
+                items_received=items_received,
+                items_accepted=items_accepted,
+                items_rejected=items_rejected,
+                pagination_complete=pagination_complete,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    # Advisory-lock key distinct from `_LISTINGS_CLAIM_ADVISORY_LOCK_KEY`
+    # (847_539_201_663) — two independent workers (Listings, Orders)
+    # claiming concurrently must never serialize against each other's
+    # decision step.
+    _ORDERS_CLAIM_ADVISORY_LOCK_KEY = 847_539_201_664
+
+    def claim_next_orders_job(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        max_global_active: int,
+        max_active_per_organization: int,
+    ) -> AmazonIngestionRun | None:
+        """Worker-side claim: atomically picks at most one eligible Orders
+        job (`queued`, or `waiting_to_retry` whose `next_retry_at` has
+        passed) across *every* organization/seller_account/region/
+        environment scope, subject to global and per-organization
+        concurrency limits, and transitions it to `started`.
+
+        Structurally identical to `claim_next_listings_job` — same
+        stale-reclaim step, same transaction-scoped advisory lock, same
+        single-row `FOR UPDATE SKIP LOCKED` subquery technique, same
+        `started_at`/`retry_count` semantics — grouped by `run_type =
+        'orders'` rather than `'listings'`. `claim_orders_run` (on
+        `AmazonIngestionRunMarketplaceParticipationRepository`) is a
+        different, narrower method: it claims for one already-known exact
+        scope, which is sufficient for a caller that already knows which
+        scope it wants, but cannot discover *any* eligible job across the
+        whole system the way a generic worker poll loop needs to — this
+        method is that discovery step. See `claim_next_listings_job`'s own
+        docstring for the full concurrency-safety reasoning, not repeated
+        here beyond what differs.
+        """
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": self._ORDERS_CLAIM_ADVISORY_LOCK_KEY},
+            )
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        _Global = aliased(AmazonIngestionRun)
+        global_active_count = (
+            select(func.count())
+            .select_from(_Global)
+            .where(_Global.run_type == "orders", _Global.status == "started")
+            .scalar_subquery()
+        )
+        _Org = aliased(AmazonIngestionRun)
+        org_active_count = (
+            select(func.count())
+            .select_from(_Org)
+            .where(
+                _Org.run_type == "orders",
+                _Org.status == "started",
+                _Org.organization_id == AmazonIngestionRun.organization_id,
+            )
+            .scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonIngestionRun.id)
+            .where(
+                AmazonIngestionRun.run_type == "orders",
+                or_(
+                    AmazonIngestionRun.status == "queued",
+                    and_(
+                        AmazonIngestionRun.status == "waiting_to_retry",
+                        AmazonIngestionRun.next_retry_at.is_not(None),
+                        AmazonIngestionRun.next_retry_at <= func.now(),
+                    ),
+                ),
+                global_active_count < max_global_active,
+                org_active_count < max_active_per_organization,
+            )
+            .order_by(
+                func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc(),
+                AmazonIngestionRun.id.asc(),
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+
+        claimed = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(AmazonIngestionRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                last_heartbeat_at=func.now(),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonIngestionRun.started_at, func.now()),
+                retry_count=case(
+                    (AmazonIngestionRun.status == "waiting_to_retry", AmazonIngestionRun.retry_count + 1),
+                    else_=AmazonIngestionRun.retry_count,
+                ),
+            )
+            .returning(AmazonIngestionRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
+
 
 @dataclass(frozen=True)
 class ListingSummaryCounts:
@@ -3445,6 +3918,63 @@ class AmazonIngestionRunMarketplaceParticipationRepository:
             is not None
         )
 
+    def get_latest_orders_run_for_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """12B.4D read-API support: the most recent Orders run that
+        covered this specific participation (any status) — used to build
+        per-participation sync evidence even though an Orders run's own
+        scope is coarser than one participation. Returns `None` if the
+        participation does not belong to `organization_id` or no Orders
+        run has ever covered it."""
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .join(
+                AmazonIngestionRunMarketplaceParticipation,
+                AmazonIngestionRunMarketplaceParticipation.ingestion_run_id == AmazonIngestionRun.id,
+            )
+            .where(
+                AmazonIngestionRunMarketplaceParticipation.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+            )
+            .order_by(*_LATEST_LISTINGS_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_latest_successful_orders_run_for_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """Same tie-safe ordering as
+        `AmazonIngestionRunRepository.get_latest_successful_orders_run`
+        — every matched row already has `status='succeeded'`, so
+        `started_at` is guaranteed non-null."""
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .join(
+                AmazonIngestionRunMarketplaceParticipation,
+                AmazonIngestionRunMarketplaceParticipation.ingestion_run_id == AmazonIngestionRun.id,
+            )
+            .where(
+                AmazonIngestionRunMarketplaceParticipation.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "orders",
+                AmazonIngestionRun.status == "succeeded",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
     def finalize_successful_orders_run(
         self,
         *,
@@ -3520,6 +4050,15 @@ class AmazonIngestionRunMarketplaceParticipationRepository:
                 lease_owner=None,
                 lease_expires_at=None,
                 next_retry_at=None,
+                # 12B.4D remediation: this run has reached a terminal
+                # state — clear the durable continuation token the same
+                # way `complete_orders_run_as_failed` does for the
+                # non-successful terminal path. Pagination is already
+                # known complete by the time this method is ever called
+                # (see `AmazonOrdersIngestionService._finalize`), so this
+                # is normally a no-op write, kept explicit rather than
+                # assumed.
+                orders_pagination_next_token=None,
             )
         )
         self.session.flush()
@@ -3675,6 +4214,50 @@ class AmazonSellerOrderRepository:
         )
         return list(self.session.scalars(statement).all())
 
+    def get_max_last_updated_at_by_participation(
+        self, organization_id: UUID, ingestion_run_id: UUID
+    ) -> dict[UUID, datetime]:
+        """12B.4D remediation: the true highest `amazon_last_updated_at`
+        committed by this specific run, grouped by
+        `marketplace_participation_id` — computed fresh from the database
+        rather than accumulated in memory across a traversal, because a
+        resumed attempt only re-fetches pages *after* its saved resume
+        point and therefore never re-sees orders a prior, interrupted
+        attempt of the *same run* already committed on earlier pages.
+        Every page of every attempt of one run is upserted with the same
+        `last_ingestion_run_id` (see `AmazonOrdersIngestionService.
+        _persist_page`), so this aggregate is correct regardless of how
+        many attempts it took to complete. Internal to ingestion
+        finalization — takes an `ingestion_run_id` directly rather than a
+        caller-supplied participation, so no organization-ownership check
+        is needed beyond the `organization_id` filter already present in
+        the query (this run's own scope was already validated at claim
+        time)."""
+        rows = self.session.execute(
+            select(
+                AmazonSellerOrder.marketplace_participation_id,
+                func.max(AmazonSellerOrder.amazon_last_updated_at),
+            )
+            .join(
+                AmazonMarketplaceParticipation,
+                AmazonMarketplaceParticipation.id == AmazonSellerOrder.marketplace_participation_id,
+            )
+            .where(
+                AmazonSellerOrder.last_ingestion_run_id == ingestion_run_id,
+                AmazonSellerOrder.amazon_last_updated_at.is_not(None),
+                AmazonMarketplaceParticipation.organization_id == organization_id,
+            )
+            .group_by(AmazonSellerOrder.marketplace_participation_id)
+        ).all()
+        # See `freeze_orders_window_if_needed`'s comment: SQLite does not
+        # round-trip `tzinfo` on a `DateTime(timezone=True)` column, so
+        # normalize each aggregate result to stay comparable against the
+        # (already tz-aware) frozen `orders_window_captured_at` value.
+        return {
+            participation_id: (max_updated_at if max_updated_at.tzinfo is not None else max_updated_at.replace(tzinfo=UTC))
+            for participation_id, max_updated_at in rows
+        }
+
     def upsert(
         self,
         *,
@@ -3751,6 +4334,182 @@ class AmazonSellerOrderRepository:
         self.session.add(row)
         self.session.flush()
         return row
+
+    # --- 12B.4D: read API support --------------------------------------
+
+    _ORDERS_SORT_COLUMNS: dict[str, Any] = {
+        "amazon_last_updated_at": AmazonSellerOrder.amazon_last_updated_at,
+        "amazon_created_at": AmazonSellerOrder.amazon_created_at,
+        "order_total_amount": AmazonSellerOrder.order_total_amount,
+    }
+
+    def get_summary_counts(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> "OrdersSummaryCounts | None":
+        """Mirrors `AmazonSellerListingRepository.get_summary_counts`'
+        one-aggregate-query shape."""
+        if AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        ) is None:
+            return None
+
+        row = self.session.execute(
+            select(
+                func.count().label("total"),
+                func.count().filter(AmazonSellerOrder.was_cancelled.is_(True)).label("cancelled"),
+                func.count().filter(AmazonSellerOrder.is_business_order.is_(True)).label("business"),
+                func.count().filter(AmazonSellerOrder.is_prime.is_(True)).label("prime"),
+                # 12B.4D remediation: excludes any row whose amount is
+                # known but currency is not — summing an amount with an
+                # unknown currency into a total the caller then labels
+                # with *some other* known currency would misrepresent
+                # that unknown-currency amount as if it were in that
+                # currency. `AmazonOrdersReadService.get_summary`'s own
+                # currency-consistency check (a separate query over
+                # distinct non-null currencies) reasons about exactly
+                # this same excluded set, so the two stay in agreement:
+                # a participation with only one known currency plus one
+                # amount-with-unknown-currency order correctly reports
+                # that one known currency's true total, never a total
+                # silently inflated by the unknown-currency amount.
+                func.coalesce(
+                    func.sum(AmazonSellerOrder.order_total_amount).filter(
+                        AmazonSellerOrder.order_total_currency.is_not(None)
+                    ),
+                    0,
+                ).label("order_value_sum"),
+            ).where(AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id)
+        ).one()
+
+        status_counts = dict(
+            self.session.execute(
+                select(AmazonSellerOrder.fulfillment_status, func.count())
+                .where(AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id)
+                .group_by(AmazonSellerOrder.fulfillment_status)
+            ).all()
+        )
+
+        return OrdersSummaryCounts(
+            total=row.total,
+            cancelled=row.cancelled,
+            business=row.business,
+            prime=row.prime,
+            order_value_sum=row.order_value_sum,
+            status_counts=status_counts,
+        )
+
+    def list_page(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        search: str | None = None,
+        fulfillment_status: str | None = None,
+        fulfilled_by: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        sort_by: str = "amazon_last_updated_at",
+        sort_dir: str = "desc",
+        offset: int = 0,
+        limit: int = 25,
+    ) -> "tuple[list[AmazonSellerOrder], int] | None":
+        """Validated, filtered, deterministically-ordered orders page,
+        scoped to one organization-owned marketplace participation.
+        Mirrors `AmazonSellerListingRepository.list_page`'s ordering/
+        search/validation conventions exactly (NULLS LAST + `id ASC`
+        tie-break, `_escape_like_term`-sanitized `ILIKE`). `search`
+        matches the Amazon order id directly, or (via an `EXISTS`
+        subquery — order items are a separate table) any item's seller
+        SKU or ASIN on that order."""
+        if AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        ) is None:
+            return None
+        if sort_by not in self._ORDERS_SORT_COLUMNS:
+            raise ValueError(f"Unsupported orders sort field: {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"Unsupported orders sort direction: {sort_dir!r}")
+
+        filters = [AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id]
+        search = (search or "").strip()
+        if search:
+            term = f"%{_escape_like_term(search)}%"
+            item_match = (
+                select(AmazonSellerOrderItem.id)
+                .where(
+                    AmazonSellerOrderItem.order_id == AmazonSellerOrder.id,
+                    or_(
+                        AmazonSellerOrderItem.seller_sku.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                        AmazonSellerOrderItem.asin.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                    ),
+                )
+                .exists()
+            )
+            filters.append(or_(AmazonSellerOrder.amazon_order_id.ilike(term, escape=_LIKE_ESCAPE_CHAR), item_match))
+        if fulfillment_status is not None:
+            filters.append(AmazonSellerOrder.fulfillment_status == fulfillment_status)
+        if fulfilled_by is not None:
+            filters.append(AmazonSellerOrder.fulfilled_by == fulfilled_by)
+        if created_after is not None:
+            filters.append(AmazonSellerOrder.amazon_created_at >= created_after)
+        if created_before is not None:
+            filters.append(AmazonSellerOrder.amazon_created_at <= created_before)
+
+        total = self.session.scalar(select(func.count()).select_from(AmazonSellerOrder).where(*filters)) or 0
+
+        sort_column = self._ORDERS_SORT_COLUMNS[sort_by]
+        order = (sort_column.desc() if sort_dir == "desc" else sort_column.asc()).nulls_last()
+        statement = (
+            select(AmazonSellerOrder)
+            .where(*filters)
+            .order_by(order, AmazonSellerOrder.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = list(self.session.scalars(statement).all())
+        return rows, int(total)
+
+    def get_order_detail(
+        self, organization_id: UUID, marketplace_participation_id: UUID, order_id: UUID
+    ) -> AmazonSellerOrder | None:
+        """Read-API variant: returns `None` (never raises) for a foreign
+        or nonexistent participation — unlike `_require_participation_in_
+        organization` (used by the ingestion-write paths, where a
+        mismatched participation is an internal caller bug), a read
+        request against someone else's participation id is an ordinary,
+        expected occurrence that must produce the same sanitized
+        not-found result as a genuinely nonexistent order, matching
+        `AmazonSellerListingRepository.get_detail`'s contract."""
+        if AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        ) is None:
+            return None
+        return self.session.scalars(
+            select(AmazonSellerOrder).where(
+                AmazonSellerOrder.id == order_id,
+                AmazonSellerOrder.marketplace_participation_id == marketplace_participation_id,
+            )
+        ).first()
+
+
+@dataclass(frozen=True)
+class OrdersSummaryCounts:
+    """Plain aggregate counts for one marketplace participation's orders.
+    12B.4D read API. Never carries an identifier — purely counts.
+    `order_value_sum` is a plain `Decimal` sum of `order_total_amount`
+    across every order in scope — deliberately not currency-aware (an
+    organization with orders in multiple currencies would sum
+    incompatible units); the read service only surfaces this figure when
+    every order in scope shares one currency, otherwise it is omitted
+    (never silently summed across currencies and presented as one
+    number)."""
+
+    total: int
+    cancelled: int
+    business: int
+    prime: int
+    order_value_sum: Decimal
+    status_counts: dict[str | None, int]
 
 
 class AmazonSellerOrderItemRepository:

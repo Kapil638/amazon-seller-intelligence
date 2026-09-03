@@ -8,7 +8,7 @@ export default async function ProfitModelPage({
 }) {
   const { id } = await params;
   return (
-    <AppShell current="profit">
+    <AppShell current="analytics">
       <SellerProfit modelId={id} />
     </AppShell>
   );

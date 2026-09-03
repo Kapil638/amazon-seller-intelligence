@@ -3,7 +3,7 @@ import { AnalysisHistory } from "@/components/analysis-history";
 
 export default function HistoryPage() {
   return (
-    <AppShell current="history">
+    <AppShell current="activity">
       <AnalysisHistory />
     </AppShell>
   );
