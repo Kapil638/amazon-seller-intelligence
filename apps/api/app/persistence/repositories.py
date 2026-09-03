@@ -1837,16 +1837,38 @@ class AmazonIngestionRunRepository:
     def get_latest_cooldown_relevant_listings_run(
         self, organization_id: UUID, marketplace_participation_id: UUID
     ) -> AmazonIngestionRun | None:
-        """Like `get_latest_listings_run`, but excludes `cancelled_before_
-        start` rows. An administrative cancellation of a job that never
-        started never made an Amazon call and did zero work — the entire
-        point of `terminalize-queued` is to unblock a stuck scope so a
-        real attempt can proceed, so it must never itself impose a fresh
-        cooldown on top of the wait the operator just ended. Every other
-        terminal outcome (`succeeded`, `partial`, `timed_out`, and a
+        """Like `get_latest_listings_run`, but restricted to **terminal**
+        runs (`succeeded`, `partial`, `failed`, `timed_out`) and excluding
+        `cancelled_before_start` rows — mirrors `get_latest_cooldown_
+        relevant_orders_run`'s same terminal-only semantics (its own
+        docstring already says so; this method's status filter had
+        drifted from it). An administrative cancellation of a job that
+        never started never made an Amazon call and did zero work — the
+        entire point of `terminalize-queued` is to unblock a stuck scope
+        so a real attempt can proceed, so it must never itself impose a
+        fresh cooldown on top of the wait the operator just ended. Every
+        other terminal outcome (`succeeded`, `partial`, `timed_out`, and a
         genuine `failed` run that actually made an Amazon call before
         failing) still counts toward the cooldown, because each of those
         represents real, recent Amazon API usage worth pacing against.
+
+        The status restriction is not cosmetic: without it, a `queued` or
+        `started` sibling row — including one a *concurrent* trigger call
+        just created, an instant before this call's own transaction reads
+        it — is misread as "the latest cooldown-relevant run", and its
+        `created_at` (a queued row has no `completed_at` yet, so the
+        anchor falls back to `created_at`) computes a fresh multi-minute
+        cooldown window against a job that has not made any real Amazon
+        call at all. Under concurrent triggers for the same scope this
+        made a losing caller spuriously resolve to `reason="cooldown"`
+        instead of truthfully reporting the winner's job as
+        `"already_running"` — a real production race, not a test-only
+        concern, reproduced under real PostgreSQL by
+        `test_ten_concurrent_triggers_create_at_most_one_job`. Restricting
+        to terminal statuses closes it: a still-`queued`/`started`/
+        `waiting_to_retry` row can never again be mistaken for a genuine,
+        already-completed Amazon attempt.
+
         Same tie-safe ordering as `get_latest_listings_run` — see its
         docstring."""
         return self.session.scalars(
@@ -1855,6 +1877,7 @@ class AmazonIngestionRunRepository:
                 AmazonIngestionRun.organization_id == organization_id,
                 AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
                 AmazonIngestionRun.run_type == "listings",
+                AmazonIngestionRun.status.in_(("succeeded", "partial", "failed", "timed_out")),
                 or_(
                     AmazonIngestionRun.failure_class.is_(None),
                     AmazonIngestionRun.failure_class != "cancelled_before_start",

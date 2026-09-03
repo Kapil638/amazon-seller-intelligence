@@ -43,7 +43,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.orm import Session
 
 from app.amazon.listings_sync import AmazonListingsSyncTriggerService
@@ -320,6 +320,38 @@ class _TriggerOutcome:
     run_id: UUID | None
 
 
+def _diagnostics_message(outcomes: "list[_TriggerOutcome]", engine) -> str:
+    """A failure-only, sanitized summary of a concurrent-trigger run — no
+    organization, seller, connection, participation, or run identifier is
+    ever included, only counts and a same-job boolean. Safe to attach as
+    an assertion message (pytest only renders it when the assertion
+    actually fails)."""
+    reason_counts: dict[str, int] = {}
+    for outcome in outcomes:
+        reason_counts[outcome.reason] = reason_counts.get(outcome.reason, 0) + 1
+
+    non_null_count = sum(1 for o in outcomes if o.run_id is not None)
+    null_count = sum(1 for o in outcomes if o.run_id is None)
+    distinct_non_null_run_ids = {o.run_id for o in outcomes if o.run_id is not None}
+
+    with Session(engine) as session:
+        status_rows = session.execute(
+            select(AmazonIngestionRun.status, func.count())
+            .where(AmazonIngestionRun.run_type == "listings")
+            .group_by(AmazonIngestionRun.status)
+        ).all()
+    status_counts = {status: count for status, count in status_rows}
+
+    return (
+        "outcome reason counts: "
+        f"{reason_counts} | "
+        f"non-null run id outcomes: {non_null_count} (distinct job(s): {len(distinct_non_null_run_ids)}) | "
+        f"null run id outcomes: {null_count} | "
+        f"all non-null outcomes reference the same durable job: {len(distinct_non_null_run_ids) <= 1} | "
+        f"final Listings run counts by status: {status_counts}"
+    )
+
+
 def _trigger_attempt(*, participation_id: UUID, barrier: threading.Barrier, outcomes: list, errors: list, lock) -> None:
     try:
         barrier.wait()
@@ -359,13 +391,14 @@ def test_two_concurrent_triggers_create_at_most_one_job(disposable_engine) -> No
         for t in threads:
             t.join(timeout=15)
 
-        assert errors == []
-        assert len(outcomes) == 2
+        diagnostics = lambda: _diagnostics_message(outcomes, disposable_engine)  # noqa: E731
+        assert errors == [], diagnostics()
+        assert len(outcomes) == 2, diagnostics()
         created_run_ids = {o.run_id for o in outcomes if o.reason == "queued"}
-        assert len(created_run_ids) == 1, outcomes
+        assert len(created_run_ids) == 1, diagnostics()
         non_queued = [o for o in outcomes if o.reason != "queued"]
-        assert len(non_queued) == 1
-        assert non_queued[0].reason == "already_running"
+        assert len(non_queued) == 1, diagnostics()
+        assert non_queued[0].reason == "already_running", diagnostics()
 
 
 def test_ten_concurrent_triggers_create_at_most_one_job(disposable_engine) -> None:
@@ -395,11 +428,12 @@ def test_ten_concurrent_triggers_create_at_most_one_job(disposable_engine) -> No
         for t in threads:
             t.join(timeout=20)
 
-        assert errors == []
-        assert len(outcomes) == 10
+        diagnostics = lambda: _diagnostics_message(outcomes, disposable_engine)  # noqa: E731
+        assert errors == [], diagnostics()
+        assert len(outcomes) == 10, diagnostics()
         created_run_ids = {o.run_id for o in outcomes if o.reason == "queued"}
-        assert len(created_run_ids) == 1, outcomes
-        assert all(o.reason in ("queued", "already_running") for o in outcomes)
+        assert len(created_run_ids) == 1, diagnostics()
+        assert all(o.reason in ("queued", "already_running") for o in outcomes), diagnostics()
 
 
 # --- 4: a trigger racing an already-claimed job recognizes it rather than
