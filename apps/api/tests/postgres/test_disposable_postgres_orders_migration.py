@@ -1,4 +1,6 @@
 """12B.4B — Disposable PostgreSQL validation for migration 0012 (remediated).
+Extended (12B.4D remediation) with one test for migration 0013's own
+downgrade-refusal boundary (durable Orders pagination continuation).
 
 Opt-in only. See `_guard.py` for the two conditions that must both hold
 before anything here runs. Written and statically reasoned through
@@ -412,6 +414,68 @@ def test_downgrade_0012_to_0011_refuses_when_orders_data_exists(disposable_engin
             {"id": run_id},
         ).scalar()
     assert still_there == 1
+
+
+# 7b (12B.4D remediation): migration 0013's own downgrade refusal — an
+# in-flight `orders_pagination_next_token` has no representation in
+# 0012's schema, so downgrading while one exists must be refused, never
+# silently dropped (which would strand a resumable run at a page-one
+# restart the next time it's claimed, with no record that anything was
+# lost). Pinned to exactly "0013_orders_durable_pagination" as the
+# upgrade target (== head at authoring time) and "0012_orders_
+# foundation" as the downgrade target, since this test's purpose is
+# specifically the 0013 -> 0012 boundary.
+def test_downgrade_0013_to_0012_refuses_when_pagination_token_in_flight(disposable_engine) -> None:
+    url = _guard.disposable_url()
+    cfg = _alembic_config(url)
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0013_orders_durable_pagination")
+
+    org_id, seller_account_id, connection_id, _ = _seed_org_seller_connection_and_participation(disposable_engine)
+    run_id = uuid4()
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO amazon_ingestion_runs "
+                "(id, organization_id, seller_account_id, marketplace_participation_id, connection_id, run_type, "
+                "domain, region, environment, status, orders_pagination_next_token) "
+                "VALUES (:id, :org_id, :seller_account_id, NULL, :connection_id, 'orders', 'orders', 'na', "
+                "'PRODUCTION', 'started', 'IN-FLIGHT-TOKEN')"
+            ),
+            {"id": run_id, "org_id": org_id, "seller_account_id": seller_account_id, "connection_id": connection_id},
+        )
+
+    with _alembic_environment(url):
+        with pytest.raises(Exception):
+            command.downgrade(cfg, "0012_orders_foundation")
+
+    inspector = inspect(disposable_engine)
+    assert "orders_pagination_next_token" in {
+        col["name"] for col in inspector.get_columns("amazon_ingestion_runs")
+    }
+    with disposable_engine.connect() as conn:
+        still_there = conn.execute(
+            text(
+                "SELECT count(*) FROM amazon_ingestion_runs "
+                "WHERE id = :id AND orders_pagination_next_token = 'IN-FLIGHT-TOKEN'"
+            ),
+            {"id": run_id},
+        ).scalar()
+    assert still_there == 1
+
+    # Clearing the token (the same effect any terminal completion has)
+    # unblocks the downgrade cleanly.
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE amazon_ingestion_runs SET orders_pagination_next_token = NULL WHERE id = :id"),
+            {"id": run_id},
+        )
+    with _alembic_environment(url):
+        command.downgrade(cfg, "0012_orders_foundation")
+    inspector = inspect(disposable_engine)
+    assert "orders_pagination_next_token" not in {
+        col["name"] for col in inspector.get_columns("amazon_ingestion_runs")
+    }
 
 
 # 8: active Orders run uniqueness under REAL PostgreSQL — the coarser

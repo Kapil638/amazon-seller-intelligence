@@ -212,6 +212,82 @@ class Settings(BaseSettings):
         description="Hard cap on the Listings worker's own poll-error backoff delay — see listings_worker_poll_error_base_backoff_seconds.",
     )
 
+    # 12B.4D — durable Orders synchronization job: retry/backoff and
+    # concurrency defaults. Mirrors the Listings settings above in shape,
+    # but Orders' documented searchOrders usage plan (0.0056 req/s, burst
+    # 20 — see docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md) is
+    # roughly 900x tighter than Listings', so the backoff/retry-budget
+    # defaults are deliberately much larger, not copy-pasted.
+    orders_sync_max_attempts: int = Field(
+        default=8, ge=1, le=50,
+        description="Total attempts (first try + retries) before a retryable Orders sync failure becomes the terminal 'rate_limited' outcome. Higher than Listings' default: a single throttle-driven retry cycle can legitimately need many attempts to walk a large backfill.",
+    )
+    orders_sync_base_backoff_seconds: float = Field(
+        default=180.0, gt=0,
+        description="Base delay for bounded exponential backoff with jitter when Amazon gives no usable Retry-After signal on a 429. Anchored near the documented ~178.6s sustained searchOrders interval, not a short generic default — see 12B.4A's rate-limit-implications section.",
+    )
+    orders_sync_max_backoff_seconds: float = Field(
+        default=3600.0, gt=0,
+        description="Hard cap on any single computed retry delay (including a Retry-After value from Amazon), in seconds. Anchored near the documented ~59.5-minute full-burst-refill time.",
+    )
+    orders_sync_max_total_retry_seconds: float = Field(
+        default=14400.0, gt=0,
+        description="Hard cap on total elapsed time (from first attempt) an Orders job may spend retrying before exhausting to a terminal failure. 4 hours — long enough for a multi-hour backfill under sustained throttling, per 12B.4A's own worked example.",
+    )
+    orders_sync_lease_duration_seconds: int = Field(
+        default=300, ge=30, le=3600,
+        description="How long a worker's exclusive claim on an Orders job is valid before it is eligible for stale-lease recovery by another worker. Same value as Listings — lease safety is governed by heartbeat renewal during an in-flight request, not by how long the job as a whole may run.",
+    )
+    orders_sync_heartbeat_time_interval_seconds: float = Field(
+        default=60.0, gt=0,
+        description="Wall-clock cadence at which the lease is renewed WHILE a single page fetch is in flight — see the identical Listings setting's docstring for why this, not a page-count cadence, is the actual lease-safety guarantee. Must stay comfortably below orders_sync_lease_duration_seconds.",
+    )
+    orders_sync_max_global_concurrent_jobs: int = Field(
+        default=4, ge=1, le=100,
+        description="Maximum number of Orders jobs any worker fleet may run simultaneously, across all organizations.",
+    )
+    orders_sync_max_concurrent_jobs_per_organization: int = Field(
+        default=1, ge=1, le=20,
+        description="Maximum number of Orders jobs one organization may run simultaneously.",
+    )
+    orders_sync_trigger_cooldown_seconds: int = Field(
+        default=300, ge=0, le=3600,
+        description="Minimum time after an Orders job's own creation before the trigger endpoint accepts another request for the same (seller_account, region, environment) scope. Mirrors listings_sync_trigger_cooldown_seconds's own production-incident rationale.",
+    )
+    orders_sync_max_queued_per_organization: int = Field(
+        default=10, ge=1, le=1000,
+        description="Queue-backlog safety valve: maximum number of status='queued' Orders jobs one organization may have outstanding at once. Lower than Listings' default since an Orders scope is coarser (one run already covers every included participation).",
+    )
+    orders_sync_default_lookback_days: int = Field(
+        default=30, ge=1, le=730,
+        description="Product-default initial-sync lookback window for a participation with no prior checkpoint — deliberately far narrower than the API's own 2-year retrieval ceiling (2016+ for JP/AU/SG). See 12B.4A Phase 4 point 1: a capacity ceiling and a product default are separate concepts, never conflated.",
+    )
+    orders_sync_checkpoint_overlap_seconds: int = Field(
+        default=1800, ge=120, le=86400,
+        description="Safety overlap subtracted from a participation's stored watermark before constructing the next lastUpdatedAfter — comfortably larger than the documented mandatory ~2-minute consistency gap, per 12B.4A Phase 4 point 2's 15-30 minute recommendation.",
+    )
+    orders_worker_idle_poll_seconds: float = Field(
+        default=5.0, gt=0, le=300,
+        description="How long the Orders worker sleeps between claim attempts when no eligible job was found.",
+    )
+    orders_worker_poll_error_base_backoff_seconds: float = Field(
+        default=2.0, gt=0,
+        description="Base delay for the Orders worker's own bounded exponential backoff after a recoverable error in the claim/poll step itself (e.g. a database connectivity failure) — mirrors listings_worker_poll_error_base_backoff_seconds.",
+    )
+    orders_worker_poll_error_max_backoff_seconds: float = Field(
+        default=60.0, gt=0,
+        description="Hard cap on the Orders worker's own poll-error backoff delay — see orders_worker_poll_error_base_backoff_seconds.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_orders_worker_poll_error_backoff_bounds(self) -> "Settings":
+        if self.orders_worker_poll_error_base_backoff_seconds > self.orders_worker_poll_error_max_backoff_seconds:
+            raise ValueError(
+                "orders_worker_poll_error_base_backoff_seconds must not exceed "
+                "orders_worker_poll_error_max_backoff_seconds"
+            )
+        return self
+
     @model_validator(mode="after")
     def _validate_listings_worker_poll_error_backoff_bounds(self) -> "Settings":
         # `gt=0` on each field already rules out zero/negative individually;

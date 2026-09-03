@@ -830,6 +830,19 @@ class AmazonIngestionRun(Base):
             "AND region IS NOT NULL AND environment IS NOT NULL AND connection_id IS NOT NULL)",
             name="ck_amazon_ingestion_runs_orders_scope_required",
         ),
+        # 12B.4D remediation (0013) — durable pagination continuation.
+        # These three columns are meaningless outside `run_type='orders'`
+        # (a Listings run's pagination position is never interrupted
+        # across a worker restart in a way that needs a persisted resume
+        # point — see `listings_ingestion.py`), so structurally forbidding
+        # them from ever being set on any other run_type keeps a future
+        # bug from accidentally reusing this storage for something else.
+        CheckConstraint(
+            "run_type = 'orders' OR "
+            "(orders_window_last_updated_after IS NULL AND orders_window_captured_at IS NULL "
+            "AND orders_pagination_next_token IS NULL)",
+            name="ck_amazon_ingestion_runs_orders_pagination_scope_required",
+        ),
         # Single-writer guarantee (12B.3 product decision, widened 12B.3G):
         # at most one *nonterminal* listings run may exist per
         # (seller_account_id, marketplace_participation_id) at a time —
@@ -984,6 +997,72 @@ class AmazonIngestionRun(Base):
     items_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     items_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     items_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 12B.4D remediation (0013) — durable pagination continuation.
+    # `orders_window_last_updated_after`/`orders_window_captured_at` are
+    # written exactly once per run, by whichever attempt first reaches
+    # `AmazonIngestionRunRepository.freeze_orders_window_if_needed`
+    # (idempotent — a later attempt that resumes this run reads the
+    # already-frozen value back rather than recomputing a fresh one).
+    # Freezing this per-run, rather than recomputing it from the
+    # checkpoint on every attempt (12B.4B's original design — see
+    # `AmazonOrdersSyncCheckpoint`'s docstring), is what makes reusing a
+    # still-valid `orders_pagination_next_token` across attempts safe:
+    # Amazon's pinned contract requires "all other parameters [to] be
+    # provided with the same values that were provided with the request
+    # that generated this token" for the whole life of one paginated
+    # traversal (`paginationToken`'s 24-hour documented lifetime) — see
+    # `docs/AI_HANDOVER/12B4A_ORDERS_API_CONTRACT_REPORT.md`'s Pagination
+    # section. The *marketplace* half of that same frozen request shape
+    # needs no separate column: it is already immutably fixed by this
+    # run's own membership rows in
+    # `amazon_ingestion_run_marketplace_participations`, which nothing
+    # ever adds to or removes from after creation.
+    orders_window_last_updated_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    orders_window_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # `orders_pagination_next_token` is Amazon's opaque `paginationToken`
+    # for resuming exactly where the last successfully committed page
+    # left off — never a page-1 restart after an interruption. It is
+    # NOT a credential (it grants nothing by itself: redeeming it still
+    # requires a valid LWA access token derived from the real refresh
+    # token, which lives only in `SecretProvider`, never here), but it is
+    # still treated as sensitive-by-convention and kept out of every
+    # public surface:
+    #
+    # Threat model: an actor who can read this column already has raw
+    # database access, and therefore can already see every other column
+    # on this same row and its child rows (the exact frozen search
+    # window, every participation covered, and the already-persisted
+    # orders/items this run produced) — the token adds no NEW visibility
+    # into ASI's own data beyond what that same access already exposes.
+    # Its only incremental capability is being redeemable directly
+    # against Amazon's `searchOrders` endpoint for this account's already-
+    # visible query shape, and only *if* the actor separately also holds
+    # a valid access token — gated entirely by SecretProvider, not by
+    # this column. The realistic worst case of this column leaking on
+    # its own is a nuisance replay against Amazon's own rate limit for
+    # this seller, not a new seller-identity or business-data exposure.
+    # This is why a plain, tightly-scoped private column — not
+    # SecretProvider (whose one-value-per-connection reference format and
+    # narrowly documented "OAuth/token onboarding" purpose this does not
+    # fit — see `app/amazon/secrets.py`'s module docstring) and not a new
+    # encryption dependency (no key-management infrastructure exists in
+    # this codebase to hold such a key safely, so adding one would trade
+    # a well-understood, disciplined-access risk for a new, less-
+    # understood one) — is judged proportionate for this milestone.
+    #
+    # Discipline enforced instead: never selected into any read-service
+    # projection or Pydantic response model (`AmazonOrdersReadService`
+    # never touches this column at all), never interpolated into a log
+    # message, and cleared to `NULL` (not merely left stale) the moment
+    # this run reaches any terminal status — see
+    # `AmazonIngestionRunRepository.finalize_successful_orders_run` and
+    # `.complete_orders_run_as_failed`. `Text`, not a bounded `String`:
+    # unlike `token_reference` (validated against `MAX_SECRET_REFERENCE_
+    # LENGTH` because it is parsed as a structured pointer elsewhere),
+    # this value is opaque and never parsed, so there is no protocol
+    # reason to risk truncating a real Amazon-issued token against an
+    # arbitrary bound.
+    orders_pagination_next_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     organization: Mapped[Organization] = relationship()
