@@ -266,6 +266,41 @@ def test_evidence_cache_key_changes_when_orders_evidence_version_changes() -> No
     assert key_before != key_after
 
 
+def test_evidence_cache_key_defaults_sales_traffic_version_to_none_unaffecting_existing_callers() -> None:
+    """12B.6A — mechanism-ready only: an existing Listings/Orders call
+    site that never passes `sales_traffic_evidence_version` must produce
+    the exact same key as one that passes it explicitly as `None`."""
+    org, participation = uuid4(), uuid4()
+    common = dict(
+        organization_id=org,
+        marketplace_participation_ids=[participation],
+        skill_id="listing_health_prioritizer",
+        skill_version="2.0.0",
+        params={"period_days": 30},
+        listings_evidence_version="none",
+        orders_evidence_version="none",
+    )
+    key_omitted = evidence_cache_key(**common)
+    key_explicit_none = evidence_cache_key(sales_traffic_evidence_version=None, **common)
+    assert key_omitted == key_explicit_none
+
+
+def test_evidence_cache_key_changes_when_sales_traffic_evidence_version_changes() -> None:
+    org, participation = uuid4(), uuid4()
+    common = dict(
+        organization_id=org,
+        marketplace_participation_ids=[participation],
+        skill_id="listing_health_prioritizer",
+        skill_version="2.0.0",
+        params={"period_days": 30},
+        listings_evidence_version="none",
+        orders_evidence_version="none",
+    )
+    key_before = evidence_cache_key(sales_traffic_evidence_version="none|none", **common)
+    key_after = evidence_cache_key(sales_traffic_evidence_version="2026-09-03T00:00:00+00:00|2026-09-01", **common)
+    assert key_before != key_after
+
+
 def test_evidence_cache_key_is_stable_regardless_of_marketplace_id_order() -> None:
     org = uuid4()
     p1, p2 = uuid4(), uuid4()

@@ -92,10 +92,10 @@ def test_alembic_has_a_single_head() -> None:
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0013_orders_durable_pagination"
-    revision = script.get_revision("0013_orders_durable_pagination")
+    assert heads[0] == "0014_sales_traffic_foundation"
+    revision = script.get_revision("0014_sales_traffic_foundation")
     assert revision is not None
-    assert revision.down_revision == "0012_orders_foundation"
+    assert revision.down_revision == "0013_orders_durable_pagination"
 
 
 # Alembic's own bookkeeping table, `alembic_version`, stores the revision
