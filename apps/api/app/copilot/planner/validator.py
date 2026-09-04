@@ -103,6 +103,7 @@ class ExtractedSlots:
         report_id: UUID | None = None,
         marketplace_participation_id: UUID | None = None,
         period_days: int | None = None,
+        force_refresh: bool = False,
     ) -> None:
         self.asin = asin
         self.report_id = report_id
@@ -117,6 +118,10 @@ class ExtractedSlots:
         # currently selected analysis window, never parsed from free
         # text, threaded in from `PlanValidator.validate()`.
         self.period_days = period_days
+        # 12B.5B — "Recompute from saved data," same never-parsed-from-
+        # free-text, threaded-in-explicitly treatment as the two fields
+        # above.
+        self.force_refresh = force_refresh
 
 
 def asin_from_message(user_message: str) -> str | None:
@@ -235,6 +240,8 @@ def _skill_tool_calls(intent: Intent, slots: ExtractedSlots) -> list[ProposedToo
     arguments: dict[str, Any] = {"marketplace_participation_id": str(slots.marketplace_participation_id)}
     if slots.period_days is not None:
         arguments["period_days"] = slots.period_days
+    if slots.force_refresh:
+        arguments["force_refresh"] = True
     if intent == "prioritize_listing_health":
         return [ProposedToolCall(name="prioritize_listing_health", arguments=dict(arguments))]
     if intent == "investigate_non_buyable_listing":
@@ -314,9 +321,11 @@ class PlanValidator:
         planner_prompt_version: str | None,
         marketplace_participation_id: UUID | None = None,
         period_days: int | None = None,
+        force_refresh: bool = False,
     ) -> Plan:
         slots = extract_slots(user_message, compact)
         slots.marketplace_participation_id = marketplace_participation_id
+        slots.force_refresh = force_refresh
         slots.period_days = period_days
         typed_asin = asin_from_message(user_message)
         fallback_intent = infer_fallback_intent(user_message, slots, compact.previous_intent)

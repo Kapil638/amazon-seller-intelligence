@@ -38,14 +38,18 @@ def _service() -> PlannerService:
     return PlannerService(registry=_GuardRegistry(default_registry()))
 
 
-async def _plan(message: str, *, marketplace_participation_id=None):
+async def _plan(message: str, *, marketplace_participation_id=None, period_days=None, force_refresh=False):
     conversations = ConversationService()
     created = conversations.create_conversation()
     service = PlannerService(
         conversations=conversations, registry=_GuardRegistry(default_registry())
     )
     return await service.plan_turn(
-        created.id, message, marketplace_participation_id=marketplace_participation_id
+        created.id,
+        message,
+        marketplace_participation_id=marketplace_participation_id,
+        period_days=period_days,
+        force_refresh=force_refresh,
     )
 
 
@@ -58,6 +62,23 @@ async def test_listing_health_routes_with_marketplace_scope() -> None:
     assert plan.tool_calls[0].name == "prioritize_listing_health"
     assert plan.tool_calls[0].arguments["marketplace_participation_id"] == str(participation_id)
     assert plan.needs_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_threads_into_the_tool_call_arguments() -> None:
+    """12B.5B — "Recompute from saved data." Never on by default (a
+    plain question must not force-bypass the evidence cache), but must
+    reach the tool call exactly when the caller asked for it."""
+    participation_id = uuid4()
+    plain = await _plan("Which listings should I fix first?", marketplace_participation_id=participation_id)
+    assert plain.tool_calls[0].arguments.get("force_refresh") is False
+
+    forced = await _plan(
+        "Which listings should I fix first?",
+        marketplace_participation_id=participation_id,
+        force_refresh=True,
+    )
+    assert forced.tool_calls[0].arguments["force_refresh"] is True
 
 
 @pytest.mark.asyncio

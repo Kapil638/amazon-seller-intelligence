@@ -339,7 +339,7 @@ def test_synthesis_modules_cannot_execute_or_query() -> None:
         assert name not in imported, name
     assert ".execute(" not in source
     assert "copilot_plan" not in SYSTEM_PROMPT
-    assert PROMPT_VERSION == "copilot_synthesize"
+    assert PROMPT_VERSION == "copilot_synthesize_v2"
 
 
 def _rich_report_envelope(*, score: int = 80):
