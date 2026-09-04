@@ -52,8 +52,16 @@ process from the API and is never started implicitly, by design.
 cd apps/api
 cp .env.example .env   # then fill keys locally; never commit .env
 uv sync
-uv run uvicorn app.main:app --reload --port 8000
+ASI_DB_RUNTIME_CONTEXT=api uv run uvicorn app.main:app --reload --port 8000
 ```
+
+`ASI_DB_RUNTIME_CONTEXT=api` authorizes this process to open a
+non-loopback (real remote Postgres/Supabase) database connection — see
+`app/persistence/database.py`'s own module docstring for the full
+production-database guard design. Omitting it is only safe if
+`DATABASE_URL` is SQLite or a local loopback Postgres; against this
+repository's real Supabase `DATABASE_URL`, the API will refuse to open
+a connection without it. `./scripts/dev.sh` already sets this for you.
 
 `apps/api/.env.example` has **empty** credential placeholders only.
 

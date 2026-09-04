@@ -201,7 +201,15 @@ else
   WORKER_CMD=(uv run python -m app.amazon.listings_worker)
 fi
 
-start_child "backend" "$API_DIR" "${BACKEND_CMD[@]}"
+# ASI_DB_RUNTIME_CONTEXT=api authorizes the backend process (only) to
+# open a non-loopback database connection — see
+# `apps/api/app/persistence/database.py`'s own module docstring for the
+# full production-database guard design. Scoped to this one child via
+# `env`, not `export`ed into this script's own shell, so the frontend
+# and worker children below never inherit it (the worker declares its
+# own context internally regardless, after its own separate
+# ASI_LISTINGS_WORKER_ENABLED check).
+start_child "backend" "$API_DIR" env ASI_DB_RUNTIME_CONTEXT=api "${BACKEND_CMD[@]}"
 start_child "frontend" "$WEB_DIR" "${FRONTEND_CMD[@]}"
 
 if [ "$SKIP_WORKER" -eq 0 ]; then

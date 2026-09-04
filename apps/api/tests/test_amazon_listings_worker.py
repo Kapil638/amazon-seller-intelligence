@@ -691,6 +691,50 @@ def test_main_proceeds_past_the_gate_when_explicitly_enabled(monkeypatch, value)
     assert exit_code == EXIT_CONFIGURATION_ERROR  # reached past the gate
 
 
+# --- final safety/bounded-evidence review: production-database guard -------
+# --- runtime-context declaration ---------------------------------------
+
+
+def test_disabled_worker_never_declares_a_db_runtime_context(monkeypatch) -> None:
+    """`app.persistence.database`'s production-database guard is
+    authorized per-process by `ASI_DB_RUNTIME_CONTEXT` — a disabled
+    worker must never set it, matching "fail closed before touching
+    configuration at all" for the database guard's authorization
+    surface too, not just for Settings."""
+    monkeypatch.delenv("ASI_LISTINGS_WORKER_ENABLED", raising=False)
+    monkeypatch.delenv("ASI_DB_RUNTIME_CONTEXT", raising=False)
+    exit_code = main()
+    assert exit_code == EXIT_DISABLED
+    assert os.environ.get("ASI_DB_RUNTIME_CONTEXT") is None
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE"])
+def test_enabled_worker_declares_the_listings_worker_db_runtime_context(monkeypatch, value) -> None:
+    """Proves the real `main()` sets `ASI_DB_RUNTIME_CONTEXT=listings_
+    worker` — the exact declaration `app.persistence.database`'s guard
+    checks — after its own explicit enable gate has passed, and before
+    it reaches Settings/the asyncio loop. Stops at a forced Settings
+    failure (the same technique `test_main_proceeds_past_the_gate_when_
+    explicitly_enabled` uses) so this never spins up the real worker
+    loop."""
+    monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", value)
+    monkeypatch.delenv("ASI_DB_RUNTIME_CONTEXT", raising=False)
+
+    def _raise_invalid(*_args, **_kwargs):
+        raise ValidationError.from_exception_data("Settings", [])
+
+    monkeypatch.setattr("app.amazon.listings_worker.get_settings", _raise_invalid)
+    try:
+        exit_code = main()
+        assert exit_code == EXIT_CONFIGURATION_ERROR
+        assert os.environ.get("ASI_DB_RUNTIME_CONTEXT") == "listings_worker"
+    finally:
+        # `main()` sets this directly via `os.environ[...] = ...`, not
+        # via `monkeypatch` — it must be cleaned up explicitly here or
+        # it would otherwise leak into every later test in the suite.
+        os.environ.pop("ASI_DB_RUNTIME_CONTEXT", None)
+
+
 def test_disabled_worker_log_never_leaks_the_env_var_value(monkeypatch, caplog) -> None:
     monkeypatch.setenv("ASI_LISTINGS_WORKER_ENABLED", "definitely-not-a-real-token-but-should-still-never-appear")
     with caplog.at_level("ERROR", logger="app.amazon.listings_worker"):
