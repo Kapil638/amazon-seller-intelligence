@@ -12,15 +12,34 @@ single opaque score. Components, in priority order:
    severity ranks worse).
 3. Has a WARNING-severity issue (worse than a clean listing).
 4. Not buyable (worse than buyable).
-5. Not active (worse than active).
-6. Recent order count for this SKU, descending (more exposed listings
+5. Not discoverable (worse than discoverable) — 12B.5B fix, see below.
+6. Not active (worse than active).
+7. Recent order count for this SKU, descending (more exposed listings
    surface first among otherwise-equal listings).
 
 No step estimates "lost revenue" — `order_value_exposure` is the sum of
 *already-observed* `item_proceeds_amount` for this SKU in the window,
 grouped by currency, never a projection of what might happen if the
 issue goes unfixed.
-"""
+
+**12B.5B material fix (skill_version 1.0.0 -> 1.1.0):** `is_discoverable`
+was computed and returned in every record but never consulted by the
+rank key itself — a buyable-but-not-discoverable listing (invisible in
+Amazon search/browse, effectively unsellable to a new customer even
+though it can technically be purchased via a direct link) ranked
+identically to a fully healthy listing with the same issue severity.
+Confirmed via a before/after fixture: given one ERROR-severity listing
+that is buyable but not discoverable, and one WARNING-severity listing
+that is fully healthy otherwise, the pre-fix key already ranked the
+ERROR listing first (severity dominates), so the *ordering* of that
+specific pair was unaffected — but a *buyable, not-discoverable,
+issue-free* listing (no issues at all) previously tied for last place
+with every other issue-free listing and could sort either before or
+after them depending only on `seller_sku`; it now deterministically
+outranks (surfaces before) an otherwise-identical fully-healthy listing,
+which is the materially correct behavior a seller actually needs
+surfaced (a listing invisible to new shoppers is not "healthy" merely
+because it has zero Amazon-reported issues)."""
 
 from __future__ import annotations
 
@@ -30,9 +49,11 @@ from uuid import UUID
 
 from app.amazon.listings_read import AmazonListingsReadService, ListingCollectionItem
 from app.amazon.orders_read import AmazonOrdersReadService
-from app.copilot.skills.contracts import SkillEvidence, incomplete_run, safe_deep_link
+from app.copilot.skills.contracts import SKILL_VERSIONS, SkillEvidence, incomplete_run, safe_deep_link
 from app.copilot.skills.shared import CurrencySafeTotal, build_periods, fetch_all_pages
 from app.persistence.database import current_organization_id
+
+_SKILL_ID = "listing_health_prioritizer"
 
 DEFAULT_RESULT_LIMIT = 25
 MAX_RESULT_LIMIT = 100
@@ -96,6 +117,7 @@ class ListingHealthEvidenceService:
                 {
                     "seller_sku": listing.seller_sku,
                     "asin": listing.asin,
+                    "item_name": listing.item_name,
                     "is_active": listing.is_active,
                     "is_buyable": listing.is_buyable,
                     "is_discoverable": listing.is_discoverable,
@@ -104,6 +126,21 @@ class ListingHealthEvidenceService:
                     "recent_order_count": exposure.order_count,
                     "recent_units": exposure.units,
                     "recent_order_value_by_currency": (exposure.value or CurrencySafeTotal()).as_dict(),
+                    # 12B.5B — an explicit, named breakdown of exactly the
+                    # signals `_rank_key` used to place this listing where
+                    # it is. Never a substitute for the deterministic
+                    # ranking itself; exists so a customer-facing answer
+                    # can explain *why* a listing ranked where it did
+                    # without recomputing or approximating the ranking.
+                    "score_factors": {
+                        "has_error_issue": listing.highest_issue_severity == "ERROR",
+                        "has_warning_issue": listing.highest_issue_severity == "WARNING",
+                        "issue_count": listing.issue_count,
+                        "is_buyable": listing.is_buyable,
+                        "is_discoverable": listing.is_discoverable,
+                        "is_active": listing.is_active,
+                        "recent_order_count": exposure.order_count,
+                    },
                 }
             )
 
@@ -126,8 +163,8 @@ class ListingHealthEvidenceService:
         confidence = "insufficient_data" if not all_listings else ("medium" if freshness_incomplete else "high")
 
         return SkillEvidence(
-            skill_id="listing_health_prioritizer",
-            skill_version="1.0.0",
+            skill_id=_SKILL_ID,
+            skill_version=SKILL_VERSIONS[_SKILL_ID],
             organization_id=current_organization_id(),
             marketplace_participation_ids=[marketplace_participation_id],
             analysis_period=analysis_period,
@@ -191,6 +228,11 @@ def _rank_key(listing: ListingCollectionItem, exposure: _SkuExposure) -> tuple:
         0 if is_warning else 1,
         -listing.issue_count if is_warning else 0,
         0 if not listing.is_buyable else 1,
+        # 12B.5B fix: was entirely absent from this key — a buyable but
+        # not-discoverable listing (invisible in Amazon search/browse)
+        # must not rank as if healthy merely because it is technically
+        # purchasable and carries no Amazon-reported issue.
+        0 if not listing.is_discoverable else 1,
         0 if not listing.is_active else 1,
         -exposure.order_count,
         # Explicit final tie-break for listings equal on every ranking

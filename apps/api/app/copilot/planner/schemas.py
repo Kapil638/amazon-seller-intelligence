@@ -76,6 +76,7 @@ class PlannerRequest(CopilotIgnoreExtra):
     available_tools: list[ToolCatalogEntry] = Field(default_factory=list)
     marketplace_participation_id: UUID | None = None
     period_days: int | None = Field(default=None, ge=1, le=90)
+    force_refresh: bool = False
 
 
 class PlanTurnRequest(CopilotIgnoreExtra):
@@ -96,11 +97,18 @@ class PlanTurnRequest(CopilotIgnoreExtra):
     `marketplace_participation_id`. `None` lets each tool apply its own
     default (30 days); the tool's own schema still bounds it to [1, 90]
     regardless of what this field allows through.
+
+    `force_refresh` (12B.5B) is "Recompute from saved data" — bypasses
+    only the evidence-cache *read* for this one turn; it never triggers
+    a Listings/Orders synchronization or calls Amazon, and the fresh
+    result still repopulates the cache for the next caller. Same
+    per-turn, never-persisted treatment as the two fields above.
     """
 
     user_message: str = Field(min_length=1, max_length=8000)
     marketplace_participation_id: UUID | None = None
     period_days: int | None = Field(default=None, ge=1, le=90)
+    force_refresh: bool = False
 
 
 class ApprovedToolCall(BaseModel):

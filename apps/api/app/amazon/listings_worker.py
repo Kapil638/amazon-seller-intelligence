@@ -360,6 +360,14 @@ def main() -> int:
         )
         return EXIT_DISABLED
 
+    # Declares this already-authorized process to `app.persistence.
+    # database`'s production-database guard. Reached only after the
+    # explicit ASI_LISTINGS_WORKER_ENABLED check above has already
+    # passed — this is not a new opt-in surface, merely a declaration
+    # of which already-authorized process is now running, made by the
+    # process itself rather than inferred from an unrelated import.
+    os.environ["ASI_DB_RUNTIME_CONTEXT"] = "listings_worker"
+
     try:
         settings = get_settings()
     except ValidationError:

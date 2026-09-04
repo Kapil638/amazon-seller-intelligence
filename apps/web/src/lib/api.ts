@@ -1068,14 +1068,17 @@ export async function fetchCopilotConversation(
 export async function planCopilotTurn(
   conversationId: string,
   userMessage: string,
-  scope?: { marketplaceParticipationId?: string | null; periodDays?: number | null },
+  scope?: { marketplaceParticipationId?: string | null; periodDays?: number | null; forceRefresh?: boolean },
 ): Promise<CopilotPlan> {
-  const body: Record<string, string | number> = { user_message: userMessage };
+  const body: Record<string, string | number | boolean> = { user_message: userMessage };
   if (scope?.marketplaceParticipationId) {
     body.marketplace_participation_id = scope.marketplaceParticipationId;
   }
   if (scope?.periodDays) {
     body.period_days = scope.periodDays;
+  }
+  if (scope?.forceRefresh) {
+    body.force_refresh = true;
   }
   return copilotRequest<CopilotPlan>(`/conversations/${conversationId}/plan`, {
     method: "POST",

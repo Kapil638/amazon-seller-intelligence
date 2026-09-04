@@ -94,6 +94,7 @@ async def create_conversation_plan(
             payload.user_message,
             marketplace_participation_id=payload.marketplace_participation_id,
             period_days=payload.period_days,
+            force_refresh=payload.force_refresh,
         )
     except Exception as copilot_exc:
         raise _http_error(copilot_exc) from copilot_exc

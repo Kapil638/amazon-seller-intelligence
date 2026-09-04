@@ -11,6 +11,29 @@ Deliberately calls the money metric "order value," never "revenue" or
 the stored contract means them to be (an order/item's own recorded
 total), with no COGS, fees, or ad spend netted out anywhere in this
 schema. Currencies are never summed together or converted.
+
+**12B.5B material fix (skill_version 1.0.0 -> 1.1.0):** percentage
+change was previously reported at any sample size, including a
+misleadingly large swing computed from a handful of orders (e.g. "+100%"
+from 1 order to 2). `MIN_SAMPLE_SIZE_FOR_TREND` — the same threshold
+Cancellation/Operational Anomaly Detector already uses for its own
+minimum-observations rule — now gates whether a percentage change is
+presented as reliable; `sample_size_sufficient_for_trend` is reported
+explicitly so a customer-facing answer can distinguish "orders are up"
+from "not enough orders yet to say."
+
+**Documented limitation, deliberately not built this pass:** a
+"partial-period avoidance" check (detecting whether the *comparison*
+period itself predates when this participation's Orders history began
+being synced, which would make the just-added minimum-sample-size gate
+insufficient on its own — a low comparison-period count caused by an
+incomplete history window looks identical to a genuinely low-volume
+comparison-period count) would need a reliable "earliest synced order
+date" signal. No such signal exists yet on `OrdersSyncEvidence` or
+`AmazonOrdersSyncCheckpoint` cheaply enough to check from this skill's
+existing `AmazonOrdersReadService`-only dependency without either a new
+read-service method or an assumption this milestone was not willing to
+make silently. Flagged here, not solved with a fragile heuristic.
 """
 
 from __future__ import annotations
@@ -19,10 +42,15 @@ from decimal import Decimal
 from uuid import UUID
 
 from app.amazon.orders_read import AmazonOrdersReadService
-from app.copilot.skills.contracts import SkillEvidence, incomplete_run, safe_deep_link
+from app.copilot.skills.contracts import SKILL_VERSIONS, SkillEvidence, incomplete_run, safe_deep_link
 from app.copilot.skills.shared import CurrencySafeTotal, build_periods, percentage_change
 
 TOP_BOTTOM_SKU_LIMIT = 5
+_SKILL_ID = "order_and_sales_trend_analyst"
+# Mirrors CancellationAnomalyEvidenceService.MIN_SAMPLE_SIZE — the same
+# "too few observations to trust a rate/percentage comparison" floor,
+# applied here to order/unit percentage-change reliability.
+MIN_SAMPLE_SIZE_FOR_TREND = 10
 
 
 class OrderTrendEvidenceService:
@@ -49,6 +77,10 @@ class OrderTrendEvidenceService:
 
         order_count_change = percentage_change(current.order_count, previous.order_count)
         unit_count_change = percentage_change(current.units, previous.units)
+        sample_size_sufficient_for_trend = (
+            current.order_count >= MIN_SAMPLE_SIZE_FOR_TREND
+            and previous.order_count >= MIN_SAMPLE_SIZE_FOR_TREND
+        )
 
         fulfillment_distribution: dict[str, int] = {}
         order_seen: set[UUID] = set()
@@ -60,8 +92,10 @@ class OrderTrendEvidenceService:
             fulfillment_distribution[key] = fulfillment_distribution.get(key, 0) + 1
 
         units_by_sku: dict[str, int] = {}
+        item_name_by_sku: dict[str, str | None] = {}
         for row in current_rows:
             units_by_sku[row.seller_sku] = units_by_sku.get(row.seller_sku, 0) + row.quantity_ordered
+            item_name_by_sku.setdefault(row.seller_sku, row.item_name)
         ranked_skus = sorted(units_by_sku.items(), key=lambda pair: (-pair[1], pair[0]))
         top_skus = ranked_skus[:TOP_BOTTOM_SKU_LIMIT]
         bottom_skus = ranked_skus[-TOP_BOTTOM_SKU_LIMIT:] if len(ranked_skus) > TOP_BOTTOM_SKU_LIMIT else []
@@ -89,12 +123,23 @@ class OrderTrendEvidenceService:
             limitations.append(
                 f"{orders_without_items} order(s) in this window have no item rows on record."
             )
+        if not sample_size_sufficient_for_trend:
+            limitations.append(
+                f"Fewer than {MIN_SAMPLE_SIZE_FOR_TREND} orders in the current and/or comparison period — "
+                "the percentage change above is still reported but is not a statistically reliable trend "
+                "signal at this sample size."
+            )
+        limitations.append(
+            "Cannot detect whether the comparison period is only partially covered by this account's "
+            "synced Orders history — a short comparison-period count caused by an incomplete sync window "
+            "would look identical to a genuinely low-volume period in this data."
+        )
 
         freshness_incomplete = incomplete_run(summary.sync.status)
 
         return SkillEvidence(
-            skill_id="order_and_sales_trend_analyst",
-            skill_version="1.0.0",
+            skill_id=_SKILL_ID,
+            skill_version=SKILL_VERSIONS[_SKILL_ID],
             organization_id=_org_id(),
             marketplace_participation_ids=[marketplace_participation_id],
             analysis_period=analysis_period,
@@ -108,16 +153,29 @@ class OrderTrendEvidenceService:
                 "unit_count": current.units,
                 "unit_count_previous_period": previous.units,
                 "unit_count_percentage_change": unit_count_change,
+                "sample_size_sufficient_for_trend": sample_size_sufficient_for_trend,
                 "order_value_by_currency": current.value.as_dict(),
                 "order_value_previous_period_by_currency": previous.value.as_dict(),
                 "fulfillment_status_distribution": fulfillment_distribution,
                 "orders_without_items_count": orders_without_items,
+                # 12B.5B remediation (Section 7): the total distinct-SKU
+                # count this window's top/bottom-`TOP_BOTTOM_SKU_LIMIT`
+                # selection was drawn from — without it, a customer-facing
+                # answer had no honest way to say "top 5 of how many" for
+                # a truncated list.
+                "distinct_sku_count": len(ranked_skus),
             },
             records=[
-                {"kind": "top_sku_by_units", "seller_sku": sku, "units": units} for sku, units in top_skus
+                {"kind": "top_sku_by_units", "seller_sku": sku, "item_name": item_name_by_sku.get(sku), "units": units}
+                for sku, units in top_skus
             ]
             + [
-                {"kind": "bottom_sku_by_units", "seller_sku": sku, "units": units}
+                {
+                    "kind": "bottom_sku_by_units",
+                    "seller_sku": sku,
+                    "item_name": item_name_by_sku.get(sku),
+                    "units": units,
+                }
                 for sku, units in bottom_skus
             ],
             limitations=limitations,

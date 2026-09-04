@@ -96,6 +96,7 @@ class PlannerService:
             planner_prompt_version=PROMPT_VERSION if used_llm else None,
             marketplace_participation_id=request.marketplace_participation_id,
             period_days=request.period_days,
+            force_refresh=request.force_refresh,
         )
         await self._persist(request, plan)
         return plan
@@ -107,6 +108,7 @@ class PlannerService:
         *,
         marketplace_participation_id: UUID | None = None,
         period_days: int | None = None,
+        force_refresh: bool = False,
     ) -> Plan:
         detail = self._conversations.get_conversation(conversation_id)
         request = PlannerRequest(
@@ -116,6 +118,7 @@ class PlannerService:
             available_tools=self._registry.list_tools(),
             marketplace_participation_id=marketplace_participation_id,
             period_days=period_days,
+            force_refresh=force_refresh,
         )
         return await self.create_plan(request)
 

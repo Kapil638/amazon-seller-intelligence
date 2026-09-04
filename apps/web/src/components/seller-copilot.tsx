@@ -130,7 +130,7 @@ export function SellerCopilot() {
   }, [participationId]);
 
   const appendAssistant = useCallback(
-    (response: CopilotSynthesizedResponse, evidenceEnvelopes: CopilotEvidenceEnvelope[]) => {
+    (response: CopilotSynthesizedResponse, evidenceEnvelopes: CopilotEvidenceEnvelope[], originatingQuestion: string) => {
       setMessages((current) => [
         ...current,
         {
@@ -139,6 +139,7 @@ export function SellerCopilot() {
           content: response.summary,
           response,
           skillEvidence: extractSkillEvidence(evidenceEnvelopes),
+          originatingQuestion,
         },
       ]);
     },
@@ -164,7 +165,7 @@ export function SellerCopilot() {
         evidence: execution.evidence,
         compact_context: conversation.compact_context,
       });
-      appendAssistant(response, execution.evidence);
+      appendAssistant(response, execution.evidence, userMessage);
       setEvidence(evidenceCardsFromEnvelopes(execution.evidence));
       setActivity(activityFromExecution(plan, execution.tool_results, { phase: "answered" }));
     },
@@ -179,7 +180,7 @@ export function SellerCopilot() {
   // function only ever attaches the seller's *currently selected* scope
   // — never a guessed or stale one.
   const runTurn = useCallback(
-    async (rawMessage: string) => {
+    async (rawMessage: string, options?: { forceRefresh?: boolean }) => {
       const userMessage = rawMessage.trim();
       if (!userMessage || loading) {
         return;
@@ -198,6 +199,7 @@ export function SellerCopilot() {
         const plan = await planCopilotTurn(conversationId, userMessage, {
           marketplaceParticipationId: participationIdRef.current,
           periodDays: periodDaysRef.current,
+          forceRefresh: options?.forceRefresh,
         });
         setUnderstood(intentLabel(plan.intent));
         setActivity(activityFromPlan(plan));
@@ -222,7 +224,7 @@ export function SellerCopilot() {
             evidence: [],
             compact_context: conversation.compact_context,
           });
-          appendAssistant(response, []);
+          appendAssistant(response, [], userMessage);
           setEvidence([]);
           setActivity(activityFromExecution(plan, [], { phase: "answered" }));
           return;
@@ -403,7 +405,12 @@ export function SellerCopilot() {
                 </div>
               </div>
             ) : (
-              <CopilotMessageList messages={messages} loading={loading} />
+              <CopilotMessageList
+                messages={messages}
+                loading={loading}
+                onRecompute={(question) => void runTurn(question, { forceRefresh: true })}
+                recomputeDisabled={loading}
+              />
             )}
           </Panel>
 

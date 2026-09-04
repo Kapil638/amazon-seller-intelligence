@@ -399,7 +399,13 @@ def _skill_template_response(facts: list[AllowedFact], *, extras: list[str] | No
         recommendations.append("Open this listing in Seller Listings to review Amazon's exact issue text.")
     elif skill_id == "order_and_sales_trend_analyst":
         change = metrics.get("order_count_percentage_change")
-        change_text = "no orders in the comparison period (new activity)" if change is None else f"{change:+.1f}% vs the prior period"
+        sample_sufficient = metrics.get("sample_size_sufficient_for_trend", True)
+        if change is None:
+            change_text = "no orders in the comparison period (new activity)"
+        elif not sample_sufficient:
+            change_text = f"{change:+.1f}% vs the prior period (sample too small for a reliable trend)"
+        else:
+            change_text = f"{change:+.1f}% vs the prior period"
         findings.append(
             f"{metrics.get('order_count', 0)} orders and {metrics.get('unit_count', 0)} units this period "
             f"({change_text})."

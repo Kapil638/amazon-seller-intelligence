@@ -240,6 +240,12 @@ def main() -> int:
         )
         return EXIT_DISABLED
 
+    # Declares this already-authorized process to `app.persistence.
+    # database`'s production-database guard. Reached only after the
+    # explicit ASI_ORDERS_WORKER_ENABLED check above has already
+    # passed — see `listings_worker.main`'s identical comment.
+    os.environ["ASI_DB_RUNTIME_CONTEXT"] = "orders_worker"
+
     try:
         settings = get_settings()
     except ValidationError:

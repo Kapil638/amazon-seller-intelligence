@@ -139,6 +139,12 @@ class ListingCollectionItem(BaseModel):
     id: UUID
     seller_sku: str
     asin: str | None
+    # 12B.5B: additive, already-persisted (`AmazonSellerListing.item_name`)
+    # — added so Copilot's ranked-listing skills can show a seller a
+    # recognizable product title next to a SKU, not the SKU alone.
+    # `None` is unioned in for a draft listing pre-title, matching
+    # `ListingDetail.item_name`'s existing nullability.
+    item_name: str | None = None
     product_type: str | None
     is_active: bool
     is_buyable: bool
@@ -221,6 +227,7 @@ def _collection_item(row: AmazonSellerListing) -> ListingCollectionItem:
         id=row.id,
         seller_sku=row.seller_sku,
         asin=row.asin,
+        item_name=row.item_name,
         product_type=row.product_type,
         is_active=row.is_active,
         is_buyable=row.is_buyable,

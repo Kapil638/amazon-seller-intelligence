@@ -253,17 +253,23 @@ specific provider remains a distinct, later authorization gate.
 ### Runbook
 
 **API service**
-- Command: `uv run uvicorn app.main:app --host 0.0.0.0 --port
-  ${PORT:-8000}` (no `--reload` — that flag is local-development-only).
+- Command: `ASI_DB_RUNTIME_CONTEXT=api uv run uvicorn app.main:app
+  --host 0.0.0.0 --port ${PORT:-8000}` (no `--reload` — that flag is
+  local-development-only). `ASI_DB_RUNTIME_CONTEXT=api` is **required**
+  whenever `DATABASE_URL` is a real remote database — see
+  `apps/api/app/persistence/database.py`'s own module docstring for the
+  production-database guard this authorizes; omitting it fails closed
+  rather than silently connecting.
 - Environment variables required (names only — see `apps/api/.env.example`
   for the complete authoritative list; never commit or paste actual
-  values): `DATABASE_URL`, the SP-API/LWA credential set (sandbox and
-  production/Draft kept separate, per this repo's existing security
-  rules), `AMAZON_SECRET_BACKEND` and its supporting variables,
-  `AMAZON_DEVELOPMENT_SECRET_STORE` (development-only; production
-  requires a real backend, which does not exist yet per this repo's own
-  documented limitations), Supabase Storage credentials, OpenAI
-  credentials, `NEXT_PUBLIC_API_BASE_URL` (frontend-side).
+  values): `DATABASE_URL`, `ASI_DB_RUNTIME_CONTEXT=api`, the SP-API/LWA
+  credential set (sandbox and production/Draft kept separate, per this
+  repo's existing security rules), `AMAZON_SECRET_BACKEND` and its
+  supporting variables, `AMAZON_DEVELOPMENT_SECRET_STORE`
+  (development-only; production requires a real backend, which does not
+  exist yet per this repo's own documented limitations), Supabase
+  Storage credentials, OpenAI credentials, `NEXT_PUBLIC_API_BASE_URL`
+  (frontend-side).
 - Startup/restart policy: standard HTTP-service policy for whatever
   platform is eventually chosen (restart on crash, health check on the
   existing `/` or an equivalent liveness route).
@@ -284,6 +290,11 @@ specific provider remains a distinct, later authorization gate.
   keeps the distinction between "a process authorized to process real
   jobs" and "a process that is not" legible at the environment-config
   level, not just in code.
+- No `ASI_DB_RUNTIME_CONTEXT` needs to be configured for this service —
+  the worker's own `main()` sets it internally (to
+  `"listings_worker"`), and only after the `ASI_LISTINGS_WORKER_ENABLED`
+  check above has already passed. This is not a separate opt-in;
+  nothing to add to this service's environment configuration.
 - Same `DATABASE_URL` and secret configuration as the API service — the
   worker resolves Amazon credentials through the identical
   `SecretProvider`/connection-token-reference path, never a separate

@@ -28,6 +28,7 @@ concurrent worker claim and this operator action mutually exclusive.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from uuid import UUID
 
@@ -51,6 +52,17 @@ def terminalize_queued_listings_job(organization_id: UUID, run_id: UUID, *, reas
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Declares this deliberately-invoked, operator-only maintenance
+    # entry point to `app.persistence.database`'s production-database
+    # guard. This process is never imported or started by accident —
+    # `main()` only ever runs via `if __name__ == "__main__"` below,
+    # invoked directly by an operator supplying required, non-defaulted
+    # arguments. A real remote-database target additionally still
+    # requires the separate ASI_ALLOW_PRODUCTION_DB_ACCESS override —
+    # see that module's own docstring for why "admin" alone is not
+    # sufficient authorization for a production write.
+    os.environ["ASI_DB_RUNTIME_CONTEXT"] = "admin"
+
     parser = argparse.ArgumentParser(
         prog="python -m app.amazon.listings_job_admin",
         description="Operator-only Listings job maintenance actions. No live Amazon call, ever.",

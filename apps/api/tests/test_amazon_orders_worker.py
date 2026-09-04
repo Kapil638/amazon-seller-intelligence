@@ -402,6 +402,47 @@ def test_worker_enabled_env_var_is_independent_of_listings() -> None:
     assert listings_worker_module._WORKER_ENABLED_ENV_VAR != orders_worker_module._WORKER_ENABLED_ENV_VAR
 
 
+# --- final safety/bounded-evidence review: production-database guard -------
+# --- runtime-context declaration ---------------------------------------
+
+
+def test_disabled_worker_never_declares_a_db_runtime_context(monkeypatch) -> None:
+    """`app.persistence.database`'s production-database guard is
+    authorized per-process by `ASI_DB_RUNTIME_CONTEXT` — a disabled
+    worker must never set it, matching "fail closed before touching
+    configuration at all" for the database guard's authorization
+    surface too, not just for Settings."""
+    monkeypatch.delenv("ASI_ORDERS_WORKER_ENABLED", raising=False)
+    monkeypatch.delenv("ASI_DB_RUNTIME_CONTEXT", raising=False)
+    exit_code = main()
+    assert exit_code == EXIT_DISABLED
+    assert os.environ.get("ASI_DB_RUNTIME_CONTEXT") is None
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE"])
+def test_enabled_worker_declares_the_orders_worker_db_runtime_context(monkeypatch, value) -> None:
+    """Proves the real `main()` sets `ASI_DB_RUNTIME_CONTEXT=orders_
+    worker` after its own explicit enable gate has passed, and before it
+    reaches Settings/the asyncio loop. Stops at a forced Settings
+    failure so this never spins up the real worker loop."""
+    monkeypatch.setenv("ASI_ORDERS_WORKER_ENABLED", value)
+    monkeypatch.delenv("ASI_DB_RUNTIME_CONTEXT", raising=False)
+
+    def _raise_invalid(*_args, **_kwargs):
+        raise ValidationError.from_exception_data("Settings", [])
+
+    monkeypatch.setattr("app.amazon.orders_worker.get_settings", _raise_invalid)
+    try:
+        exit_code = main()
+        assert exit_code == EXIT_CONFIGURATION_ERROR
+        assert os.environ.get("ASI_DB_RUNTIME_CONTEXT") == "orders_worker"
+    finally:
+        # `main()` sets this directly via `os.environ[...] = ...`, not
+        # via `monkeypatch` — it must be cleaned up explicitly here or
+        # it would otherwise leak into every later test in the suite.
+        os.environ.pop("ASI_DB_RUNTIME_CONTEXT", None)
+
+
 # --- config validation ------------------------------------------------------
 
 

@@ -9,7 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.copilot.evidence import EvidenceEnvelope
 
-PROMPT_VERSION = "copilot_synthesize"
+# 12B.5B — bumped from "copilot_synthesize": `synthesis/prompts.py`'s
+# SYSTEM_PROMPT gained a stable LAUNCH SKILLS/response-contract block
+# (Phase 6C prompt-prefix design). The final-answer cache keys on this
+# exact string precisely so a pre-bump answer can never be served under
+# a post-bump prompt, or vice versa.
+PROMPT_VERSION = "copilot_synthesize_v2"
 
 Confidence = Literal["high", "medium", "low", "none"]
 SynthesisSource = Literal["synthesis_llm", "template_fallback", "rewritten_citations"]

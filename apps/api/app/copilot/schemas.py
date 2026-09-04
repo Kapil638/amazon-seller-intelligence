@@ -109,6 +109,13 @@ _MAX_PERIOD_DAYS = 90
 class MarketplaceScopedSkillInput(CopilotToolInput):
     marketplace_participation_id: UUID
     period_days: int = Field(default=30, ge=1, le=_MAX_PERIOD_DAYS)
+    # 12B.5B — "Recompute from saved data" (never "Synchronize with
+    # Amazon"): bypasses the evidence-cache *read* only. Still computed
+    # entirely from already-synchronized Listings/Orders rows through
+    # the same read services every other call uses — never triggers a
+    # sync, never calls Amazon. The fresh result still repopulates the
+    # cache for the next caller.
+    force_refresh: bool = False
 
 
 class PrioritizeListingHealthInput(MarketplaceScopedSkillInput):

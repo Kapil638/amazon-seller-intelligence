@@ -378,6 +378,24 @@ describe("SellerCopilot — launch skill cards", () => {
     expect(screen.queryByText(/token_reference|nonce|prioritize_listing_health|skill_id/i)).not.toBeInTheDocument();
   });
 
+  it("recompute from saved data resubmits the same question with force_refresh, never a sync trigger", async () => {
+    render(<SellerCopilot />);
+    await waitForReady();
+
+    fireEvent.click(screen.getByText(SKILL_SUGGESTIONS[0].question));
+    await waitFor(() => expect(screen.getByText("SKU-ERR needs attention first.")).toBeInTheDocument());
+    expect(planCopilotTurn).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByText("Recompute from saved data"));
+
+    await waitFor(() => expect(planCopilotTurn).toHaveBeenCalledTimes(2));
+    expect(planCopilotTurn).toHaveBeenNthCalledWith(2, "conv-1", SKILL_SUGGESTIONS[0].question, {
+      marketplaceParticipationId: US_ID,
+      periodDays: 30,
+      forceRefresh: true,
+    });
+  });
+
   it("disables launch skill cards while a marketplace has not loaded or is not selected", async () => {
     vi.mocked(fetchAmazonConnection).mockResolvedValue(overview({ marketplaces: [] }));
     render(<SellerCopilot />);
