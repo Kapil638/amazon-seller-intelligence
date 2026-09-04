@@ -46,13 +46,54 @@ SkillId = Literal[
 # Bumped only if a skill's metric/record *shape* changes in a way a
 # consumer (frontend card renderer, an eval fixture) would need to know
 # about. Independent per skill so one skill's formula change never forces
-# every other skill's fixtures to be re-reviewed.
+# every other skill's fixtures to be re-reviewed. Each skill module reads
+# its own version from here rather than hardcoding a literal string, so
+# this dict is the single source of truth — including for the evidence
+# cache, which folds `skill_version` into every cache key (a version
+# bump here naturally invalidates every previously-cached entry for that
+# skill, with no separate cache-clearing step required anywhere).
+#
+# 12B.5B remediation correction: an earlier pass bumped all five skills
+# to "2.0.0" on the theory that added fields (item_name, issue_categories,
+# score_factors, failure_category) justified a major bump. On review,
+# most of those additions were presentational — more fields surfaced,
+# nothing about prioritization, classification, confidence, or
+# recommendations actually changed — and a major skill-version bump must
+# never be used merely to invalidate caches. Each skill was re-audited
+# individually; only skills where a genuine, evidence-backed formula
+# change was made and tested got a version bump, and it is a minor bump
+# (1.1.0) reflecting a response-contract change, not a "2.0.0" rewrite:
+#
+# - listing_health_prioritizer -> 1.1.0: `is_discoverable` was previously
+#   computed but never consulted by the rank key; it now participates in
+#   ranking (see listing_health.py's own docstring for the before/after).
+# - non_buyable_listing_investigator -> 1.1.0: added offer-based evidence
+#   (`active_offer_evidence`) and a new possible_explanation branch for
+#   "not buyable, no active offer, no ERROR issue" — previously that case
+#   fell through to a generic observed_fact with no offer signal at all.
+# - order_and_sales_trend_analyst -> 1.1.0: added a minimum-sample-size
+#   gate (`sample_size_sufficient_for_trend`) so a percentage change
+#   computed from a handful of orders is labeled unreliable rather than
+#   presented at face value.
+# - cancellation_operational_anomaly_detector -> 1.1.0 (final safety/
+#   bounded-evidence review, after the 12B.5B remediation above first
+#   confirmed no change was needed): `records` previously listed every
+#   distinct affected SKU with no limit at all — the one skill among
+#   the five with a genuinely unbounded per-record payload. Now bounded
+#   to the top `AFFECTED_SKU_LIMIT` by cancelled-order count, with
+#   `affected_sku_count`/`returned_sku_count`/`sku_list_truncated`
+#   making the truncation explicit. Every aggregate cancellation metric
+#   still reflects the full population, never the truncated list.
+# - listing_risk_by_order_exposure -> 1.1.0: confidence is now capped at
+#   "medium" when at least half of all at-risk listings have no linked
+#   order in the window (`majority_unmatched`) — previously confidence
+#   ignored how much of the exposure picture was actually unmatched.
 SKILL_VERSIONS: dict[str, str] = {
-    "listing_health_prioritizer": "1.0.0",
-    "non_buyable_listing_investigator": "1.0.0",
-    "order_and_sales_trend_analyst": "1.0.0",
-    "cancellation_operational_anomaly_detector": "1.0.0",
-    "listing_risk_by_order_exposure": "1.0.0",
+    "listing_health_prioritizer": "1.1.0",
+    "non_buyable_listing_investigator": "1.1.0",
+    "order_and_sales_trend_analyst": "1.1.0",
+    "cancellation_operational_anomaly_detector": "1.1.0",
+    "listing_risk_by_order_exposure": "1.1.0",
 }
 
 ConfidenceCategory = Literal["high", "medium", "low", "insufficient_data"]
@@ -148,6 +189,47 @@ def incomplete_run(sync_status: str | None) -> bool:
     partial/in-progress run exists" requirement without a second query:
     the sync-evidence status already IS the latest run's status."""
     return sync_status not in (None, "succeeded", "never_synchronized")
+
+
+def listings_evidence_version(sync: ListingsSyncEvidence | None) -> str:
+    """12B.5B — the evidence-cache "version" for a participation's
+    Listings data. Deliberately built from `last_successful_synchronized_
+    at` alone (never `status`): only a genuinely *successful* ingestion
+    can change what a listing row actually contains, so only that should
+    change every cache key derived from it. A transition through
+    `queued`/`started` with no new success yet must not invalidate
+    already-cached evidence — the underlying rows have not changed, and
+    the cache's own TTL (a secondary safeguard, per this milestone's own
+    design) is what bounds how stale an in-progress-but-not-yet-
+    successful sync's absence from the cached evidence can be."""
+    if sync is None or sync.last_successful_synchronized_at is None:
+        return "none"
+    return sync.last_successful_synchronized_at.isoformat()
+
+
+def orders_evidence_version(sync: OrdersSyncEvidence | None) -> str:
+    """Mirrors `listings_evidence_version` for Orders data."""
+    if sync is None or sync.last_successful_synchronized_at is None:
+        return "none"
+    return sync.last_successful_synchronized_at.isoformat()
+
+
+def issue_categories(issues: list[Any]) -> list[str]:
+    """Sorted, deduplicated `Issue.categories` values across a listing's
+    issues — the pinned `searchListingsItems` contract's own
+    classification, never invented here. Safe to surface to a seller:
+    Amazon's own short category labels (e.g. `"IMAGE"`, `"COMPLIANCE"`),
+    never the free-text `message` field (see CLAUDE.md's Amazon Security
+    Rules — Amazon-authored listing issue text is untrusted evidence,
+    never surfaced to the model or a seller as if ASI wrote it)."""
+    found: set[str] = set()
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        for category in issue.get("categories") or []:
+            if isinstance(category, str) and category:
+                found.add(category)
+    return sorted(found)
 
 
 def skill_evidence_to_claims(evidence: SkillEvidence) -> list[EvidenceClaim]:

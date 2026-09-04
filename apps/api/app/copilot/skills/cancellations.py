@@ -17,6 +17,25 @@ a requester or reason.
 
 Anomaly labeling is a documented, configurable, tested threshold rule —
 never a bare rate comparison. See `is_anomalous()`.
+
+**Material fix (skill_version 1.0.0 -> 1.1.0):** `records` previously
+listed *every* distinct SKU present on a cancelled order in the window,
+with no limit at all — a seller with an extreme number of distinct
+cancelled-order SKUs in one window could produce an unbounded evidence
+payload, unlike every other one of the five skills, which all cap their
+per-record output. `AFFECTED_SKU_LIMIT = 25` (matching Listing Health
+Prioritizer's and Listing Risk by Order Exposure's own default result
+limit) now bounds `records` to the top-N SKUs by how many cancelled
+orders each was present on — deterministic, tied-broken by
+`seller_sku` — while `affected_sku_count` (the full matching
+population), `returned_sku_count`, and `sku_list_truncated` make the
+truncation itself explicit rather than silent. Every aggregate
+cancellation metric (`total_orders`, `cancelled_orders`,
+`cancellation_rate`, the previous-period comparison, `is_anomalous`)
+is computed from the full, untruncated order-level query this skill
+already ran — never from the truncated SKU list — so bounding the
+*records* never changes what the skill can honestly claim about the
+*population*.
 """
 
 from __future__ import annotations
@@ -25,7 +44,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from app.amazon.orders_read import AmazonOrdersReadService
-from app.copilot.skills.contracts import SkillEvidence, incomplete_run, safe_deep_link
+from app.copilot.skills.contracts import SKILL_VERSIONS, SkillEvidence, incomplete_run, safe_deep_link
 from app.copilot.skills.shared import build_periods, percentage_change
 
 # Configurable, documented, tested (see tests/test_copilot_skills_evidence.py).
@@ -40,6 +59,11 @@ MIN_SAMPLE_SIZE = 10
 #     comparison-period rate (a 50%+ relative increase, by default).
 ANOMALY_RELATIVE_INCREASE = 1.5
 ANOMALY_FLOOR_RATE = 0.10
+# Matches Listing Health Prioritizer's/Listing Risk by Order Exposure's
+# own `DEFAULT_RESULT_LIMIT` — the same "bounded top-N, never an
+# unbounded per-record list" ceiling applied here to affected SKUs.
+AFFECTED_SKU_LIMIT = 25
+_SKILL_ID = "cancellation_operational_anomaly_detector"
 
 
 @dataclass(frozen=True)
@@ -100,7 +124,10 @@ class CancellationAnomalyEvidenceService:
             else None
         )
 
-        affected_skus = self._affected_skus(marketplace_participation_id, analysis_period)
+        affected_sku_counts = self._affected_sku_cancelled_order_counts(marketplace_participation_id, analysis_period)
+        ranked_skus = sorted(affected_sku_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        top_skus = ranked_skus[:AFFECTED_SKU_LIMIT]
+        sku_list_truncated = len(ranked_skus) > len(top_skus)
 
         limitations = [
             "Cannot explain why an order was cancelled — no free-text reason is stored, only the "
@@ -115,12 +142,19 @@ class CancellationAnomalyEvidenceService:
                 f"Only {current.total_orders} order(s) in this window — too small a sample to call "
                 "any change anomalous."
             )
+        if sku_list_truncated:
+            limitations.append(
+                f"Showing the top {len(top_skus)} of {len(ranked_skus)} affected SKUs, ranked by how "
+                "many cancelled orders each appeared on — this is a prioritized subset, not the full "
+                "affected-SKU population. Every cancellation count/rate above still reflects the full "
+                "population, not just the SKUs shown here."
+            )
 
         freshness_incomplete = incomplete_run(summary.sync.status)
 
         return SkillEvidence(
-            skill_id="cancellation_operational_anomaly_detector",
-            skill_version="1.0.0",
+            skill_id=_SKILL_ID,
+            skill_version=SKILL_VERSIONS[_SKILL_ID],
             organization_id=_org_id(),
             marketplace_participation_ids=[marketplace_participation_id],
             analysis_period=analysis_period,
@@ -140,8 +174,18 @@ class CancellationAnomalyEvidenceService:
                 "minimum_sample_size": MIN_SAMPLE_SIZE,
                 "anomaly_relative_increase_threshold": ANOMALY_RELATIVE_INCREASE,
                 "anomaly_floor_rate": ANOMALY_FLOOR_RATE,
+                # 12B.5B remediation (bounded evidence): the full
+                # matching population and how much of it is actually
+                # returned — never calculable only from `records` once
+                # `records` itself is a truncated top-N subset.
+                "affected_sku_count": len(ranked_skus),
+                "returned_sku_count": len(top_skus),
+                "sku_list_truncated": sku_list_truncated,
             },
-            records=[{"kind": "sku_on_cancelled_order", "seller_sku": sku} for sku in affected_skus],
+            records=[
+                {"kind": "sku_on_cancelled_order", "seller_sku": sku, "cancelled_order_count": count}
+                for sku, count in top_skus
+            ],
             limitations=limitations,
             confidence="insufficient_data" if current.total_orders == 0 else (
                 "medium" if freshness_incomplete else "high"
@@ -167,11 +211,23 @@ class CancellationAnomalyEvidenceService:
         ).total
         return _WindowCancellation(total_orders=total, cancelled_orders=cancelled)
 
-    def _affected_skus(self, marketplace_participation_id: UUID, period) -> list[str]:
+    def _affected_sku_cancelled_order_counts(self, marketplace_participation_id: UUID, period) -> dict[str, int]:
+        """Every distinct SKU present on a cancelled order in this
+        window, mapped to how many *distinct cancelled orders* it
+        appeared on (never a raw item-row count, which could double-
+        count a SKU repeated on one order) — this count is exactly what
+        the top-N ranking in `detect()` sorts by, and is itself
+        returned per-record (`cancelled_order_count`) so the ranking is
+        never opaque."""
         rows = self._orders.list_order_items_for_window(
             marketplace_participation_id, created_after=period.start, created_before=period.end
         )
-        return sorted({row.seller_sku for row in rows if row.order_was_cancelled})
+        orders_by_sku: dict[str, set] = {}
+        for row in rows:
+            if not row.order_was_cancelled:
+                continue
+            orders_by_sku.setdefault(row.seller_sku, set()).add(row.order_id)
+        return {sku: len(order_ids) for sku, order_ids in orders_by_sku.items()}
 
 
 def _org_id() -> UUID:

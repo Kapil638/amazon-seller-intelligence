@@ -235,6 +235,10 @@ class OrderItemWindowRow(BaseModel):
 
     seller_sku: str
     asin: str | None
+    # 12B.5B: additive, already-persisted (`AmazonSellerOrderItem.item_name`)
+    # — lets Copilot's order-trend skill show a recognizable product
+    # title next to a top/bottom SKU, not the SKU alone.
+    item_name: str | None = None
     quantity_ordered: int
     item_proceeds_amount: Decimal | None
     item_proceeds_currency: str | None
@@ -480,6 +484,7 @@ class AmazonOrdersReadService:
                 OrderItemWindowRow(
                     seller_sku=item.seller_sku,
                     asin=item.asin,
+                    item_name=item.item_name,
                     quantity_ordered=item.quantity_ordered,
                     item_proceeds_amount=item.item_proceeds_amount,
                     item_proceeds_currency=item.item_proceeds_currency,

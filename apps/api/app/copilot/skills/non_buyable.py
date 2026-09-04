@@ -32,18 +32,38 @@ from uuid import UUID
 
 from app.amazon.listings_read import AmazonListingsReadService, ListingCollectionItem, ListingDetail
 from app.amazon.orders_read import AmazonOrdersReadService
-from app.copilot.skills.contracts import SkillEvidence, incomplete_run, safe_deep_link
+from app.copilot.skills.contracts import (
+    SKILL_VERSIONS,
+    SkillEvidence,
+    incomplete_run,
+    issue_categories,
+    safe_deep_link,
+)
 from app.copilot.skills.shared import CurrencySafeTotal, build_periods, fetch_all_pages
 from app.core.exceptions import AmazonListingsParticipationNotFoundError, AmazonSellerListingNotFoundError
 from app.core.validation import is_valid_asin, normalize_asin
 from app.persistence.database import current_organization_id
 
 _ERROR = "ERROR"
+_SKILL_ID = "non_buyable_listing_investigator"
 # Seller-facing card copy: "Why are my listings not buyable?" is
 # deliberately plural/general — a seller usually has more than one
 # affected listing, and guessing which one they mean would be a worse
 # experience than a short prioritized list to choose from.
 _CANDIDATE_SELECTION_LIMIT = 10
+
+
+def _failure_category(is_buyable: bool, is_discoverable: bool) -> str:
+    """A plain classification of which of Amazon's two binary status
+    flags are false — never a diagnosis of *why*, since this schema has
+    no root-cause field for either flag."""
+    if not is_buyable and not is_discoverable:
+        return "not_buyable_and_not_discoverable"
+    if not is_buyable:
+        return "not_buyable_only"
+    if not is_discoverable:
+        return "not_discoverable_only"
+    return "buyable_and_discoverable"
 
 
 class ListingNotFoundForInvestigationError(Exception):
@@ -116,6 +136,10 @@ class NonBuyableListingEvidenceService:
                 "error_count": len(errors),
                 "warning_count": len(warnings),
                 "issue_codes": sorted({str(row.get("code")) for row in issues if row.get("code")}),
+                # 12B.5B — Amazon's own short category labels (e.g.
+                # "IMAGE", "COMPLIANCE"), never the free-text `message`
+                # field. See `issue_categories()`'s own docstring.
+                "issue_categories": issue_categories(issues),
             },
             {
                 "kind": "observed_fact",
@@ -125,7 +149,21 @@ class NonBuyableListingEvidenceService:
                 "order_value_by_currency": exposure["value"],
                 "period": analysis_period.label,
             },
+            # 12B.5B material fix (skill_version 1.0.0 -> 1.1.0): `offers`
+            # was fetched (`ListingDetail.offers`) but never inspected —
+            # a missing active offer is one of the most common real
+            # reasons a listing is not buyable (Amazon requires an
+            # active offer/price for a listing to be buyable at all),
+            # and this evidence previously said nothing about it at all,
+            # checking only issue severity.
+            {
+                "kind": "observed_fact",
+                "field": "active_offer_evidence",
+                "has_active_offer": bool(listing.offers),
+                "offer_count": len(listing.offers),
+            },
         ]
+        has_active_offer = bool(listing.offers)
         if not listing.is_buyable and errors:
             records.append(
                 {
@@ -137,13 +175,30 @@ class NonBuyableListingEvidenceService:
                     ),
                 }
             )
-        elif not listing.is_buyable and not errors:
+        elif not listing.is_buyable and not has_active_offer:
+            # Distinct from the issue-based explanation above: this is
+            # not a mere correlation note, but still hedged the same
+            # way, since ASI's own schema has no explicit "this is why"
+            # field from Amazon confirming it for this specific listing.
+            records.append(
+                {
+                    "kind": "possible_explanation",
+                    "note": (
+                        "This listing is not buyable and currently has no active offer on record. "
+                        "Amazon requires an active offer for a listing to be buyable — this is a "
+                        "commonly documented requirement, not a claim specific to this listing's "
+                        "own history."
+                    ),
+                }
+            )
+        elif not listing.is_buyable:
             records.append(
                 {
                     "kind": "observed_fact",
                     "note": (
-                        "This listing is not buyable, but no ERROR-severity issue is currently on "
-                        "record for it — the cause cannot be attributed to any issue in this data."
+                        "This listing is not buyable, but no ERROR-severity issue and no missing "
+                        "active offer is currently on record for it — the cause cannot be attributed "
+                        "to any issue or offer signal in this data."
                     ),
                 }
             )
@@ -159,8 +214,8 @@ class NonBuyableListingEvidenceService:
         )
 
         return SkillEvidence(
-            skill_id="non_buyable_listing_investigator",
-            skill_version="1.0.0",
+            skill_id=_SKILL_ID,
+            skill_version=SKILL_VERSIONS[_SKILL_ID],
             organization_id=current_organization_id(),
             marketplace_participation_ids=[marketplace_participation_id],
             analysis_period=analysis_period,
@@ -175,6 +230,11 @@ class NonBuyableListingEvidenceService:
                 "issue_severity_warning_count": len(warnings),
                 "seller_sku": listing.seller_sku,
                 "asin": listing.asin,
+                "item_name": listing.item_name,
+                # 12B.5B — a plain classification of which flag(s) are
+                # false, never a diagnosis of *why*: Amazon's own two
+                # binary status flags are the only source of truth here.
+                "failure_category": _failure_category(listing.is_buyable, listing.is_discoverable),
             },
             records=records,
             limitations=limitations,
@@ -206,6 +266,7 @@ class NonBuyableListingEvidenceService:
             {
                 "seller_sku": row.seller_sku,
                 "asin": row.asin,
+                "item_name": row.item_name,
                 "issue_count": row.issue_count,
                 "highest_issue_severity": row.highest_issue_severity,
             }
@@ -227,8 +288,8 @@ class NonBuyableListingEvidenceService:
         )
 
         return SkillEvidence(
-            skill_id="non_buyable_listing_investigator",
-            skill_version="1.0.0",
+            skill_id=_SKILL_ID,
+            skill_version=SKILL_VERSIONS[_SKILL_ID],
             organization_id=current_organization_id(),
             marketplace_participation_ids=[marketplace_participation_id],
             analysis_period=analysis_period,
