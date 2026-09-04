@@ -278,6 +278,46 @@ class Settings(BaseSettings):
         default=60.0, gt=0,
         description="Hard cap on the Orders worker's own poll-error backoff delay — see orders_worker_poll_error_base_backoff_seconds.",
     )
+    sales_traffic_sync_lease_duration_seconds: int = Field(
+        default=300, ge=30, le=3600,
+        description="How long a worker's exclusive claim on a Sales and Traffic report job is valid before it is eligible for stale-lease recovery by another worker. Same value as Orders/Listings — see 12B.6A's own durable-polling design (this job releases its claim between polls rather than holding it for the report's full generation time).",
+    )
+    sales_traffic_sync_max_global_concurrent_jobs: int = Field(
+        default=2, ge=1, le=100,
+        description="Maximum number of Sales and Traffic report jobs any worker fleet may run simultaneously, across all organizations. Lower default than Orders — this report type's createReport budget (3 per 5 minutes, shared per seller) is far scarcer than Orders' own rate limit.",
+    )
+    sales_traffic_sync_max_concurrent_jobs_per_organization: int = Field(
+        default=1, ge=1, le=20,
+        description="Maximum number of Sales and Traffic report jobs one organization may run simultaneously.",
+    )
+    sales_traffic_sync_trigger_cooldown_seconds: int = Field(
+        default=300, ge=0, le=3600,
+        description="Minimum time after a Sales and Traffic report job's own creation before the trigger endpoint accepts another request for the same marketplace participation. Deliberately conservative given this report type's own scarce three-per-five-minutes createReport budget (handover doc §1).",
+    )
+    sales_traffic_worker_idle_poll_seconds: float = Field(
+        default=5.0, gt=0, le=300,
+        description="How long the Sales and Traffic worker sleeps between claim attempts when no eligible job was found.",
+    )
+    sales_traffic_worker_poll_error_base_backoff_seconds: float = Field(
+        default=2.0, gt=0,
+        description="Base delay for the Sales and Traffic worker's own bounded exponential backoff after a recoverable error in the claim/poll step itself (e.g. a database connectivity failure) — mirrors orders_worker_poll_error_base_backoff_seconds.",
+    )
+    sales_traffic_worker_poll_error_max_backoff_seconds: float = Field(
+        default=60.0, gt=0,
+        description="Hard cap on the Sales and Traffic worker's own poll-error backoff delay — see sales_traffic_worker_poll_error_base_backoff_seconds.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_sales_traffic_worker_poll_error_backoff_bounds(self) -> "Settings":
+        if (
+            self.sales_traffic_worker_poll_error_base_backoff_seconds
+            > self.sales_traffic_worker_poll_error_max_backoff_seconds
+        ):
+            raise ValueError(
+                "sales_traffic_worker_poll_error_base_backoff_seconds must not exceed "
+                "sales_traffic_worker_poll_error_max_backoff_seconds"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_orders_worker_poll_error_backoff_bounds(self) -> "Settings":
