@@ -10,14 +10,23 @@ export type CopilotChatMessage = {
   content: string;
   response?: CopilotSynthesizedResponse | null;
   skillEvidence?: CopilotSkillEvidence | null;
+  // The exact question that produced this answer — carried only so a
+  // "Recompute from saved data" click can resubmit the identical
+  // question with force_refresh, without guessing or reusing whatever
+  // is currently in the draft textbox.
+  originatingQuestion?: string;
 };
 
 export function CopilotMessageList({
   messages,
   loading,
+  onRecompute,
+  recomputeDisabled,
 }: {
   messages: CopilotChatMessage[];
   loading?: boolean;
+  onRecompute?: (question: string) => void;
+  recomputeDisabled?: boolean;
 }) {
   if (!messages.length && !loading) {
     return null;
@@ -28,7 +37,7 @@ export function CopilotMessageList({
         item.role === "user" ? (
           <UserBubble key={item.id} content={item.content} />
         ) : (
-          <AssistantCard key={item.id} message={item} />
+          <AssistantCard key={item.id} message={item} onRecompute={onRecompute} recomputeDisabled={recomputeDisabled} />
         ),
       )}
       {loading ? (
@@ -50,7 +59,15 @@ function UserBubble({ content }: { content: string }) {
   );
 }
 
-function AssistantCard({ message }: { message: CopilotChatMessage }) {
+function AssistantCard({
+  message,
+  onRecompute,
+  recomputeDisabled,
+}: {
+  message: CopilotChatMessage;
+  onRecompute?: (question: string) => void;
+  recomputeDisabled?: boolean;
+}) {
   const response = message.response;
   if (!response) {
     return (
@@ -60,7 +77,16 @@ function AssistantCard({ message }: { message: CopilotChatMessage }) {
     );
   }
   if (message.skillEvidence) {
-    return <SkillAnswerCard response={response} evidence={message.skillEvidence} />;
+    return (
+      <SkillAnswerCard
+        response={response}
+        evidence={message.skillEvidence}
+        onRecompute={
+          onRecompute && message.originatingQuestion ? () => onRecompute(message.originatingQuestion!) : undefined
+        }
+        recomputeDisabled={recomputeDisabled}
+      />
+    );
   }
   const notice = fallbackNotice(response);
   return (
@@ -130,9 +156,13 @@ const CONFIDENCE_LABEL: Record<string, string> = {
 function SkillAnswerCard({
   response,
   evidence,
+  onRecompute,
+  recomputeDisabled,
 }: {
   response: CopilotSynthesizedResponse;
   evidence: CopilotSkillEvidence;
+  onRecompute?: () => void;
+  recomputeDisabled?: boolean;
 }) {
   const freshness = describeSkillFreshness(evidence);
   // The deterministic template always puts the freshness sentence first
@@ -169,6 +199,16 @@ function SkillAnswerCard({
         <p className="mt-1 text-sm text-muted-foreground">{freshness.line || "Freshness is unknown."}</p>
         {freshness.warning ? (
           <p className="mt-1 text-sm text-amber-700 dark:text-amber-500">{freshness.warning}</p>
+        ) : null}
+        {onRecompute ? (
+          <button
+            type="button"
+            onClick={onRecompute}
+            disabled={recomputeDisabled}
+            className="mt-2 text-sm text-primary underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Recompute from saved data
+          </button>
         ) : null}
       </section>
       <section>
