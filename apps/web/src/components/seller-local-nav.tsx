@@ -9,16 +9,18 @@ const TABS = [
   { href: "/seller", label: "Overview" },
   { href: "/seller/listings", label: "Listings" },
   { href: "/seller/orders", label: "Orders" },
+  { href: "/seller/sales-traffic", label: "Sales & Traffic" },
 ] as const;
 
 /**
  * Page-local navigation inside the Seller Hub (12B.4D Phase 7: Orders is
- * deliberately not a global header tab — it lives here instead).
+ * deliberately not a global header tab — it lives here instead; 12B.6A
+ * adds Sales & Traffic the same way, never as a new top-level tab).
  * Preserves the selected marketplace participation across tabs so
- * switching from Listings to Orders (or back) keeps the same marketplace
- * in view rather than resetting to the default.
+ * switching between them keeps the same marketplace in view rather than
+ * resetting to the default.
  */
-export function SellerLocalNav({ active }: { active: "overview" | "listings" | "orders" }) {
+export function SellerLocalNav({ active }: { active: "overview" | "listings" | "orders" | "sales-traffic" }) {
   const searchParams = useSearchParams();
   const participation = searchParams.get("participation");
 
@@ -28,7 +30,8 @@ export function SellerLocalNav({ active }: { active: "overview" | "listings" | "
         const isActive =
           (active === "overview" && tab.href === "/seller") ||
           (active === "listings" && tab.href === "/seller/listings") ||
-          (active === "orders" && tab.href === "/seller/orders");
+          (active === "orders" && tab.href === "/seller/orders") ||
+          (active === "sales-traffic" && tab.href === "/seller/sales-traffic");
         const href = participation ? `${tab.href}?participation=${encodeURIComponent(participation)}` : tab.href;
         return (
           <Link

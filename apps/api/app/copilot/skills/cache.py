@@ -354,6 +354,7 @@ def evidence_cache_key(
     params: dict[str, Any],
     listings_evidence_version: str | None,
     orders_evidence_version: str | None,
+    sales_traffic_evidence_version: str | None = None,
 ) -> str:
     """Layer A key. `marketplace_participation_ids` is sorted so a
     multi-marketplace call's key never depends on argument order, and a
@@ -361,7 +362,15 @@ def evidence_cache_key(
     marketplace's — every component here is either an opaque id, a
     version string, or an already-normalized parameter (e.g.
     `period_days`), never a raw date/time (see module docstring: TTL,
-    not a literal timestamp, bounds "now"-sensitivity)."""
+    not a literal timestamp, bounds "now"-sensitivity).
+
+    `sales_traffic_evidence_version` defaults to `None` (12B.6A —
+    mechanism-ready only, no launch skill reads Sales and Traffic data
+    yet) so every existing Listings/Orders call site is unaffected; a
+    future skill passes its own version string exactly like the other
+    two domains, and this parameter's presence in the hashed payload
+    means a `None` (mechanism unused) and a real version string can
+    never collide with each other's cache key."""
     payload = {
         "organization_id": str(organization_id),
         "marketplace_participation_ids": sorted(str(item) for item in marketplace_participation_ids),
@@ -370,6 +379,7 @@ def evidence_cache_key(
         "params": params,
         "listings_evidence_version": listings_evidence_version,
         "orders_evidence_version": orders_evidence_version,
+        "sales_traffic_evidence_version": sales_traffic_evidence_version,
         "config_version": SKILL_CONFIG_VERSION,
     }
     return _hash_key("skill_evidence", payload)

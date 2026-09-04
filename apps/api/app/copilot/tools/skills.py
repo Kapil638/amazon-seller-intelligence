@@ -32,6 +32,7 @@ from uuid import UUID
 
 from app.amazon.listings_read import AmazonListingsReadService
 from app.amazon.orders_read import AmazonOrdersReadService
+from app.amazon.sales_traffic_read import AmazonSalesTrafficReadService
 from app.copilot.budget import COST_NONE
 from app.copilot.evidence import EvidenceEnvelope, envelope
 from app.copilot.exceptions import ToolValidationError
@@ -50,6 +51,7 @@ from app.copilot.skills.contracts import (
     SkillEvidence,
     listings_evidence_version,
     orders_evidence_version,
+    sales_traffic_evidence_version,
     skill_evidence_to_claims,
 )
 from app.copilot.skills.listing_health import ListingHealthEvidenceService
@@ -69,16 +71,21 @@ _EVIDENCE_SINGLE_FLIGHT = SingleFlight()
 
 
 def _evidence_versions(
-    marketplace_participation_id: UUID, *, listings: bool, orders: bool
-) -> tuple[str | None, str | None]:
+    marketplace_participation_id: UUID, *, listings: bool, orders: bool, sales_traffic: bool = False
+) -> tuple[str | None, str | None, str | None]:
     """Cheap, read-only freshness lookup used only to build/validate a
     cache key — never the expensive full listing/order scan a cache hit
     is meant to avoid. Ownership is re-validated here exactly like every
     other read-service call (never trusts the caller's UUID alone);
     `_guarded` translates a foreign/nonexistent scope the same way every
-    other call site in this module already does."""
+    other call site in this module already does.
+
+    `sales_traffic` defaults to `False` — 12B.6A mechanism-ready only, no
+    launch skill passes `sales_traffic=True` yet (see `contracts.py`'s
+    `SkillEvidence.sales_traffic_freshness` docstring)."""
     listings_version = None
     orders_version = None
+    sales_traffic_version = None
     if listings:
         summary = _guarded(lambda: AmazonListingsReadService().get_summary(marketplace_participation_id))
         listings_version = listings_evidence_version(summary.sync)
@@ -95,7 +102,15 @@ def _evidence_versions(
             # case (see e.g. listing_health.py's orders_freshness try/
             # except).
             orders_version = orders_evidence_version(None)
-    return listings_version, orders_version
+    if sales_traffic:
+        try:
+            freshness = AmazonSalesTrafficReadService().get_freshness(marketplace_participation_id)
+            sales_traffic_version = sales_traffic_evidence_version(freshness.sync)
+        except AmazonListingsParticipationNotFoundError:
+            raise
+        except Exception:
+            sales_traffic_version = sales_traffic_evidence_version(None)
+    return listings_version, orders_version, sales_traffic_version
 
 
 def _cached_evidence(
@@ -106,11 +121,12 @@ def _cached_evidence(
     params: dict,
     needs_listings: bool,
     needs_orders: bool,
+    needs_sales_traffic: bool = False,
     compute: Callable[[], SkillEvidence],
     force_refresh: bool = False,
 ) -> SkillEvidence:
-    listings_version, orders_version = _evidence_versions(
-        marketplace_participation_id, listings=needs_listings, orders=needs_orders
+    listings_version, orders_version, sales_traffic_version = _evidence_versions(
+        marketplace_participation_id, listings=needs_listings, orders=needs_orders, sales_traffic=needs_sales_traffic
     )
     key = evidence_cache_key(
         organization_id=current_organization_id(),
@@ -120,6 +136,7 @@ def _cached_evidence(
         params=params,
         listings_evidence_version=listings_version,
         orders_evidence_version=orders_version,
+        sales_traffic_evidence_version=sales_traffic_version,
     )
     return cached_evidence_lookup(
         _EVIDENCE_CACHE, _EVIDENCE_SINGLE_FLIGHT, key=key, compute=compute, force_refresh=force_refresh

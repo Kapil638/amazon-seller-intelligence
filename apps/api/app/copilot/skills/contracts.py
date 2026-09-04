@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.amazon.listings_read import ListingsSyncEvidence
 from app.amazon.orders_read import OrdersSyncEvidence
+from app.amazon.sales_traffic_read import SalesTrafficSyncEvidence
 from app.copilot.evidence import EvidenceClaim, claim
 
 SkillId = Literal[
@@ -168,11 +169,17 @@ class SkillEvidence(BaseModel):
     comparison_period: PeriodWindow | None = None
     listings_freshness: ListingsSyncEvidence | None = None
     orders_freshness: OrdersSyncEvidence | None = None
+    # 12B.6A — mechanism-ready only: no launch skill reads this field yet
+    # (Sales and Traffic skills are a later, not-yet-started slice), but
+    # the shared evidence/cache contract is wired end to end now so a
+    # future skill needs only to populate it, never to touch this module.
+    sales_traffic_freshness: SalesTrafficSyncEvidence | None = None
     # True whenever the *latest* relevant run for this scope is anything
     # other than a clean success or "never run" — i.e. queued, running,
     # waiting_to_retry, failed, partial, or timed_out. Derived directly
-    # from `listings_freshness.status`/`orders_freshness.status`
-    # (whichever this skill actually reads), never a separate query.
+    # from `listings_freshness.status`/`orders_freshness.status`/
+    # `sales_traffic_freshness.status` (whichever this skill actually
+    # reads), never a separate query.
     has_newer_incomplete_run: bool = False
     metrics: dict[str, Any] = Field(default_factory=dict)
     records: list[dict[str, Any]] = Field(default_factory=list)
@@ -212,6 +219,35 @@ def orders_evidence_version(sync: OrdersSyncEvidence | None) -> str:
     if sync is None or sync.last_successful_synchronized_at is None:
         return "none"
     return sync.last_successful_synchronized_at.isoformat()
+
+
+def sales_traffic_evidence_version(sync: SalesTrafficSyncEvidence | None) -> str:
+    """12B.6A — mirrors `listings_evidence_version`/`orders_evidence_
+    version`, with one deliberate difference: Sales and Traffic has *two*
+    independent freshness signals that must each be able to invalidate a
+    cached evidence entry on their own —
+    `last_successful_synchronized_at` (any successful report run, catalog-
+    wide or product-level) and `synced_through_date` (the product-level
+    *daily* checkpoint, which `finalize_successful_sales_traffic_run`
+    only advances for a single-day window — see `sales_traffic_ingestion.
+    py`'s own docstring). A catalog-wide-only run can succeed (advancing
+    `last_successful_synchronized_at`) without ever moving `synced_
+    through_date`, and vice versa is not possible (a checkpoint advance
+    only ever happens inside a successful run), but relying on either
+    signal alone would still miss real cases: a version built from
+    `synced_through_date` alone would not change when a *wider* window's
+    facts are refreshed (no checkpoint movement, but the underlying daily
+    facts for already-covered days may have been overwritten by a more
+    authoritative later fetch). Folding both into one composite string
+    means either kind of genuine progress invalidates the cache; a
+    literal `"none"` half only appears when that specific signal has
+    never fired, so it can never collide with a valid ISO date on the
+    same side."""
+    if sync is None:
+        return "none|none"
+    completed = sync.last_successful_synchronized_at.isoformat() if sync.last_successful_synchronized_at else "none"
+    checkpoint = sync.synced_through_date.isoformat() if sync.synced_through_date else "none"
+    return f"{completed}|{checkpoint}"
 
 
 def issue_categories(issues: list[Any]) -> list[str]:

@@ -60,6 +60,15 @@ import type {
   OrdersSummary,
   OrdersSyncJobStatus,
   OrdersSyncTriggerResponse,
+  SalesTrafficAsinGranularity,
+  SalesTrafficDailyTrendResponse,
+  SalesTrafficDateGranularity,
+  SalesTrafficFreshness,
+  SalesTrafficProductPerformanceResponse,
+  SalesTrafficProductSortField,
+  SalesTrafficSummary,
+  SalesTrafficSyncJobStatus,
+  SalesTrafficSyncTriggerResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1543,6 +1552,164 @@ export async function fetchOrdersSyncStatus(runId: string): Promise<OrdersSyncJo
     return await ordersRequest<OrdersSyncJobStatus>(`/orders/sync/${encodeURIComponent(runId)}`);
   } catch (err) {
     if (err instanceof OrdersApiError && err.kind === "not_found") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+// --- 12B.6A: Sales and Traffic Business Report Read API + Sync Trigger ----
+
+export class SalesTrafficApiError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "not_found" | "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "SalesTrafficApiError";
+  }
+}
+
+async function salesTrafficRequest<T>(path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+  } catch {
+    throw new SalesTrafficApiError(
+      "Sales and Traffic could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new SalesTrafficApiError(detail || "This was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new SalesTrafficApiError(detail || "Sales and Traffic is not configured right now.", "unavailable");
+  }
+  throw new SalesTrafficApiError(detail || "Sales and Traffic could not complete this request.", "unknown");
+}
+
+export async function fetchSalesTrafficSummary(
+  participationId: string,
+  start: string,
+  end: string,
+): Promise<SalesTrafficSummary> {
+  const params = new URLSearchParams({ start, end });
+  return salesTrafficRequest<SalesTrafficSummary>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/sales-traffic/summary?${params.toString()}`,
+  );
+}
+
+export async function fetchSalesTrafficDailyTrend(
+  participationId: string,
+  start: string,
+  end: string,
+): Promise<SalesTrafficDailyTrendResponse> {
+  const params = new URLSearchParams({ start, end });
+  return salesTrafficRequest<SalesTrafficDailyTrendResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/sales-traffic/daily-trend?${params.toString()}`,
+  );
+}
+
+export type SalesTrafficProductQuery = {
+  q?: string;
+  sortBy?: SalesTrafficProductSortField;
+  sortDir?: SortDirection;
+  offset?: number;
+  limit?: number;
+};
+
+export async function fetchSalesTrafficProducts(
+  participationId: string,
+  start: string,
+  end: string,
+  query: SalesTrafficProductQuery = {},
+): Promise<SalesTrafficProductPerformanceResponse> {
+  const params = new URLSearchParams({ start, end });
+  if (query.q) params.set("q", query.q);
+  params.set("sort_by", query.sortBy ?? "ordered_product_sales_amount");
+  params.set("sort_dir", query.sortDir ?? "desc");
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 25));
+  return salesTrafficRequest<SalesTrafficProductPerformanceResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/sales-traffic/products?${params.toString()}`,
+  );
+}
+
+export async function fetchSalesTrafficFreshness(participationId: string): Promise<SalesTrafficFreshness> {
+  return salesTrafficRequest<SalesTrafficFreshness>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/sales-traffic/freshness`,
+  );
+}
+
+export class SalesTrafficSyncError extends Error {
+  constructor(
+    message: string,
+    readonly reason: string | null,
+    readonly kind: "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "SalesTrafficSyncError";
+  }
+}
+
+// Mirrors `triggerOrdersSync`'s own contract exactly: the trigger
+// endpoint enqueues a durable job and returns immediately, so every
+// outcome (queued, already-running, cooldown, scope failure, invalid
+// request) is a normal structured response, not an exception. Only a
+// genuine transport failure or an unparseable response throws.
+export async function triggerSalesTrafficSync(
+  sellerAccountId: string,
+  marketplaceParticipationId: string,
+  dataStartTime: string,
+  dataEndTime: string,
+  options: { dateGranularity?: SalesTrafficDateGranularity; asinGranularity?: SalesTrafficAsinGranularity } = {},
+): Promise<SalesTrafficSyncTriggerResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon/sales-traffic/sync`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        seller_account_id: sellerAccountId,
+        marketplace_participation_id: marketplaceParticipationId,
+        data_start_time: dataStartTime,
+        data_end_time: dataEndTime,
+        date_granularity: options.dateGranularity ?? "DAY",
+        asin_granularity: options.asinGranularity ?? "SKU",
+      }),
+    });
+  } catch {
+    throw new SalesTrafficSyncError("Could not reach the server to start synchronization.", null, "unavailable");
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new SalesTrafficSyncError("Synchronization could not be started.", null, "unknown");
+  }
+
+  if (response.ok) {
+    return body as SalesTrafficSyncTriggerResponse;
+  }
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object") {
+    return detail as SalesTrafficSyncTriggerResponse;
+  }
+  throw new SalesTrafficSyncError("Synchronization could not be started.", null, "unknown");
+}
+
+export async function fetchSalesTrafficSyncStatus(runId: string): Promise<SalesTrafficSyncJobStatus | null> {
+  try {
+    return await salesTrafficRequest<SalesTrafficSyncJobStatus>(`/sales-traffic/sync/${encodeURIComponent(runId)}`);
+  } catch (err) {
+    if (err instanceof SalesTrafficApiError && err.kind === "not_found") {
       return null;
     }
     throw err;
