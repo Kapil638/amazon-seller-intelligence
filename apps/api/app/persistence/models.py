@@ -801,13 +801,53 @@ class AmazonIngestionRun(Base):
             name="ck_amazon_ingestion_runs_status",
         ),
         CheckConstraint(
-            "run_type IN ('marketplace_participations', 'listings', 'orders')",
+            "run_type IN ('marketplace_participations', 'listings', 'orders', 'sales_and_traffic_report')",
             name="ck_amazon_ingestion_runs_run_type",
         ),
         CheckConstraint(
             "run_type <> 'listings' OR "
             "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
             name="ck_amazon_ingestion_runs_listings_scope_required",
+        ),
+        # 12B.6A — a Sales and Traffic report run is scoped exactly like a
+        # Listings run (one participation per run), never like an Orders
+        # run (which can cover several participations at once): the
+        # pinned Reports API contract requires exactly one marketplaceId
+        # per report request (Phase 1) — there is no multi-participation
+        # request shape to represent for this report type at all, so this
+        # reuses the single-participation scope shape rather than the
+        # Orders-style association-table indirection.
+        CheckConstraint(
+            "run_type <> 'sales_and_traffic_report' OR "
+            "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
+            name="ck_amazon_ingestion_runs_sales_traffic_scope_required",
+        ),
+        # 12B.6A — the report-lifecycle columns below are meaningless
+        # outside `run_type='sales_and_traffic_report'` (a Listings/Orders
+        # run has no Amazon report id/document id/processing status to
+        # track), so structurally forbidding them from ever being set on
+        # any other run_type keeps a future bug from reusing this storage
+        # for something else — the exact same discipline already applied
+        # to the Orders pagination columns below.
+        CheckConstraint(
+            "run_type = 'sales_and_traffic_report' OR "
+            "(report_id IS NULL AND report_document_id IS NULL AND report_processing_status IS NULL "
+            "AND report_data_start_time IS NULL AND report_data_end_time IS NULL "
+            "AND report_date_granularity IS NULL AND report_asin_granularity IS NULL)",
+            name="ck_amazon_ingestion_runs_sales_traffic_fields_scope_required",
+        ),
+        CheckConstraint(
+            "report_processing_status IS NULL OR report_processing_status IN "
+            "('IN_QUEUE', 'IN_PROGRESS', 'DONE', 'CANCELLED', 'FATAL')",
+            name="ck_amazon_ingestion_runs_report_processing_status",
+        ),
+        CheckConstraint(
+            "report_date_granularity IS NULL OR report_date_granularity IN ('DAY', 'WEEK', 'MONTH')",
+            name="ck_amazon_ingestion_runs_report_date_granularity",
+        ),
+        CheckConstraint(
+            "report_asin_granularity IS NULL OR report_asin_granularity IN ('PARENT', 'CHILD', 'SKU')",
+            name="ck_amazon_ingestion_runs_report_asin_granularity",
         ),
         # 12B.4B — an Orders run is scoped coarser than a Listings run: one
         # run may cover every active marketplace participation for a given
@@ -884,6 +924,23 @@ class AmazonIngestionRun(Base):
             ),
             sqlite_where=text(
                 "run_type = 'orders' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+        ),
+        # 12B.6A — the Sales and Traffic equivalent of the Listings index
+        # above (same single-participation scope shape, §ck_..._sales_
+        # traffic_scope_required), never the Orders shape: at most one
+        # nonterminal report run may exist per (seller_account,
+        # marketplace_participation) at a time.
+        Index(
+            "uq_amazon_ingestion_runs_active_sales_traffic_scope",
+            "seller_account_id",
+            "marketplace_participation_id",
+            unique=True,
+            postgresql_where=text(
+                "run_type = 'sales_and_traffic_report' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+            sqlite_where=text(
+                "run_type = 'sales_and_traffic_report' AND status IN ('queued', 'started', 'waiting_to_retry')"
             ),
         ),
         # Widens the PK into a composite unique key so amazon_seller_listings
@@ -1063,6 +1120,31 @@ class AmazonIngestionRun(Base):
     # reason to risk truncating a real Amazon-issued token against an
     # arbitrary bound.
     orders_pagination_next_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 12B.6A — Sales and Traffic report lifecycle. `report_id`/
+    # `report_document_id` are durably stored (narrowly reviewed — see
+    # docs/AI_HANDOVER/12B6A_SALES_TRAFFIC_REPORTS.md §2) so a worker
+    # restarted after `createReport` succeeded can resume polling/
+    # downloading the *same* report instead of creating a duplicate one
+    # against this report type's scarce rate-limit budget (three
+    # createReport calls per five minutes, shared across every use of
+    # this report type for the seller). The pre-signed document URL
+    # itself is never stored here or anywhere — it expires within 5
+    # minutes of being issued (pinned contract), so persisting it would
+    # be stale before any restart could use it, independent of the
+    # privacy reasoning that also forbids it.
+    report_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    report_document_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    report_processing_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The exact requested window this run's report covers — never
+    # inferred from `created_at`/`completed_at`, which are this *run's*
+    # own timestamps, not the report's requested data range. See §1a of
+    # the handover doc: `report_data_start_time == report_data_end_time`
+    # for a daily product-level backfill request; a catalog-wide trend
+    # request may span a much wider window in one report.
+    report_data_start_time: Mapped[date | None] = mapped_column(Date(), nullable=True)
+    report_data_end_time: Mapped[date | None] = mapped_column(Date(), nullable=True)
+    report_date_granularity: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    report_asin_granularity: Mapped[str | None] = mapped_column(String(8), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     organization: Mapped[Organization] = relationship()
@@ -1548,6 +1630,321 @@ class AmazonOrdersSyncCheckpoint(Base):
     synced_through_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # No inline ForeignKey() here: the actual constraint is the composite
     # ForeignKeyConstraint in __table_args__ — see the class docstring.
+    last_successful_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AmazonSalesAndTrafficDailyFact(Base):
+    """12B.6A — catalog-wide, dated Sales and Traffic facts
+    (`salesAndTrafficByDate` in the pinned contract). One row per
+    `(marketplace_participation_id, report_date, date_granularity)` —
+    `date_granularity` is part of the natural key because a `WEEK`- or
+    `MONTH`-bucketed row's `report_date` is that period's *start* date,
+    which can collide with an unrelated `DAY`-bucketed row's own date
+    (e.g. a week starting 2026-09-01 and a single day 2026-09-01 are two
+    different facts, never the same row) — see docs/AI_HANDOVER/
+    12B6A_SALES_TRAFFIC_REPORTS.md §1a. This milestone's own worker only
+    ever requests `DAY` granularity (§7 of that doc); the column and
+    constraint still accept `WEEK`/`MONTH` structurally, for an operator-
+    triggered custom report, without this table ever conflating the
+    three.
+
+    Every money field is `Numeric(19, 4)` (matches the precision this
+    repository already established for Orders amounts — see
+    `AmazonSellerOrder`'s own docstring) and travels with exactly one
+    `currency_code` for the whole row: this report's own contract scopes
+    every `Amount` field in one response to a single marketplace, and
+    therefore a single currency, so one column rather than one currency
+    per money field.
+
+    Every percentage field is `Numeric(7, 4)`, `NULL` meaning "Amazon did
+    not return this field" (e.g. every `_b2b` column for a non-B2B
+    seller) and never coerced to `0`. Every percentage field *except*
+    `unit_session_percentage`/`unit_session_percentage_b2b` carries a
+    `CHECK (... BETWEEN 0 AND 100)` — those two are deliberately left
+    unbounded above, because the pinned contract's own schema omits an
+    upper bound for them (a session can result in more than one unit
+    purchased) and its own worked example shows a value of `300.00`; see
+    §3 of the handover doc.
+    """
+
+    __tablename__ = "amazon_sales_traffic_daily_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace_participation_id",
+            "report_date",
+            "date_granularity",
+            name="uq_amazon_sales_traffic_daily_facts_natural_key",
+        ),
+        CheckConstraint(
+            "date_granularity IN ('DAY', 'WEEK', 'MONTH')",
+            name="ck_amazon_sales_traffic_daily_facts_date_granularity",
+        ),
+        CheckConstraint(
+            "refund_rate IS NULL OR refund_rate BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_refund_rate",
+        ),
+        CheckConstraint(
+            "buy_box_percentage IS NULL OR buy_box_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_buy_box_pct",
+        ),
+        CheckConstraint(
+            "buy_box_percentage_b2b IS NULL OR buy_box_percentage_b2b BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_buy_box_pct_b2b",
+        ),
+        CheckConstraint(
+            "order_item_session_percentage IS NULL OR order_item_session_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_item_session_pct",
+        ),
+        CheckConstraint(
+            "order_item_session_percentage_b2b IS NULL OR order_item_session_percentage_b2b BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_item_session_pct_b2b",
+        ),
+        CheckConstraint(
+            "received_negative_feedback_rate IS NULL OR received_negative_feedback_rate BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_daily_facts_neg_feedback_rate",
+        ),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_sales_traffic_daily_facts_last_run_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    report_date: Mapped[date] = mapped_column(Date(), nullable=False)
+    date_granularity: Mapped[str] = mapped_column(String(8), nullable=False)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # --- salesByDate -----------------------------------------------------
+    ordered_product_sales_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    ordered_product_sales_amount_b2b: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    units_ordered: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    units_ordered_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_order_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_order_items_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    average_sales_per_order_item_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    average_sales_per_order_item_amount_b2b: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    average_units_per_order_item: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    average_units_per_order_item_b2b: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    average_selling_price_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    average_selling_price_amount_b2b: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    units_refunded: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    refund_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    claims_granted: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claims_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    shipped_product_sales_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    units_shipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    orders_shipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # --- trafficByDate -----------------------------------------------------
+    browser_page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    buy_box_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    buy_box_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    order_item_session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    order_item_session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    # No upper-bound CHECK — see class docstring.
+    unit_session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    unit_session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    average_offer_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    average_parent_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    feedback_received: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    negative_feedback_received: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    received_negative_feedback_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    # No inline ForeignKey(): the actual constraint is the composite
+    # ForeignKeyConstraint in __table_args__.
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AmazonSalesAndTrafficProductFact(Base):
+    """12B.6A — product-level Sales and Traffic facts
+    (`salesAndTrafficByAsin` in the pinned contract). **Never dated** —
+    each row is a single aggregate over the exact
+    `(request_window_start, request_window_end)` one report request
+    covered, per docs/AI_HANDOVER/12B6A_SALES_TRAFFIC_REPORTS.md §1a's
+    grain conclusion: the pinned schema's `SalesAndTrafficByAsin`
+    definition has no `date` field at all, so no date is ever invented
+    for a row here. A "daily" product fact is simply a row whose
+    `request_window_start == request_window_end` (this milestone's own
+    backfill/incremental shape, §7 of the handover doc) — the table
+    itself makes no such assumption and stores whatever window was
+    actually requested, including a wider one from a future ad-hoc
+    "summarize the whole quarter for this product" report.
+
+    `child_asin`/`seller_sku` are **`NOT NULL` with an empty-string
+    default**, not nullable, specifically so the natural-key `UNIQUE`
+    constraint below actually enforces uniqueness: SQL treats every
+    `NULL` as distinct from every other `NULL` in a unique constraint,
+    which would silently let two idempotent-retry upserts of the same
+    `PARENT`-granularity row (where `childAsin`/`sku` are genuinely
+    absent from Amazon's response, per the pinned contract) both insert
+    successfully as "different" rows. Empty string is a concrete,
+    equal-to-itself value, so the constraint works correctly; a read
+    service must translate `''` back to `None` before this ever reaches
+    an API response (§9 of the handover doc) — this is a storage-layer
+    sentinel only, never a customer-facing value.
+    """
+
+    __tablename__ = "amazon_sales_traffic_product_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace_participation_id",
+            "request_window_start",
+            "request_window_end",
+            "asin_granularity",
+            "parent_asin",
+            "child_asin",
+            "seller_sku",
+            name="uq_amazon_sales_traffic_product_facts_natural_key",
+        ),
+        CheckConstraint(
+            "asin_granularity IN ('PARENT', 'CHILD', 'SKU')",
+            name="ck_amazon_sales_traffic_product_facts_asin_granularity",
+        ),
+        CheckConstraint(
+            "request_window_start <= request_window_end",
+            name="ck_amazon_sales_traffic_product_facts_window_order",
+        ),
+        # Structural proof that the granularity column and the identifier
+        # columns actually agree — a PARENT-granularity row can never
+        # smuggle a child/sku identifier, and a CHILD/SKU-granularity row
+        # can never be missing the identifier its own granularity implies.
+        CheckConstraint(
+            "(asin_granularity = 'PARENT' AND child_asin = '' AND seller_sku = '') OR "
+            "(asin_granularity = 'CHILD' AND child_asin <> '' AND seller_sku = '') OR "
+            "(asin_granularity = 'SKU' AND child_asin <> '' AND seller_sku <> '')",
+            name="ck_amazon_sales_traffic_product_facts_granularity_ids",
+        ),
+        CheckConstraint(
+            "browser_session_percentage IS NULL OR browser_session_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_product_facts_browser_session_pct",
+        ),
+        CheckConstraint(
+            "session_percentage IS NULL OR session_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_product_facts_session_pct",
+        ),
+        CheckConstraint(
+            "page_views_percentage IS NULL OR page_views_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_product_facts_page_views_pct",
+        ),
+        CheckConstraint(
+            "buy_box_percentage IS NULL OR buy_box_percentage BETWEEN 0 AND 100",
+            name="ck_amazon_sales_traffic_product_facts_buy_box_pct",
+        ),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_sales_traffic_product_facts_last_run_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    request_window_start: Mapped[date] = mapped_column(Date(), nullable=False)
+    request_window_end: Mapped[date] = mapped_column(Date(), nullable=False)
+    asin_granularity: Mapped[str] = mapped_column(String(8), nullable=False)
+    parent_asin: Mapped[str] = mapped_column(String(10), nullable=False)
+    child_asin: Mapped[str] = mapped_column(String(10), nullable=False, server_default="")
+    seller_sku: Mapped[str] = mapped_column(String(180), nullable=False, server_default="")
+    item_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # --- salesByAsin -------------------------------------------------------
+    units_ordered: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    units_ordered_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ordered_product_sales_amount: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    ordered_product_sales_amount_b2b: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    total_order_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_order_items_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # --- trafficByAsin -------------------------------------------------------
+    browser_sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sessions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sessions_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    browser_session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    mobile_app_session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    mobile_app_session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    browser_page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mobile_app_page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_views_b2b: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    browser_page_views_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    browser_page_views_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    mobile_app_page_views_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    mobile_app_page_views_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    page_views_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    page_views_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    buy_box_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    buy_box_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    # No upper-bound CHECK — see AmazonSalesAndTrafficDailyFact's docstring.
+    unit_session_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    unit_session_percentage_b2b: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AmazonSalesAndTrafficSyncCheckpoint(Base):
+    """12B.6A — durable, per-participation Sales and Traffic incremental
+    high-water mark, for the *product-level daily* ingestion path only
+    (the expensive, one-report-per-day path — §7 of the handover doc).
+    Mirrors `AmazonOrdersSyncCheckpoint` exactly: one row per
+    `marketplace_participation_id`; absence of a row means "never
+    synced," never a shared/zero default. `synced_through_date` is a
+    bare calendar `Date`, not a timestamp — this report's own grain is
+    whole calendar days, never a moment in time (§1a). No overlap-window
+    policy is baked into the stored value; the ingestion service applies
+    the documented 1-day bounded overlap (§7) when computing the next
+    day to request.
+    """
+
+    __tablename__ = "amazon_sales_traffic_sync_checkpoints"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["last_successful_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_sales_traffic_sync_checkpoints_run_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), primary_key=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    seller_account_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    synced_through_date: Mapped[date | None] = mapped_column(Date(), nullable=True)
     last_successful_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

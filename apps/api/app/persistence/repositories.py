@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -38,6 +38,9 @@ from app.persistence.models import (
     AmazonMarketplaceParticipation,
     AmazonOAuthState,
     AmazonOrdersSyncCheckpoint,
+    AmazonSalesAndTrafficDailyFact,
+    AmazonSalesAndTrafficProductFact,
+    AmazonSalesAndTrafficSyncCheckpoint,
     AmazonSellerAccount,
     AmazonSellerListing,
     AmazonSellerOrder,
@@ -1608,6 +1611,19 @@ class ListingsRunClaim:
     reason: str | None = None  # "already_running" when claimed is False
 
 
+@dataclass(frozen=True)
+class SalesTrafficRunClaim:
+    """Outcome of an atomic Sales and Traffic report-run enqueue/claim
+    attempt — mirrors `ListingsRunClaim` exactly (this run type shares
+    the same single-participation scope shape, never Orders' coarser
+    multi-participation one). Never carries a lease owner, report id,
+    or any identifier beyond what the caller already supplied."""
+
+    claimed: bool
+    run_id: UUID | None = None
+    reason: str | None = None  # "already_running" when claimed is False
+
+
 # Shared by `get_latest_listings_run` and `get_latest_cooldown_relevant_
 # listings_run` — see the former's docstring for why the second key
 # (a boolean expression, never null on either PostgreSQL or SQLite) is
@@ -3071,6 +3087,411 @@ class AmazonIngestionRunRepository:
         ).scalar_one_or_none()
         self.session.flush()
         return claimed
+
+    # --- 12B.6A: Sales and Traffic report run lifecycle ---------------
+    # Scoped exactly like Listings (one participation per run — the
+    # pinned Reports API contract allows exactly one marketplaceId per
+    # report request, docs/AI_HANDOVER/12B6A_SALES_TRAFFIC_REPORTS.md
+    # §1), never like Orders. Deliberately new, dedicated methods
+    # (never a parametrized reuse of the Listings methods above) —
+    # matching this repository's own established discipline of never
+    # touching an already-proven run-type's code path to add a new one.
+
+    _SALES_TRAFFIC_CLAIM_ADVISORY_LOCK_KEY = 847_539_201_665
+
+    def enqueue_sales_traffic_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        region: str,
+        environment: str,
+        connection_id: UUID,
+        data_start_time: date,
+        data_end_time: date,
+        date_granularity: str,
+        asin_granularity: str,
+    ) -> SalesTrafficRunClaim:
+        """Creates a durable `status='queued'` Sales and Traffic report
+        job — no lease, no `createReport` call. A separate worker process
+        claims it later via `claim_next_sales_traffic_job`. Protected by
+        `uq_amazon_ingestion_runs_active_sales_traffic_scope`, so a
+        concurrent enqueue/claim for the same participation fails the
+        same way every other run type's does:
+        `SalesTrafficRunClaim(claimed=False, reason="already_running")`.
+        """
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(organization_id, seller_account_id)
+        if seller_account is None:
+            raise TypeError("Amazon sales traffic run cannot bind a seller account from another organization.")
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon sales traffic run cannot bind a marketplace participation from another organization."
+            )
+        if participation.seller_account_id != seller_account_id:
+            raise TypeError(
+                "Amazon sales traffic run marketplace participation does not belong to the given seller account."
+            )
+        connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+        if connection is None:
+            raise TypeError("Amazon sales traffic run cannot bind a connection from another organization.")
+        if date_granularity not in ("DAY", "WEEK", "MONTH"):
+            raise TypeError(f"Unsupported dateGranularity: {date_granularity!r}")
+        if asin_granularity not in ("PARENT", "CHILD", "SKU"):
+            raise TypeError(f"Unsupported asinGranularity: {asin_granularity!r}")
+        if data_start_time > data_end_time:
+            raise TypeError("Amazon sales traffic run dataStartTime must not be after dataEndTime.")
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        row = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            seller_account_id=seller_account_id,
+            marketplace_participation_id=marketplace_participation_id,
+            run_type="sales_and_traffic_report",
+            domain="sales_and_traffic_report",
+            status="queued",
+            region=region,
+            environment=environment,
+            report_data_start_time=data_start_time,
+            report_data_end_time=data_end_time,
+            report_date_granularity=date_granularity,
+            report_asin_granularity=asin_granularity,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            return SalesTrafficRunClaim(claimed=False, reason="already_running")
+        return SalesTrafficRunClaim(claimed=True, run_id=row.id)
+
+    def get_active_sales_traffic_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+            .order_by(AmazonIngestionRun.created_at.desc())
+            .limit(1)
+        ).first()
+
+    def get_latest_sales_traffic_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+            )
+            .order_by(AmazonIngestionRun.created_at.desc())
+            .limit(1)
+        ).first()
+
+    def get_latest_successful_sales_traffic_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                AmazonIngestionRun.status == "succeeded",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
+    def claim_next_sales_traffic_job(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        max_global_active: int,
+        max_active_per_organization: int,
+    ) -> AmazonIngestionRun | None:
+        """Worker-side claim — identical shape and safety properties to
+        `claim_next_listings_job` (single-row `SKIP LOCKED` candidate,
+        PostgreSQL-only transaction-scoped advisory lock serializing the
+        decision step, stale-`started`-lease reclaim first), using a
+        dedicated advisory-lock key never shared with any other run
+        type's claim method."""
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": self._SALES_TRAFFIC_CLAIM_ADVISORY_LOCK_KEY},
+            )
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        _Global = aliased(AmazonIngestionRun)
+        global_active_count = (
+            select(func.count())
+            .select_from(_Global)
+            .where(_Global.run_type == "sales_and_traffic_report", _Global.status == "started")
+            .scalar_subquery()
+        )
+        _Org = aliased(AmazonIngestionRun)
+        org_active_count = (
+            select(func.count())
+            .select_from(_Org)
+            .where(
+                _Org.run_type == "sales_and_traffic_report",
+                _Org.status == "started",
+                _Org.organization_id == AmazonIngestionRun.organization_id,
+            )
+            .scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonIngestionRun.id)
+            .where(
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                or_(
+                    AmazonIngestionRun.status == "queued",
+                    and_(
+                        AmazonIngestionRun.status == "waiting_to_retry",
+                        AmazonIngestionRun.next_retry_at.is_not(None),
+                        AmazonIngestionRun.next_retry_at <= func.now(),
+                    ),
+                ),
+                global_active_count < max_global_active,
+                org_active_count < max_active_per_organization,
+            )
+            .order_by(
+                func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc(),
+                AmazonIngestionRun.id.asc(),
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+
+        claimed = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(AmazonIngestionRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                last_heartbeat_at=func.now(),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonIngestionRun.started_at, func.now()),
+                retry_count=case(
+                    (AmazonIngestionRun.status == "waiting_to_retry", AmazonIngestionRun.retry_count + 1),
+                    else_=AmazonIngestionRun.retry_count,
+                ),
+            )
+            .returning(AmazonIngestionRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
+
+    def heartbeat_sales_traffic_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        report_id: str | None = None,
+        report_document_id: str | None = None,
+        report_processing_status: str | None = None,
+    ) -> bool:
+        """Extends the lease and durably records report-lifecycle progress
+        (`report_id`/`report_document_id`/`report_processing_status`) for
+        an in-flight run — the exact mechanism that lets a worker
+        restarted mid-poll resume the *same* report instead of calling
+        `createReport` again. Compare-and-set on `(lease_owner, status=
+        'started', lease_expires_at > now())`, identical guarantee to
+        `heartbeat_listings_run`. Passing `None` for any of the three
+        report fields leaves that column's current value unchanged
+        (never overwrites a previously-recorded id with NULL)."""
+        values: dict = {
+            "lease_expires_at": self._lease_expiry_value(lease_duration_seconds),
+            "last_heartbeat_at": func.now(),
+        }
+        if report_id is not None:
+            values["report_id"] = report_id
+        if report_document_id is not None:
+            values["report_document_id"] = report_document_id
+        if report_processing_status is not None:
+            values["report_processing_status"] = report_processing_status
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(**values)
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def reschedule_sales_traffic_run_for_retry(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        next_retry_at: datetime,
+        failure_class: str,
+    ) -> bool:
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="waiting_to_retry",
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def complete_sales_traffic_run_as_failed(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        status: str,
+        failure_class: str | None,
+    ) -> bool:
+        """Terminal, non-successful completion (`failed`/`timed_out`).
+        Deliberately never accepts `status='succeeded'` — see
+        `finalize_successful_sales_traffic_run`'s own docstring for why
+        success and checkpoint advancement must never be split into two
+        separately-callable steps."""
+        if status == "succeeded":
+            raise ValueError("use finalize_successful_sales_traffic_run for a successful completion")
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status=status,
+                completed_at=func.now(),
+                failure_class=failure_class,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def finalize_successful_sales_traffic_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        marketplace_participation_id: UUID,
+        seller_account_id: UUID,
+        synced_through_date: date | None,
+    ) -> bool:
+        """Atomically marks a `started` sales-and-traffic run `succeeded`
+        and, if `synced_through_date` is given (the daily product-level
+        ingestion path only — never for a catalog-wide-only run),
+        advances that one participation's checkpoint in the same
+        transaction — mirroring `finalize_successful_orders_run`'s own
+        "success and checkpoint advancement are never two separately-
+        callable steps" discipline, simplified for this run type's
+        single-participation scope (no association table to join
+        through). Returns False (writing nothing) if this caller no
+        longer holds the claim."""
+        completed = self.complete_sales_traffic_run_terminal(
+            organization_id, run_id, lease_owner=lease_owner, status="succeeded"
+        )
+        if not completed:
+            return False
+        if synced_through_date is not None:
+            AmazonSalesTrafficSyncCheckpointRepository(self.session)._advance_if_run_succeeded(
+                organization_id=organization_id,
+                seller_account_id=seller_account_id,
+                marketplace_participation_id=marketplace_participation_id,
+                run_id=run_id,
+                synced_through_date=synced_through_date,
+            )
+        return True
+
+    def complete_sales_traffic_run_terminal(
+        self, organization_id: UUID, run_id: UUID, *, lease_owner: str, status: str
+    ) -> bool:
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(status=status, completed_at=func.now(), lease_owner=None, lease_expires_at=None)
+        )
+        self.session.flush()
+        return result.rowcount == 1
 
 
 @dataclass(frozen=True)
@@ -4838,6 +5259,325 @@ class AmazonOrdersSyncCheckpointRepository:
             existing.last_successful_run_id = ingestion_run_id
         self.session.flush()
         return True
+
+
+class AmazonSalesTrafficSyncCheckpointRepository:
+    """Durable, per-participation Sales and Traffic high-water-mark
+    primitives, for the product-level daily ingestion path only. 12B.6A.
+
+    Mirrors `AmazonOrdersSyncCheckpointRepository`'s own discipline
+    exactly: no public, permissive "advance whenever" method — the only
+    way this watermark ever moves is through
+    `AmazonIngestionRunRepository.finalize_successful_sales_traffic_run`,
+    which calls this class's private `_advance_if_run_succeeded`
+    immediately after (same transaction, same session) marking the
+    covering run `succeeded`. Simplified relative to Orders' own version
+    in one respect only: this run type has no association table to join
+    through (§ scope note on `enqueue_sales_traffic_run`), so eligibility
+    is a direct `amazon_ingestion_runs` row check, not a join.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonMarketplaceParticipation:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon sales traffic sync checkpoint access cannot bind a marketplace participation "
+                "from another organization."
+            )
+        return participation
+
+    def get(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonSalesAndTrafficSyncCheckpoint | None:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        return self.session.get(AmazonSalesAndTrafficSyncCheckpoint, marketplace_participation_id)
+
+    def _advance_if_run_succeeded(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        run_id: UUID,
+        synced_through_date: date,
+    ) -> bool:
+        """Private. Returns `True` if the checkpoint was created/updated,
+        `False` if the gating predicate was not satisfied. Never moves the
+        watermark backward — an equal date is idempotent, a strictly
+        earlier one is silently ignored, matching
+        `AmazonOrdersSyncCheckpointRepository`'s own semantics."""
+        eligible = self.session.execute(
+            select(AmazonIngestionRun.id).where(
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "sales_and_traffic_report",
+                AmazonIngestionRun.status == "succeeded",
+                AmazonIngestionRun.completed_at.is_not(None),
+            )
+        ).first()
+        if eligible is None:
+            return False
+
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return False
+
+        existing = self.session.get(AmazonSalesAndTrafficSyncCheckpoint, marketplace_participation_id)
+        if existing is None:
+            self.session.add(
+                AmazonSalesAndTrafficSyncCheckpoint(
+                    marketplace_participation_id=marketplace_participation_id,
+                    organization_id=organization_id,
+                    seller_account_id=participation.seller_account_id,
+                    synced_through_date=synced_through_date,
+                    last_successful_run_id=run_id,
+                )
+            )
+            self.session.flush()
+            return True
+        if existing.synced_through_date is None or synced_through_date >= existing.synced_through_date:
+            existing.synced_through_date = synced_through_date
+            existing.last_successful_run_id = run_id
+        self.session.flush()
+        return True
+
+
+def _validate_sales_traffic_money_amount(amount: Decimal | None, *, field_name: str) -> None:
+    if amount is None:
+        return
+    if amount != round(amount, 4):
+        raise TypeError(f"Amazon sales traffic {field_name} must not carry more than 4 fractional digits.")
+
+
+class AmazonSalesTrafficDailyFactRepository:
+    """Idempotent upsert for catalog-wide, dated Sales and Traffic facts.
+    12B.6A. Mirrors `AmazonSellerOrderRepository.upsert`'s own discipline:
+    an explicit, named-field-only signature (never a raw parsed-response
+    object passed through, so an unapproved field cannot be smuggled in),
+    an ownership check on every call, and `first_seen_at`/`last_seen_at`
+    preserved-vs-updated distinction is not needed here (this table has
+    no such columns — a fact row is either freshly written or replaced
+    wholesale on a later, more-authoritative fetch of the identical
+    window; there is no notion of "still present" vs. "no longer
+    present" the way a Listings snapshot has)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> None:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon sales traffic daily fact cannot bind a marketplace participation from another "
+                "organization."
+            )
+
+    def upsert(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        report_date: date,
+        date_granularity: str,
+        last_ingestion_run_id: UUID,
+        fields: dict[str, Any],
+    ) -> AmazonSalesAndTrafficDailyFact:
+        """`fields` must be an already-validated, already-allowlisted
+        mapping of this model's own approved column names (built by the
+        parser in `app.amazon.sales_traffic_parser` — never a raw Amazon
+        response dict) — this method never inspects or trusts key names
+        beyond passing them to the ORM constructor/assignment, so a typo'd
+        key fails loudly (an `AttributeError`/`TypeError`), never
+        silently drops or smuggles a field."""
+        for money_field in (
+            "ordered_product_sales_amount",
+            "ordered_product_sales_amount_b2b",
+            "average_sales_per_order_item_amount",
+            "average_sales_per_order_item_amount_b2b",
+            "average_selling_price_amount",
+            "average_selling_price_amount_b2b",
+            "claims_amount",
+            "shipped_product_sales_amount",
+        ):
+            _validate_sales_traffic_money_amount(fields.get(money_field), field_name=money_field)
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        existing = self.session.execute(
+            select(AmazonSalesAndTrafficDailyFact).where(
+                AmazonSalesAndTrafficDailyFact.marketplace_participation_id == marketplace_participation_id,
+                AmazonSalesAndTrafficDailyFact.report_date == report_date,
+                AmazonSalesAndTrafficDailyFact.date_granularity == date_granularity,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            for key, value in fields.items():
+                setattr(existing, key, value)
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return existing
+        row = AmazonSalesAndTrafficDailyFact(
+            marketplace_participation_id=marketplace_participation_id,
+            report_date=report_date,
+            date_granularity=date_granularity,
+            last_ingestion_run_id=last_ingestion_run_id,
+            **fields,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_for_range(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        start: date,
+        end: date,
+        date_granularity: str = "DAY",
+    ) -> list[AmazonSalesAndTrafficDailyFact] | None:
+        """12B.6A read API. Returns `None` for a foreign/nonexistent
+        participation (caller must surface this identically to every
+        other Sales and Traffic read method's "missing vs. foreign are
+        indistinguishable" sanitized behavior) — never an empty list,
+        which is reserved for "participation exists, no facts in range
+        yet". Ordered by `report_date` ascending — the natural order for
+        a trend chart."""
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        return list(
+            self.session.scalars(
+                select(AmazonSalesAndTrafficDailyFact)
+                .where(
+                    AmazonSalesAndTrafficDailyFact.marketplace_participation_id == marketplace_participation_id,
+                    AmazonSalesAndTrafficDailyFact.date_granularity == date_granularity,
+                    AmazonSalesAndTrafficDailyFact.report_date >= start,
+                    AmazonSalesAndTrafficDailyFact.report_date <= end,
+                )
+                .order_by(AmazonSalesAndTrafficDailyFact.report_date.asc())
+            ).all()
+        )
+
+
+class AmazonSalesTrafficProductFactRepository:
+    """Idempotent upsert for product-level, never-dated Sales and Traffic
+    facts. 12B.6A. Same discipline as
+    `AmazonSalesTrafficDailyFactRepository.upsert` — see that class's own
+    docstring."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> None:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon sales traffic product fact cannot bind a marketplace participation from another "
+                "organization."
+            )
+
+    def upsert(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        request_window_start: date,
+        request_window_end: date,
+        asin_granularity: str,
+        parent_asin: str,
+        child_asin: str = "",
+        seller_sku: str = "",
+        last_ingestion_run_id: UUID,
+        fields: dict[str, Any],
+    ) -> AmazonSalesAndTrafficProductFact:
+        for money_field in ("ordered_product_sales_amount", "ordered_product_sales_amount_b2b"):
+            _validate_sales_traffic_money_amount(fields.get(money_field), field_name=money_field)
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        existing = self.session.execute(
+            select(AmazonSalesAndTrafficProductFact).where(
+                AmazonSalesAndTrafficProductFact.marketplace_participation_id == marketplace_participation_id,
+                AmazonSalesAndTrafficProductFact.request_window_start == request_window_start,
+                AmazonSalesAndTrafficProductFact.request_window_end == request_window_end,
+                AmazonSalesAndTrafficProductFact.asin_granularity == asin_granularity,
+                AmazonSalesAndTrafficProductFact.parent_asin == parent_asin,
+                AmazonSalesAndTrafficProductFact.child_asin == child_asin,
+                AmazonSalesAndTrafficProductFact.seller_sku == seller_sku,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            for key, value in fields.items():
+                setattr(existing, key, value)
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return existing
+        row = AmazonSalesAndTrafficProductFact(
+            marketplace_participation_id=marketplace_participation_id,
+            request_window_start=request_window_start,
+            request_window_end=request_window_end,
+            asin_granularity=asin_granularity,
+            parent_asin=parent_asin,
+            child_asin=child_asin,
+            seller_sku=seller_sku,
+            last_ingestion_run_id=last_ingestion_run_id,
+            **fields,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_for_window(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        start: date,
+        end: date,
+    ) -> list[AmazonSalesAndTrafficProductFact] | None:
+        """12B.6A read API. Returns every product-fact row whose own
+        exact requested window (`request_window_start`/`_end`) falls
+        entirely within `[start, end]` — never a row whose window merely
+        *overlaps* the query range, which would silently blend a wider
+        catalog-wide-style request's aggregate into a narrower period's
+        report and misrepresent it as belonging to that narrower window
+        (handover doc §1a's grain rule: a product-fact row's numbers are
+        an aggregate over its own exact window, never divisible or
+        re-attributable to a sub-range). Returns `None` for a foreign/
+        nonexistent participation, matching every other Sales and
+        Traffic read method."""
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        return list(
+            self.session.scalars(
+                select(AmazonSalesAndTrafficProductFact).where(
+                    AmazonSalesAndTrafficProductFact.marketplace_participation_id == marketplace_participation_id,
+                    AmazonSalesAndTrafficProductFact.request_window_start >= start,
+                    AmazonSalesAndTrafficProductFact.request_window_end <= end,
+                )
+            ).all()
+        )
 
 
 def file_sha256(data: bytes) -> str:
