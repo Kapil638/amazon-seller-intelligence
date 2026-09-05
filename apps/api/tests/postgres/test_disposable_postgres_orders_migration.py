@@ -44,10 +44,32 @@ orders_foundation`, but still called `session.get(AmazonIngestionRun,
 run_id)` after 0013 (12B.4D remediation) added three more columns to
 that same model. The fix is identical in kind: replace the post-upgrade
 ORM read with raw SQL restricted to the columns that exist at the pinned
-revision. Every `AmazonIngestionRun` reference in this file was
-re-audited for the same pattern when 0013 was added — see `test_
-existing_0012_database_upgrades_to_0013_preserving_data` for the new
-0012 -> 0013 boundary's own equivalent proof.
+revision.
+
+**Recurrence, a third time, for migration 0014 (12B.6A):** the "every
+`AmazonIngestionRun` reference in this file was re-audited" claim this
+docstring used to make above was itself falsified by a real CI failure —
+`test_existing_0012_database_upgrades_to_0013_preserving_data` (this
+file's own dedicated 0012 -> 0013 boundary proof, pinned correctly to
+`0013_orders_durable_pagination`, never upgraded to `0014`) still ended
+with `session.get(AmazonIngestionRun, run_id)`. Once `0014_sales_
+traffic_foundation` added seven more nullable report-lifecycle columns
+(`report_id`, ...) to that same model, that final `session.get()`
+generated a `SELECT` naming all seven, and PostgreSQL correctly rejected
+it with `UndefinedColumn: column amazon_ingestion_runs.report_id does
+not exist` — a database genuinely still pinned at 0013 has no such
+column. Fixed identically again: the trailing ORM read was replaced with
+raw SQL restricted to the columns that exist at 0013, preserving the
+same two assertions (`row is not None` and the pagination-token value).
+**The claim "every reference was re-audited" is retired** — it has now
+been wrong twice. The durable, disprovable claim instead: any test in
+this file (or any Postgres-guarded migration test file in this
+repository) that pins the database below `head` must never call
+`session.get(<current ORM class>, ...)` or otherwise let the ORM build a
+`SELECT`/`INSERT` against that model, full stop, regardless of how
+recently it was last checked — a future migration will add more columns
+again, and only a raw-SQL read scoped to the pinned revision's own
+column set stays correct as the model keeps growing after it.
 """
 
 from __future__ import annotations
@@ -459,15 +481,14 @@ def test_downgrade_0012_to_0011_refuses_when_orders_data_exists(disposable_engin
 # Pinned to exactly "0012_orders_foundation" before seeding, then upgraded
 # exactly once to "0013_orders_durable_pagination" — never "head" — since
 # this test's own name and purpose are specifically the 0012 -> 0013
-# boundary. The seed INSERT below is raw SQL restricted to columns that
-# genuinely exist at 0012 (see this file's own module docstring and
-# `test_existing_0011_database_upgrades_to_0012_preserving_data`'s
-# comment for why the current `AmazonIngestionRun` ORM must not be used
-# before that upgrade — it would generate a SELECT/INSERT naming the
-# three 0013-only columns, which PostgreSQL would correctly reject as
-# `UndefinedColumn` against a database still pinned at 0012). The current
-# ORM (`AmazonIngestionRun`) is used only after the upgrade to 0013, once
-# every column it maps genuinely exists.
+# boundary. Every read/write in this test, including after the upgrade,
+# is raw SQL restricted to the columns that genuinely exist at whichever
+# revision the database is pinned to at that point (0012 before the
+# upgrade, 0013 after it) — never the current `AmazonIngestionRun` ORM,
+# which by now also maps 0014_sales_traffic_foundation's own later
+# columns (e.g. `report_id`) that do not exist yet at either revision
+# this test ever reaches. See this file's own module docstring for the
+# full history of this exact bug recurring across 0012, 0013, and 0014.
 def test_existing_0012_database_upgrades_to_0013_preserving_data(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
@@ -569,13 +590,24 @@ def test_existing_0012_database_upgrades_to_0013_preserving_data(disposable_engi
         ).scalar()
     assert allowed_value == "ALLOWED"
 
-    # Now — and only now, after the upgrade to 0013 — the current
-    # `AmazonIngestionRun` ORM is safe to use: the database genuinely has
-    # every column it maps.
-    with Session(disposable_engine) as session:
-        run = session.get(AmazonIngestionRun, run_id)
-        assert run is not None
-        assert run.orders_pagination_next_token == "ALLOWED"
+    # NOT the current `AmazonIngestionRun` ORM here — this test stays
+    # pinned at exactly 0013 for its entire duration and never upgrades
+    # to 0014, so the ORM (which also maps 0014_sales_traffic_
+    # foundation's seven report-lifecycle columns, e.g. `report_id`)
+    # would generate a SELECT naming columns that genuinely do not exist
+    # yet, which PostgreSQL correctly rejects with `UndefinedColumn` —
+    # this is exactly the recurring bug this file's own module docstring
+    # now documents happening a third time. Raw SQL restricted to the
+    # columns that exist at 0013 instead; the 0013 -> 0014 boundary has
+    # its own dedicated proof in `test_disposable_postgres_sales_
+    # traffic_migration.py`, not here.
+    with disposable_engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, orders_pagination_next_token FROM amazon_ingestion_runs WHERE id = :id"),
+            {"id": run_id},
+        ).mappings().first()
+    assert row is not None
+    assert row["orders_pagination_next_token"] == "ALLOWED"
 
 
 # 7b (12B.4D remediation): migration 0013's own downgrade refusal — an
