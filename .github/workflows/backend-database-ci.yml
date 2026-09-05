@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0013_orders_durable_pagination (head)" /tmp/heads.txt
+          grep -q "0014_sales_traffic_foundation (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0013_orders_durable_pagination" /tmp/current.txt
+          grep -q "0014_sales_traffic_foundation" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
@@ -270,6 +270,55 @@ jobs:
       # test_disposable_postgres_orders_migration.py`, exercised by the
       # `postgres-identity-concurrency` job below (`pytest tests/
       # postgres/`) rather than duplicated here as raw shell/SQL.
+
+  existing-database-upgrade-0014:
+    name: Existing PostgreSQL (0013) — upgrade to 0014
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0014
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0014
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0013 (simulates an existing pre-12B.6A database)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0013_orders_durable_pagination
+      - name: alembic upgrade to 0014 (the real 12B.6A upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0014_sales_traffic_foundation
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0014_sales_traffic_foundation"
+      # As with the 0011/0012/0013 jobs above: the deeper behavioral proof
+      # (existing pre-0014 run data preserved across the upgrade, the
+      # seven new report-lifecycle columns existing and starting NULL,
+      # the sales-and-traffic-only scope check constraints, the new
+      # fact/checkpoint tables' schema, the active-scope partial unique
+      # index under real concurrency-relevant constraints, and the
+      # downgrade's refusal while any sales-and-traffic data exists)
+      # lives in `tests/postgres/test_disposable_postgres_sales_traffic_
+      # migration.py`, exercised by the `postgres-identity-concurrency`
+      # job below (`pytest tests/postgres/`) rather than duplicated here
+      # as raw shell/SQL.
 
   postgres-identity-concurrency:
     name: PostgreSQL — OAuth identity concurrency validation

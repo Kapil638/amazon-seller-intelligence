@@ -1887,3 +1887,159 @@ export type OrdersSyncTriggerResponse = {
   retry_allowed_at: string | null;
 };
 
+// --- 12B.6A: Sales and Traffic Business Report Read API + Sync Trigger
+// (backend contract) ---------------------------------------------------
+
+// Identical vocabulary to OrdersSyncStatus/ListingsSyncStatus — this
+// codebase's own internal job-lifecycle states, never shown to a
+// customer verbatim (see seller-sales-traffic-view.ts's own label map).
+export type SalesTrafficSyncStatus =
+  | "never_synchronized"
+  | "queued"
+  | "running"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "failed"
+  | "partial"
+  | "timed_out";
+
+export type SalesTrafficDateGranularity = "DAY" | "WEEK" | "MONTH";
+export type SalesTrafficAsinGranularity = "PARENT" | "CHILD" | "SKU";
+export type SalesTrafficProductSortField =
+  | "ordered_product_sales_amount"
+  | "units_ordered"
+  | "sessions"
+  | "unit_session_percentage";
+
+export type SalesTrafficSyncEvidence = {
+  status: SalesTrafficSyncStatus;
+  failure_class: string | null;
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  report_processing_status: string | null;
+  next_retry_at: string | null;
+  last_successful_synchronized_at: string | null;
+  // Product-level daily-ingestion high-water mark — independent of
+  // `last_successful_synchronized_at` (a catalog-wide-only run can
+  // succeed without ever moving this). `null` until at least one
+  // single-day product-level report has succeeded.
+  synced_through_date: string | null;
+};
+
+export type SalesTrafficSummary = {
+  marketplace_participation_id: string;
+  start: string;
+  end: string;
+  days_with_data: number;
+  // Every money/percentage field below is serialized as a decimal
+  // string (never a float), and is `null` when no rows are in range or
+  // the relevant denominator is zero — never a silently-coerced zero.
+  currency_code: string | null;
+  ordered_product_sales_amount: string | null;
+  units_ordered: number | null;
+  total_order_items: number | null;
+  sessions: number | null;
+  page_views: number | null;
+  // Recomputed (page-view-weighted / units-over-sessions), never a naive
+  // mean of daily percentages — see the backend read service's own
+  // docstring.
+  buy_box_percentage: string | null;
+  unit_session_percentage: string | null;
+  sync: SalesTrafficSyncEvidence;
+};
+
+export type SalesTrafficDailyTrendPoint = {
+  report_date: string;
+  ordered_product_sales_amount: string | null;
+  currency_code: string | null;
+  units_ordered: number | null;
+  sessions: number | null;
+  page_views: number | null;
+  buy_box_percentage: string | null;
+  unit_session_percentage: string | null;
+};
+
+export type SalesTrafficDailyTrendResponse = {
+  marketplace_participation_id: string;
+  start: string;
+  end: string;
+  points: SalesTrafficDailyTrendPoint[];
+};
+
+export type SalesTrafficCoverageRange = {
+  start: string;
+  end: string;
+};
+
+export type SalesTrafficProductRow = {
+  parent_asin: string;
+  child_asin: string | null;
+  seller_sku: string | null;
+  item_name: string | null;
+  currency_code: string | null;
+  ordered_product_sales_amount: string | null;
+  units_ordered: number | null;
+  sessions: number | null;
+  page_views: number | null;
+  buy_box_percentage: string | null;
+  unit_session_percentage: string | null;
+  // How many distinct product-fact report windows were aggregated into
+  // this row (e.g. 30 for a 30-day daily backfill) — surfaced so the UI
+  // never implies more granularity than the underlying data actually has.
+  window_count: number;
+  // Coverage truthfulness: the fields above only reflect the requested
+  // period in full when `coverage_complete` is true. When false, they
+  // reflect only `covered_ranges` — never the full requested window —
+  // and `partial_coverage_reason` explains why no complete window or
+  // combination of windows was available. Never silently treat this
+  // row's numbers as answering the full requested period without
+  // checking `coverage_complete` first.
+  coverage_complete: boolean;
+  covered_ranges: SalesTrafficCoverageRange[];
+  partial_coverage_reason: string | null;
+  excluded_overlapping_window_count: number;
+  excluded_conflicting_granularity_window_count: number;
+};
+
+export type SalesTrafficProductPerformanceResponse = {
+  marketplace_participation_id: string;
+  start: string;
+  end: string;
+  items: SalesTrafficProductRow[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type SalesTrafficFreshness = {
+  marketplace_participation_id: string;
+  sync: SalesTrafficSyncEvidence;
+  earliest_daily_fact_date: string | null;
+  latest_daily_fact_date: string | null;
+};
+
+export type SalesTrafficSyncJobStatus = {
+  run_id: string;
+  run_type: string;
+  status: string;
+  marketplace_participation_id: string;
+  data_start_time: string | null;
+  data_end_time: string | null;
+  date_granularity: string | null;
+  report_processing_status: string | null;
+  queued_at: string;
+  started_at: string | null;
+  last_heartbeat_at: string | null;
+  next_retry_at: string | null;
+  completed_at: string | null;
+  failure_class: string | null;
+};
+
+export type SalesTrafficSyncTriggerResponse = {
+  reason: string;
+  message: string | null;
+  job: SalesTrafficSyncJobStatus | null;
+  retry_allowed_at: string | null;
+};
+
