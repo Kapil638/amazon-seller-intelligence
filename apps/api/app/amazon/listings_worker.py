@@ -8,9 +8,10 @@ during tests — only `if __name__ == "__main__"` below invokes
     cd apps/api
     uv run python -m app.amazon.listings_worker
 
-Or, for local development, via the unified `./scripts/dev.sh`, which
-starts exactly one of these alongside the frontend and API — see that
-script and `docs/AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`.
+Or, for local development, via the unified `./scripts/dev.sh`, which can
+start this worker (and, independently, the Orders and Sales & Traffic
+workers) alongside the frontend and API — see that script and
+`docs/AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`.
 
 Multiple worker processes may run concurrently against the same database;
 the database is the *only* coordination point — no in-memory queue, no

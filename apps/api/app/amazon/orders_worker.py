@@ -7,6 +7,11 @@ every operational convention to `app.amazon.listings_worker`, deliberately
     cd apps/api
     uv run python -m app.amazon.orders_worker
 
+Or, for local development, via the unified `./scripts/dev.sh`
+(`ASI_ORDERS_WORKER_ENABLED=true ./scripts/dev.sh`), which can start this
+worker (and, independently, the Listings and Sales & Traffic workers)
+alongside the frontend and API — see that script.
+
 **Why a dedicated worker instead of one worker claiming both run types**
 (12B.4D Phase 5 design decision): Listings' `claim_next_listings_job` is a
 heavily-reviewed, concurrency-proof piece of SQL (advisory lock +

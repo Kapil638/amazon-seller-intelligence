@@ -8,6 +8,11 @@ Run it as its own hosted process:
     cd apps/api
     uv run python -m app.amazon.sales_traffic_worker
 
+Or, for local development, via the unified `./scripts/dev.sh`
+(`ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh`), which can
+start this worker (and, independently, the Listings and Orders workers)
+alongside the frontend and API — see that script.
+
 **Why a dedicated worker** (same reasoning as Orders vs Listings,
 `orders_worker.py`'s own docstring): this report type's claim
 (`claim_next_sales_traffic_job`) uses its own dedicated PostgreSQL

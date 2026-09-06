@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 12B.3H — Unified local development startup: frontend + backend API +
-# exactly one Listings worker, in one terminal, one Ctrl-C.
+# each of the Listings, Orders, and Sales & Traffic workers that has
+# been explicitly enabled, in one terminal, one Ctrl-C.
 #
 # Supported platforms: macOS and Linux only (this repo's other local
 # tooling — e.g. the disposable-Postgres backup scripts under
@@ -11,15 +12,15 @@
 #
 # This does not replace the existing individual commands (still
 # documented in docs/AI_HANDOVER/14_LOCAL_DEVELOPMENT_SETUP.md) — it
-# only saves opening three terminals for the common case of wanting all
-# three running together. No process manager dependency is added; this
-# is plain bash job control.
+# only saves opening several terminals for the common case of wanting
+# the backend, frontend, and one or more workers running together. No
+# process manager dependency is added; this is plain bash job control.
 #
 # Usage:
 #   ./scripts/dev.sh
 #
 # Ctrl-C (SIGINT) or `kill <pid>` (SIGTERM) on this script's own process
-# stops all three children.
+# stops every child it started.
 
 set -uo pipefail
 set -m # job control: each backgrounded child becomes its own process group leader
@@ -146,15 +147,18 @@ if port_in_use "$FRONTEND_PORT"; then
   exit 1
 fi
 
-# --- pre-flight: worker authorization gate ----------------------------------
-# 12B.3H — starting this unified stack must never *silently* begin
-# claiming and processing real jobs (real Amazon calls, against whatever
-# DATABASE_URL is configured — a live Supabase project in this repo's
-# actual local .env, not a disposable one) just because a developer ran
-# this script without thinking about it. The worker module enforces this
-# same gate itself (fail-closed, checked first thing in its own `main()`)
-# — checking it here too means a disabled worker is never even attempted,
-# rather than started and immediately exiting with a visible error.
+# --- pre-flight: worker authorization gates ---------------------------------
+# 12B.3H (Listings), extended for Orders and Sales & Traffic — starting
+# this unified stack must never *silently* begin claiming and processing
+# real jobs (real Amazon calls, against whatever DATABASE_URL is
+# configured — a live Supabase project in this repo's actual local .env,
+# not a disposable one) just because a developer ran this script without
+# thinking about it. Each worker module enforces this same gate itself
+# (fail-closed, checked first thing in its own `main()`) — checking it
+# here too means a disabled worker is never even attempted, rather than
+# started and immediately exiting with a visible error. The three flags
+# are independent: any subset may be enabled at once (see each worker's
+# own `is_worker_enabled` docstring).
 
 SKIP_WORKER=0
 if [ "${ASI_LISTINGS_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_LISTINGS_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
@@ -163,12 +167,36 @@ if [ "${ASI_LISTINGS_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_LIST
   SKIP_WORKER=1
 fi
 
-# --- pre-flight: duplicate worker -------------------------------------------
+SKIP_ORDERS_WORKER=0
+if [ "${ASI_ORDERS_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_ORDERS_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
+  log "ASI_ORDERS_WORKER_ENABLED is not set to true — not starting an Orders worker."
+  log "(backend and frontend still start normally; set ASI_ORDERS_WORKER_ENABLED=true to also start the worker)"
+  SKIP_ORDERS_WORKER=1
+fi
+
+SKIP_SALES_TRAFFIC_WORKER=0
+if [ "${ASI_SALES_TRAFFIC_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_SALES_TRAFFIC_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
+  log "ASI_SALES_TRAFFIC_WORKER_ENABLED is not set to true — not starting a Sales and Traffic worker."
+  log "(backend and frontend still start normally; set ASI_SALES_TRAFFIC_WORKER_ENABLED=true to also start the worker)"
+  SKIP_SALES_TRAFFIC_WORKER=1
+fi
+
+# --- pre-flight: duplicate workers -------------------------------------------
 
 if [ "$SKIP_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.listings_worker" >/dev/null 2>&1; then
   log "a Listings worker process already appears to be running — not starting a second one."
   log "(this script never claims two workers are safe to run without checking; see app/amazon/listings_worker.py's own module docstring for why a duplicate worker is otherwise harmless, just wasteful — this check exists purely to avoid confusing duplicate log output)"
   SKIP_WORKER=1
+fi
+
+if [ "$SKIP_ORDERS_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.orders_worker" >/dev/null 2>&1; then
+  log "an Orders worker process already appears to be running — not starting a second one."
+  SKIP_ORDERS_WORKER=1
+fi
+
+if [ "$SKIP_SALES_TRAFFIC_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.sales_traffic_worker" >/dev/null 2>&1; then
+  log "a Sales and Traffic worker process already appears to be running — not starting a second one."
+  SKIP_SALES_TRAFFIC_WORKER=1
 fi
 
 # --- start ------------------------------------------------------------------
@@ -201,19 +229,39 @@ else
   WORKER_CMD=(uv run python -m app.amazon.listings_worker)
 fi
 
+if [ -n "${DEV_SH_ORDERS_WORKER_CMD:-}" ]; then
+  # shellcheck disable=SC2206
+  ORDERS_WORKER_CMD=($DEV_SH_ORDERS_WORKER_CMD)
+else
+  ORDERS_WORKER_CMD=(uv run python -m app.amazon.orders_worker)
+fi
+
+if [ -n "${DEV_SH_SALES_TRAFFIC_WORKER_CMD:-}" ]; then
+  # shellcheck disable=SC2206
+  SALES_TRAFFIC_WORKER_CMD=($DEV_SH_SALES_TRAFFIC_WORKER_CMD)
+else
+  SALES_TRAFFIC_WORKER_CMD=(uv run python -m app.amazon.sales_traffic_worker)
+fi
+
 # ASI_DB_RUNTIME_CONTEXT=api authorizes the backend process (only) to
 # open a non-loopback database connection — see
 # `apps/api/app/persistence/database.py`'s own module docstring for the
 # full production-database guard design. Scoped to this one child via
 # `env`, not `export`ed into this script's own shell, so the frontend
-# and worker children below never inherit it (the worker declares its
+# and worker children below never inherit it (each worker declares its
 # own context internally regardless, after its own separate
-# ASI_LISTINGS_WORKER_ENABLED check).
+# ASI_*_WORKER_ENABLED check).
 start_child "backend" "$API_DIR" env ASI_DB_RUNTIME_CONTEXT=api "${BACKEND_CMD[@]}"
 start_child "frontend" "$WEB_DIR" "${FRONTEND_CMD[@]}"
 
 if [ "$SKIP_WORKER" -eq 0 ]; then
   start_child "worker" "$API_DIR" "${WORKER_CMD[@]}"
+fi
+if [ "$SKIP_ORDERS_WORKER" -eq 0 ]; then
+  start_child "orders-worker" "$API_DIR" "${ORDERS_WORKER_CMD[@]}"
+fi
+if [ "$SKIP_SALES_TRAFFIC_WORKER" -eq 0 ]; then
+  start_child "sales-traffic-worker" "$API_DIR" "${SALES_TRAFFIC_WORKER_CMD[@]}"
 fi
 
 # --- partial-start-failure check --------------------------------------------
