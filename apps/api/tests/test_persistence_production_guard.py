@@ -102,7 +102,7 @@ def test_guard_raises_for_a_remote_database_with_an_unrecognized_context(monkeyp
         _guard_engine_creation(_FAKE_REMOTE_URL)
 
 
-@pytest.mark.parametrize("context", ["api", "listings_worker", "orders_worker"])
+@pytest.mark.parametrize("context", ["api", "listings_worker", "orders_worker", "sales_traffic_worker"])
 def test_guard_allows_a_remote_database_for_each_non_admin_recognized_context(monkeypatch, context) -> None:
     monkeypatch.setenv(_CONTEXT_ENV_VAR, context)
     # Does not raise.
@@ -200,6 +200,21 @@ def test_real_get_engine_succeeds_for_the_listings_worker_context(monkeypatch, _
 
 def test_real_get_engine_succeeds_for_the_orders_worker_context(monkeypatch, _fake_remote_engine_resolution) -> None:
     monkeypatch.setenv(_CONTEXT_ENV_VAR, "orders_worker")
+    engine = database_module.get_engine()
+    assert engine is not None
+
+
+def test_real_get_engine_succeeds_for_the_sales_traffic_worker_context(
+    monkeypatch, _fake_remote_engine_resolution
+) -> None:
+    """Regression test: `sales_traffic_worker.py`'s own `main()` declares
+    this exact context string, but it was never added to
+    `_RECOGNIZED_DB_RUNTIME_CONTEXTS` when that worker was built — a gap
+    that would have made a real worker start fail closed against its own
+    database on the very first `get_engine()` call, discovered while
+    debugging an unrelated `/connection` 500 caused by the API itself
+    running with no context set at all."""
+    monkeypatch.setenv(_CONTEXT_ENV_VAR, "sales_traffic_worker")
     engine = database_module.get_engine()
     assert engine is not None
 
