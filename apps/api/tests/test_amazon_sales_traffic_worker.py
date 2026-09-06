@@ -176,7 +176,10 @@ async def test_run_once_claims_and_creates_a_report_for_a_queued_job() -> None:
     assert claimed_something is True
     assert len(client.create_report_calls) == 1
     run = _get_run(claim.run_id)
-    assert run.status == "started"
+    # Released to `waiting_to_retry` so a later poll can check `getReport`
+    # — see AmazonSalesTrafficIngestionService.process_claimed_job's own
+    # docstring for why a `started` row here would never be reclaimed.
+    assert run.status == "waiting_to_retry"
     assert run.report_id == "amzn-report-1"
 
 

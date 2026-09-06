@@ -42,10 +42,22 @@ point the worker calls):
                           duplicate *business facts* once the resulting
                           report is eventually downloaded and persisted
                           (idempotent upsert on the fact tables' own
-                          natural keys, §8).
+                          natural keys, §8). This attempt then releases
+                          the claim (reschedule_sales_traffic_run_for_
+                          retry, same mechanism as the "not yet DONE"
+                          case below) rather than calling `getReport` in
+                          the same attempt — see "Why one getReport call
+                          per attempt" below. This step is not optional:
+                          a `started` row is invisible to `claim_next_
+                          sales_traffic_job`, so skipping the release
+                          here would strand the run until its lease's
+                          bare expiry, with no attempt ever reaching
+                          `getReport`.
             |
-    network getReport call (exactly once per attempt — see below for why
-                             this is not an in-process poll loop)
+    network getReport call (exactly once per attempt, on a *later*
+                             claim than the one that created the report —
+                             see below for why this is not an
+                             in-process poll loop)
             |
     if not yet DONE/CANCELLED/FATAL: reschedule_sales_traffic_run_for_
                                       retry with a short next_retry_at —
@@ -302,6 +314,17 @@ class AmazonSalesTrafficIngestionService:
                     )
                 )
                 self._heartbeat(run_id, lease_owner, report_id=report_id, report_processing_status="IN_QUEUE")
+                # Release the claim immediately after recording report_id —
+                # identical reasoning to the `polling` reschedule below (see
+                # "Why one getReport call per attempt" in the module
+                # docstring). Without this, the row stays `status='started'`
+                # with no other code path that ever reclaims it: it is
+                # invisible to `claim_next_sales_traffic_job` (which only
+                # claims `queued`/`waiting_to_retry`), so it can only ever
+                # reach its lease's natural expiry and be marked
+                # `timed_out` — no attempt would ever call `getReport`,
+                # regardless of how long a worker keeps running.
+                self._reschedule(run_id, lease_owner, failure_class="polling")
                 return SalesTrafficIngestionOutcome(run_id=run_id, outcome="created")
 
             status = await client.get_report(report_id)
