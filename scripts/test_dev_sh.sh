@@ -48,13 +48,15 @@ no_sleep100_survivors() {
   ! pgrep -f "sleep 100" >/dev/null 2>&1
 }
 
-# --- 1: correct three child commands, all started -------------------------
+# --- 1: correct five child commands, all started ---------------------------
 
-test_starts_three_children_and_shuts_down_cleanly() {
+test_starts_five_children_and_shuts_down_cleanly() {
   local log
   log="$(mktemp)"
-  ASI_LISTINGS_WORKER_ENABLED=true BACKEND_PORT=18211 FRONTEND_PORT=18212 \
+  ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true \
+    BACKEND_PORT=18211 FRONTEND_PORT=18212 \
     DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
+    DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
     "$DEV_SH" >"$log" 2>&1 &
   local script_pid=$!
 
@@ -66,10 +68,10 @@ test_starts_three_children_and_shuts_down_cleanly() {
   fi
   local running
   running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
-  if [ "$running" -ne 3 ]; then
-    fail "startup: expected 3 'sleep 100' children, found $running"
+  if [ "$running" -ne 5 ]; then
+    fail "startup: expected 5 'sleep 100' children, found $running"
   else
-    pass "startup: exactly 3 child processes running (backend, frontend, worker)"
+    pass "startup: exactly 5 child processes running (backend, frontend, listings/orders/sales-traffic workers)"
   fi
 
   kill -TERM "$script_pid" 2>/dev/null || true
@@ -83,6 +85,39 @@ test_starts_three_children_and_shuts_down_cleanly() {
   else
     fail "shutdown: dev.sh's own process is still running"
   fi
+  rm -f "$log"
+  pkill -f "sleep 100" 2>/dev/null || true
+}
+
+# --- 1b: each worker flag is independent — enabling only one starts only it -
+
+test_enabling_only_sales_traffic_worker_starts_only_that_one() {
+  local log
+  log="$(mktemp)"
+  env -u ASI_LISTINGS_WORKER_ENABLED -u ASI_ORDERS_WORKER_ENABLED \
+    ASI_SALES_TRAFFIC_WORKER_ENABLED=true \
+    BACKEND_PORT=18225 FRONTEND_PORT=18226 \
+    DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" \
+    DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
+    "$DEV_SH" >"$log" 2>&1 &
+  local script_pid=$!
+  wait_until 5 grep -q "all requested processes are running" "$log" || true
+
+  if grep -q "ASI_LISTINGS_WORKER_ENABLED is not set to true" "$log" && grep -q "ASI_ORDERS_WORKER_ENABLED is not set to true" "$log"; then
+    pass "independent flags: Listings and Orders correctly withheld"
+  else
+    fail "independent flags: expected both Listings and Orders to be withheld ($log)"
+  fi
+  local running
+  running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
+  if [ "$running" -eq 3 ]; then
+    pass "independent flags: exactly 3 children running (backend, frontend, sales-traffic worker only)"
+  else
+    fail "independent flags: expected exactly 3 children, found $running"
+  fi
+
+  kill -TERM "$script_pid" 2>/dev/null || true
+  wait_until 5 no_sleep100_survivors || true
   rm -f "$log"
   pkill -f "sleep 100" 2>/dev/null || true
 }
@@ -218,26 +253,30 @@ test_command_construction_never_prints_secrets() {
 test_worker_not_started_without_the_enable_flag() {
   local log
   log="$(mktemp)"
-  # Deliberately no ASI_LISTINGS_WORKER_ENABLED at all — the default,
-  # fail-closed state this whole gate exists to prove.
-  env -u ASI_LISTINGS_WORKER_ENABLED \
+  # Deliberately none of the three ASI_*_WORKER_ENABLED flags at all —
+  # the default, fail-closed state this whole gate exists to prove, for
+  # all three workers independently.
+  env -u ASI_LISTINGS_WORKER_ENABLED -u ASI_ORDERS_WORKER_ENABLED -u ASI_SALES_TRAFFIC_WORKER_ENABLED \
     BACKEND_PORT=18223 FRONTEND_PORT=18224 \
     DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
+    DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
     "$DEV_SH" >"$log" 2>&1 &
   local script_pid=$!
   wait_until 5 grep -q "all requested processes are running" "$log" || true
 
-  if grep -q "ASI_LISTINGS_WORKER_ENABLED is not set to true" "$log"; then
-    pass "worker gate: dev.sh explained why it is not starting a worker"
+  if grep -q "ASI_LISTINGS_WORKER_ENABLED is not set to true" "$log" \
+    && grep -q "ASI_ORDERS_WORKER_ENABLED is not set to true" "$log" \
+    && grep -q "ASI_SALES_TRAFFIC_WORKER_ENABLED is not set to true" "$log"; then
+    pass "worker gate: dev.sh explained why it is not starting any of the three workers"
   else
-    fail "worker gate: no explanation logged for the disabled worker ($log)"
+    fail "worker gate: missing explanation for at least one disabled worker ($log)"
   fi
   local running
   running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
   if [ "$running" -eq 2 ]; then
-    pass "worker gate: only backend and frontend started (worker withheld by default)"
+    pass "worker gate: only backend and frontend started (all three workers withheld by default)"
   else
-    fail "worker gate: expected exactly 2 children (backend, frontend) without the flag, found $running"
+    fail "worker gate: expected exactly 2 children (backend, frontend) without any flag, found $running"
   fi
 
   kill -TERM "$script_pid" 2>/dev/null || true
@@ -302,7 +341,8 @@ test_runtime_output_never_contains_a_database_url_or_token() {
   pkill -f "sleep 100" 2>/dev/null || true
 }
 
-test_starts_three_children_and_shuts_down_cleanly
+test_starts_five_children_and_shuts_down_cleanly
+test_enabling_only_sales_traffic_worker_starts_only_that_one
 test_partial_start_failure_cleans_up
 test_port_conflict_is_detected
 test_does_not_start_a_duplicate_worker

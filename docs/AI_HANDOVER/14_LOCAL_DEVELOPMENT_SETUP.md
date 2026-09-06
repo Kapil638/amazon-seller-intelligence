@@ -7,44 +7,55 @@
 - Optional: Supabase project for persistence (tests do not require it)
 - macOS or Linux (see `./scripts/dev.sh` below — not supported on Windows)
 
-## Quick start: frontend + backend + Listings worker together
+## Quick start: frontend + backend + workers together
 
 ```bash
 ./scripts/dev.sh
 ```
 
-Starts the backend API and frontend. **The Listings worker is *not*
-started by default** — `./scripts/dev.sh` alone gives you the frontend
-and API only. To also start the worker (so a triggered sync actually
-gets claimed and processed):
+Starts the backend API and frontend. **None of the three sync workers
+(Listings, Orders, Sales & Traffic) start by default** —
+`./scripts/dev.sh` alone gives you the frontend and API only. To also
+start one or more workers (so a triggered sync actually gets claimed
+and processed), set the corresponding flag(s) — any subset may be
+combined:
 
 ```bash
 ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh
+ASI_ORDERS_WORKER_ENABLED=true ./scripts/dev.sh
+ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
+
+# or all three together:
+ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
 ```
 
 This is deliberate, not an oversight: this repository's local `.env`
 points `DATABASE_URL` at a real, live Supabase project, not a disposable
 one. A worker that started automatically the moment you ran a
-convenience script would begin claiming and processing *real* Listings
-jobs — real Amazon SP-API calls — the instant one existed, with no
-explicit action from you. `ASI_LISTINGS_WORKER_ENABLED=true` is the one
-explicit signal that authorizes that. The worker module enforces this
-same check itself (fail-closed) even if you run it directly, so there is
-no way to start a live worker by accident through either path. See
-`app/amazon/listings_worker.py`'s own module docstring and `docs/
-AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md` for the full design.
+convenience script would begin claiming and processing *real* jobs —
+real Amazon SP-API calls — the instant one existed, with no explicit
+action from you. Each `ASI_*_WORKER_ENABLED=true` flag is the one
+explicit signal that authorizes that worker. Every worker module
+enforces this same check itself (fail-closed) even if you run it
+directly, so there is no way to start a live worker by accident through
+either path. See `app/amazon/listings_worker.py`, `orders_worker.py`,
+and `sales_traffic_worker.py`'s own module docstrings, and `docs/
+AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`, for the full design.
 
-Each process's output is prefixed (`[backend]`, `[frontend]`, `[worker]`
-when enabled). A single Ctrl-C stops everything that was started
-cleanly. Detects if a port is already in use or a worker is already
-running (never starts a duplicate) before starting anything. This does
-not replace the individual commands below — both remain fully
-supported; use whichever fits what you're doing. See
+Each process's output is prefixed (`[backend]`, `[frontend]`, `[worker]`,
+`[orders-worker]`, `[sales-traffic-worker]` — the latter three only when
+enabled). A single Ctrl-C stops everything that was started cleanly.
+Detects if a port is already in use or a worker of a given type is
+already running (never starts a duplicate of that type) before starting
+anything. This does not replace the individual commands below — both
+remain fully supported; use whichever fits what you're doing. See
 `scripts/test_dev_sh.sh` for this script's own test suite.
 
-**Without an enabled worker (via either path above), a triggered
-Listings sync will sit `queued` forever** — the worker is a separate
-process from the API and is never started implicitly, by design.
+**Without a job type's worker enabled (via either path above), a
+triggered sync of that type will sit `queued` forever** — every worker
+is a separate process from the API and is never started implicitly, by
+design. Existing previously-synced data for that job type is never
+affected either way.
 
 ## Backend
 
@@ -100,6 +111,40 @@ processes durable Listings synchronization jobs; without it running (or
 enabled), a triggered sync stays `queued` indefinitely (harmlessly —
 existing listing data is never affected). Graceful shutdown via Ctrl-C
 or `SIGTERM`. See `docs/AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`.
+
+## Orders worker (standalone)
+
+```bash
+cd apps/api
+ASI_ORDERS_WORKER_ENABLED=true uv run python -m app.amazon.orders_worker
+```
+
+Identical shape and safety gate to the Listings worker above
+(`ASI_ORDERS_WORKER_ENABLED=true` required, independent of the other two
+flags). A separate, long-running process — never started implicitly by
+the API or by `./scripts/dev.sh`. Claims and processes durable Orders
+synchronization jobs; without it running (or enabled), a triggered sync
+stays `queued` indefinitely (harmlessly — existing orders data is never
+affected). Graceful shutdown via Ctrl-C or `SIGTERM`. See `app/amazon/
+orders_worker.py`'s own module docstring and `docs/AI_HANDOVER/
+12B4D_ORDERS_INGESTION_AND_UI.md`.
+
+## Sales and Traffic worker (standalone)
+
+```bash
+cd apps/api
+ASI_SALES_TRAFFIC_WORKER_ENABLED=true uv run python -m app.amazon.sales_traffic_worker
+```
+
+Identical shape and safety gate to the Listings worker above
+(`ASI_SALES_TRAFFIC_WORKER_ENABLED=true` required, independent of the
+other two flags). A separate, long-running process — never started
+implicitly by the API or by `./scripts/dev.sh`. Claims and processes
+durable Sales and Traffic report synchronization jobs; without it
+running (or enabled), a triggered sync stays `queued` indefinitely
+(harmlessly — existing sales/traffic data is never affected). Graceful
+shutdown via Ctrl-C or `SIGTERM`. See `app/amazon/sales_traffic_worker.py`'s
+own module docstring and `docs/AI_HANDOVER/12B6A_SALES_TRAFFIC_REPORTS.md`.
 
 ## Amazon local notes
 
