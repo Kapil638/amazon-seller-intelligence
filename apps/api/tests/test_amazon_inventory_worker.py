@@ -324,6 +324,33 @@ async def test_sigint_and_sigterm_request_graceful_stop() -> None:
                 pass
 
 
+# --- sanitized logging -------------------------------------------------------
+
+
+def test_disabled_worker_log_never_leaks_the_env_var_value(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("ASI_INVENTORY_WORKER_ENABLED", "definitely-not-a-real-token-but-should-still-never-appear")
+    with caplog.at_level("ERROR", logger="app.amazon.inventory_worker"):
+        main()
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "definitely-not-a-real-token-but-should-still-never-appear" not in log_text
+
+
+@pytest.mark.asyncio
+async def test_logs_never_contain_seller_or_organization_identifiers(caplog) -> None:
+    scope = _seed_scope()
+    _enqueue(scope)
+    worker, client = _worker(pages=[_page("SKU-SECRET-1")])
+
+    with caplog.at_level("INFO", logger="app.amazon.inventory_worker"):
+        await worker.run_once()
+
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(scope["organization_id"]) not in log_text
+    assert str(scope["seller_account_id"]) not in log_text
+    assert str(scope["connection_id"]) not in log_text
+    assert "SKU-SECRET-1" not in log_text
+
+
 # --- ASI_INVENTORY_WORKER_ENABLED fail-closed gate ---------------------------
 
 

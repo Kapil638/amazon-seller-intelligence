@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0015_worker_heartbeats (head)" /tmp/heads.txt
+          grep -q "0016_inventory_foundation (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0015_worker_heartbeats" /tmp/current.txt
+          grep -q "0016_inventory_foundation" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
@@ -361,6 +361,56 @@ jobs:
       # a clean drop-only downgrade, and concurrent first-heartbeat
       # writes for the same worker_type under real concurrency) lives in
       # `tests/postgres/test_disposable_postgres_worker_heartbeats.py`,
+      # exercised by the `postgres-identity-concurrency` job below
+      # (`pytest tests/postgres/`) rather than duplicated here as raw
+      # shell/SQL.
+
+  existing-database-upgrade-0016:
+    name: Existing PostgreSQL (0015) — upgrade to 0016
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0016
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0016
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0015 (simulates an existing pre-12B.6B database, already carrying the runtime-availability fix)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0015_worker_heartbeats
+      - name: alembic upgrade to 0016 (the real 12B.6B upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0016_inventory_foundation
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0016_inventory_foundation"
+      # As with the 0011/0012/0013/0014/0015 jobs above: the deeper
+      # behavioral proof (existing pre-0016 run data preserved across the
+      # upgrade, the widened run_type CHECK, the inventory-only scope
+      # check constraint, the new current-state/observation tables'
+      # schema, the active-scope partial unique index and claim path
+      # under real concurrency, the corrected same-day-multiple-
+      # observations grain, composite-FK provenance, and the downgrade's
+      # refusal while any inventory data exists) lives in `tests/
+      # postgres/test_disposable_postgres_inventory_migration.py`,
       # exercised by the `postgres-identity-concurrency` job below
       # (`pytest tests/postgres/`) rather than duplicated here as raw
       # shell/SQL.
