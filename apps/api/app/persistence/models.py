@@ -801,7 +801,8 @@ class AmazonIngestionRun(Base):
             name="ck_amazon_ingestion_runs_status",
         ),
         CheckConstraint(
-            "run_type IN ('marketplace_participations', 'listings', 'orders', 'sales_and_traffic_report')",
+            "run_type IN ('marketplace_participations', 'listings', 'orders', "
+            "'sales_and_traffic_report', 'inventory')",
             name="ck_amazon_ingestion_runs_run_type",
         ),
         CheckConstraint(
@@ -869,6 +870,16 @@ class AmazonIngestionRun(Base):
             "(marketplace_participation_id IS NULL AND seller_account_id IS NOT NULL "
             "AND region IS NOT NULL AND environment IS NOT NULL AND connection_id IS NOT NULL)",
             name="ck_amazon_ingestion_runs_orders_scope_required",
+        ),
+        # 12B.6B — an Inventory run is scoped exactly like Listings/Sales &
+        # Traffic (one marketplace participation per run), never like
+        # Orders: `getInventorySummaries`' own `marketplaceIds` parameter
+        # has a pinned `maxItems: 1`, so there is no multi-participation
+        # request shape to represent for this domain either.
+        CheckConstraint(
+            "run_type <> 'inventory' OR "
+            "(marketplace_participation_id IS NOT NULL AND seller_account_id IS NOT NULL)",
+            name="ck_amazon_ingestion_runs_inventory_scope_required",
         ),
         # 12B.4D remediation (0013) — durable pagination continuation.
         # These three columns are meaningless outside `run_type='orders'`
@@ -941,6 +952,23 @@ class AmazonIngestionRun(Base):
             ),
             sqlite_where=text(
                 "run_type = 'sales_and_traffic_report' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+        ),
+        # 12B.6B — the Inventory equivalent of the Listings/Sales & Traffic
+        # index above (same single-participation scope shape, §ck_..._
+        # inventory_scope_required): at most one nonterminal inventory run
+        # may exist per (seller_account, marketplace_participation) at a
+        # time.
+        Index(
+            "uq_amazon_ingestion_runs_active_inventory_scope",
+            "seller_account_id",
+            "marketplace_participation_id",
+            unique=True,
+            postgresql_where=text(
+                "run_type = 'inventory' AND status IN ('queued', 'started', 'waiting_to_retry')"
+            ),
+            sqlite_where=text(
+                "run_type = 'inventory' AND status IN ('queued', 'started', 'waiting_to_retry')"
             ),
         ),
         # Widens the PK into a composite unique key so amazon_seller_listings
@@ -1955,15 +1983,15 @@ class AmazonSalesAndTrafficSyncCheckpoint(Base):
 class AmazonWorkerHeartbeat(Base):
     """fix/ingestion-worker-runtime-availability — a database-backed
     liveness signal for the durable-job workers (Listings, Orders, Sales
-    & Traffic; not tied to any future worker type by construction). One
-    row per `worker_type`, upserted by that worker's own process on a
-    fixed cadence (`app/amazon/worker_heartbeat.py`), independent of its
-    claim/poll loop so a worker legitimately busy on one long-running job
-    still reports itself alive.
+    & Traffic, Inventory; not tied to any future worker type by
+    construction). One row per `worker_type`, upserted by that worker's
+    own process on a fixed cadence (`app/amazon/worker_heartbeat.py`),
+    independent of its claim/poll loop so a worker legitimately busy on
+    one long-running job still reports itself alive.
 
     `worker_type` reuses `amazon_ingestion_runs.run_type`'s own
-    vocabulary (`'listings'`, `'orders'`, `'sales_and_traffic_report'`)
-    rather than inventing a second one.
+    vocabulary (`'listings'`, `'orders'`, `'sales_and_traffic_report'`,
+    `'inventory'`) rather than inventing a second one.
 
     Deliberately **not** a lease: no `lease_owner`, no exclusivity, no
     interaction whatsoever with `amazon_ingestion_runs`' own claim/lease
@@ -1981,7 +2009,7 @@ class AmazonWorkerHeartbeat(Base):
     __tablename__ = "amazon_worker_heartbeats"
     __table_args__ = (
         CheckConstraint(
-            "worker_type IN ('listings', 'orders', 'sales_and_traffic_report')",
+            "worker_type IN ('listings', 'orders', 'sales_and_traffic_report', 'inventory')",
             name="ck_amazon_worker_heartbeats_worker_type",
         ),
     )
@@ -1995,3 +2023,257 @@ class AmazonWorkerHeartbeat(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+# 12B.6B — the 20 quantity columns shared verbatim (same names, same
+# nullability) by both `AmazonSellerInventory` (current state) and
+# `AmazonSellerInventoryObservation` (immutable per-run history). None are
+# `NOT NULL`/bounded stricter than Amazon's own pinned contract, which
+# documents no `required` list and no `minimum` on any of these fields
+# (see `inventory_models.py`'s module docstring) — non-negativity is
+# enforced by `inventory_normalization.py` rejecting (and counting) a row
+# with a negative value *before* it ever reaches these columns; the CHECK
+# constraints below are a defense-in-depth backstop that a correctly
+# functioning ingestion should never actually trip, not a tighter
+# admission gate than the application itself already enforces.
+_INVENTORY_QUANTITY_COLUMNS = (
+    "total_quantity",
+    "fulfillable_quantity",
+    "inbound_working_quantity",
+    "inbound_shipped_quantity",
+    "inbound_receiving_quantity",
+    "reserved_total_quantity",
+    "reserved_pending_customer_order_quantity",
+    "reserved_pending_transshipment_quantity",
+    "reserved_fc_processing_quantity",
+    "unfulfillable_total_quantity",
+    "unfulfillable_customer_damaged_quantity",
+    "unfulfillable_warehouse_damaged_quantity",
+    "unfulfillable_distributor_damaged_quantity",
+    "unfulfillable_carrier_damaged_quantity",
+    "unfulfillable_defective_quantity",
+    "unfulfillable_expired_quantity",
+    "researching_total_quantity",
+    "researching_quantity_short_term",
+    "researching_quantity_mid_term",
+    "researching_quantity_long_term",
+)
+
+
+def _non_negative_quantities_check(*, constraint_name: str) -> "CheckConstraint":
+    """One combined CHECK covering every quantity column, rather than one
+    constraint per column: PostgreSQL's 63-character identifier limit
+    makes a per-column name (`ck_<table>_<column>_non_negative`)
+    unworkable for this table's longer column names (e.g.
+    `unfulfillable_distributor_damaged_quantity`) — verified directly,
+    `test_migration_chain_matches_orm_metadata.py` fails compilation with
+    `IdentifierError` for that naming scheme. A single constraint is also
+    simpler to reason about: "every populated quantity on this row is
+    non-negative" is one fact, not twenty independent ones."""
+    condition = " AND ".join(f"({column} IS NULL OR {column} >= 0)" for column in _INVENTORY_QUANTITY_COLUMNS)
+    return CheckConstraint(condition, name=constraint_name)
+
+
+class AmazonSellerInventory(Base):
+    """12B.6B — Canonical current FBA inventory state for one (marketplace
+    participation, seller SKU, condition). Sourced from `getInventorySummaries`
+    (FBA Inventory API v1) — see
+    `docs/AI_HANDOVER/12B6B_FBA_INVENTORY_INGESTION.md`.
+
+    **FBA-fulfilled inventory only.** This table has no visibility into
+    merchant-fulfilled (MFN) stock — a SKU's absence here may simply mean
+    it is merchant-fulfilled, not that it has zero stock. See
+    `is_active`'s own doc below for the *within-FBA* absence policy.
+
+    Ownership integrity: no `organization_id`/`seller_account_id` column,
+    matching `AmazonSellerListing`'s own documented design exactly —
+    ownership is derived solely through `marketplace_participation_id` ->
+    `amazon_marketplace_participations`. A single source of truth makes
+    contradictory ownership structurally impossible.
+
+    Identity: `(marketplace_participation_id, seller_sku, condition)` is
+    the natural key. `seller_sku`/`condition` are `NOT NULL` here even
+    though the pinned Amazon contract does not itself require either
+    field on every response row — `inventory_normalization.py` rejects
+    (and counts) any row missing either *before* it ever reaches this
+    table, so a DB-level `NOT NULL` only proves an invariant the
+    application already guarantees; it never rejects Amazon-valid data
+    this table would otherwise have to accept. `asin`/`fnsku` remain
+    nullable source *attributes*, never part of identity — both may be
+    legitimately absent even for an accepted row.
+
+    `is_active`: **absence from a later complete `getInventorySummaries`
+    sweep is never treated as zero stock.** Amazon's contract does not
+    state that a zero-quantity SKU continues to appear, nor that
+    disappearance implies zero (12B.6B audit finding — genuinely
+    undocumented either way). A row absent from the latest complete
+    traversal is marked `is_active=False` with every quantity column left
+    at its last-known value, never zeroed — see
+    `AmazonInventoryIngestionService`'s reconcile step for the "only after
+    a genuinely complete sweep" guarantee this flag depends on.
+
+    Provenance: `last_ingestion_run_id` uses the same composite foreign
+    key pattern as `AmazonSellerListing.last_ingestion_run_id` — `(id,
+    marketplace_participation_id)` on `amazon_ingestion_runs`, reusing the
+    *existing* `uq_amazon_ingestion_runs_id_marketplace_participation`
+    unique constraint rather than adding a new one.
+    """
+
+    __tablename__ = "amazon_seller_inventory"
+    __table_args__ = (
+        UniqueConstraint(
+            "marketplace_participation_id",
+            "seller_sku",
+            "condition",
+            name="uq_amazon_seller_inventory_participation_sku_condition",
+        ),
+        Index("ix_amazon_seller_inventory_participation_asin", "marketplace_participation_id", "asin"),
+        Index("ix_amazon_seller_inventory_participation_fnsku", "marketplace_participation_id", "fnsku"),
+        Index("ix_amazon_seller_inventory_participation_active", "marketplace_participation_id", "is_active"),
+        Index("ix_amazon_seller_inventory_last_ingestion_run", "last_ingestion_run_id"),
+        _non_negative_quantities_check(constraint_name="ck_amazon_seller_inventory_quantities_nonneg"),
+        ForeignKeyConstraint(
+            ["last_ingestion_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_seller_inventory_last_run_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    seller_sku: Mapped[str] = mapped_column(String(180), nullable=False)
+    condition: Mapped[str] = mapped_column(String(64), nullable=False)
+    asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    fnsku: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    product_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fulfillable_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_working_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_shipped_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_receiving_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_pending_customer_order_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_pending_transshipment_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_fc_processing_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_customer_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_warehouse_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_distributor_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_carrier_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_defective_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_expired_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_short_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_mid_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_long_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    amazon_last_updated_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    # No inline ForeignKey() here: the actual constraint is the composite
+    # ForeignKeyConstraint in __table_args__ — see class docstring.
+    last_ingestion_run_id: Mapped[UUID | None] = mapped_column(Guid(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()
+
+
+class AmazonSellerInventoryObservation(Base):
+    """12B.6B — Immutable per-run inventory observation. One row per
+    successfully reconciled ingestion run per (seller SKU, condition) —
+    **never** collapsed by calendar day. This is the corrected design
+    from the 12B.6B audit approval: an earlier draft proposed one
+    snapshot per SKU per UTC day with `ON CONFLICT DO NOTHING`, which
+    would have silently discarded every later same-day observation after
+    the first — inventory can legitimately change (and be re-synced)
+    multiple times per day. Retention/rollups are deliberately deferred
+    to a later milestone; this table simply never overwrites or discards
+    a successful run's own observations.
+
+    Denormalized (no FK to `AmazonSellerInventory`), matching
+    `AmazonSalesAndTrafficDailyFact`'s own precedent for immutable fact
+    tables — this table is a historical log, not a view of current state.
+
+    `ingestion_run_id` is part of the natural key specifically so a
+    retried/duplicate reconcile attempt for the exact same run can never
+    insert the exact same observation twice — see
+    `AmazonSellerInventoryRepository.reconcile_snapshot`'s upsert-by-run
+    behavior. Two *different* successful runs the same day always
+    produce two distinct rows.
+    """
+
+    __tablename__ = "amazon_seller_inventory_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "ingestion_run_id",
+            "marketplace_participation_id",
+            "seller_sku",
+            "condition",
+            name="uq_amazon_seller_inventory_observations_run_identity",
+        ),
+        Index(
+            "ix_amazon_seller_inventory_observations_participation_sku",
+            "marketplace_participation_id",
+            "seller_sku",
+            "condition",
+        ),
+        Index("ix_amazon_seller_inventory_observations_run", "ingestion_run_id"),
+        Index("ix_amazon_seller_inventory_observations_observed_at", "marketplace_participation_id", "observed_at"),
+        _non_negative_quantities_check(constraint_name="ck_amazon_seller_inventory_obs_quantities_nonneg"),
+        ForeignKeyConstraint(
+            ["ingestion_run_id", "marketplace_participation_id"],
+            ["amazon_ingestion_runs.id", "amazon_ingestion_runs.marketplace_participation_id"],
+            name="fk_amazon_seller_inventory_obs_run_participation",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    marketplace_participation_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_marketplace_participations.id", ondelete="RESTRICT"), nullable=False
+    )
+    # No inline ForeignKey() here: the actual constraint is the composite
+    # ForeignKeyConstraint above — see class docstring.
+    ingestion_run_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    seller_sku: Mapped[str] = mapped_column(String(180), nullable=False)
+    condition: Mapped[str] = mapped_column(String(64), nullable=False)
+    asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    fnsku: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    product_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fulfillable_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_working_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_shipped_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_receiving_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_pending_customer_order_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_pending_transshipment_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_fc_processing_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_customer_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_warehouse_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_distributor_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_carrier_damaged_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_defective_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unfulfillable_expired_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_short_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_mid_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    researching_quantity_long_term: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    amazon_last_updated_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()

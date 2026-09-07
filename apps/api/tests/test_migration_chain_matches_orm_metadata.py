@@ -109,13 +109,18 @@ def test_full_migration_chain_compiles_for_postgresql_with_no_collisions() -> No
     assert "amazon_sales_traffic_product_facts" in tables
     assert "amazon_sales_traffic_sync_checkpoints" in tables
     assert "amazon_worker_heartbeats" in tables
-    # 33 application tables (12B.4B added amazon_ingestion_run_marketplace_
+    assert "amazon_seller_inventory" in tables
+    assert "amazon_seller_inventory_observations" in tables
+    # 35 application tables (12B.4B added amazon_ingestion_run_marketplace_
     # participations, amazon_seller_orders, amazon_seller_order_items,
     # amazon_orders_sync_checkpoints; 12B.6A added amazon_sales_traffic_
     # daily_facts, amazon_sales_traffic_product_facts, amazon_sales_
     # traffic_sync_checkpoints; fix/ingestion-worker-runtime-availability
-    # added amazon_worker_heartbeats) + alembic's own bookkeeping table.
-    assert len(tables) == 34, sorted(tables)
+    # added amazon_worker_heartbeats (migration 0015); 12B.6B added
+    # amazon_seller_inventory, amazon_seller_inventory_observations
+    # (renumbered to migration 0016 after that fix landed)) + alembic's
+    # own bookkeeping table.
+    assert len(tables) == 36, sorted(tables)
 
 
 def test_migration_chain_table_set_matches_orm_metadata() -> None:
