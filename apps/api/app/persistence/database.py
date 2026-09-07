@@ -70,10 +70,11 @@ _SessionLocal: sessionmaker[Session] | None = None
 #   `app/main.py`'s own code. `app.main` performs no authorization side
 #   effect at all — merely importing it (for a `TestClient`, a
 #   diagnostic script, anything) changes nothing here.
-# - `"listings_worker"` / `"orders_worker"` / `"sales_traffic_worker"` —
-#   set by each worker's own `main()`, and only *after* that worker's own
-#   pre-existing, already-fail-closed `ASI_LISTINGS_WORKER_ENABLED`/
-#   `ASI_ORDERS_WORKER_ENABLED`/`ASI_SALES_TRAFFIC_WORKER_ENABLED` gate
+# - `"listings_worker"` / `"orders_worker"` / `"sales_traffic_worker"` /
+#   `"inventory_worker"` — set by each worker's own `main()`, and only
+#   *after* that worker's own pre-existing, already-fail-closed
+#   `ASI_LISTINGS_WORKER_ENABLED`/`ASI_ORDERS_WORKER_ENABLED`/
+#   `ASI_SALES_TRAFFIC_WORKER_ENABLED`/`ASI_INVENTORY_WORKER_ENABLED` gate
 #   has already been confirmed true. This is not a new opt-in surface: a
 #   worker that was not already explicitly authorized to run at all never
 #   reaches the line that sets this.
@@ -98,7 +99,7 @@ _SessionLocal: sessionmaker[Session] | None = None
 # have.
 _DB_RUNTIME_CONTEXT_ENV_VAR = "ASI_DB_RUNTIME_CONTEXT"
 _RECOGNIZED_DB_RUNTIME_CONTEXTS = frozenset(
-    {"api", "listings_worker", "orders_worker", "sales_traffic_worker", "admin"}
+    {"api", "listings_worker", "orders_worker", "sales_traffic_worker", "inventory_worker", "admin"}
 )
 
 # Narrow, explicit, session-scoped opt-in for a genuinely authorized
