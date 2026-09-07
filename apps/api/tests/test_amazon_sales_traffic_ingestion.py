@@ -262,9 +262,73 @@ async def test_process_claimed_job_creates_report_and_heartbeats_report_id_witho
     assert outcome == SalesTrafficIngestionOutcome(run_id=run_id, outcome="created")
     assert client.get_report_calls == []  # never polls in the same attempt it created the report
     run = _get_run(run_id)
-    assert run.status == "started"  # lease retained — not released to waiting_to_retry
+    # Released to `waiting_to_retry`, not left `started`: a `started` row
+    # is invisible to `claim_next_sales_traffic_job`, so retaining it here
+    # would strand the run until its lease's bare expiry — no later
+    # attempt would ever call `getReport`. See sales_traffic_ingestion.py's
+    # own module docstring.
+    assert run.status == "waiting_to_retry"
+    assert run.failure_class == "polling"
+    assert run.next_retry_at is not None
+    assert run.lease_owner is None
     assert run.report_id == "amzn-report-1"
     assert run.report_processing_status == "IN_QUEUE"
+
+
+@pytest.mark.asyncio
+async def test_a_later_claim_after_report_creation_actually_reaches_get_report() -> None:
+    """Regression test for a real bug: the first attempt (create_report,
+    tested above) used to leave the run `status='started'`, which
+    `claim_next_sales_traffic_job` can never reclaim (it only claims
+    `queued`/`waiting_to_retry`) — so no attempt, ever, would call
+    `getReport`, and the run was guaranteed to time out after its lease
+    duration regardless of how long a worker kept polling. This proves
+    the full cycle end-to-end through the real claim query, not just the
+    first attempt's own row state: create the report, let `next_retry_at`
+    become due, reclaim via `claim_next_sales_traffic_job` exactly as a
+    worker's next poll would, and confirm that second attempt actually
+    calls `getReport` and can reach a terminal `succeeded` outcome."""
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope, start=date(2026, 8, 1), end=date(2026, 8, 1))
+    client = _FakeReportsClient(create_report_script=[("amzn-report-1", 1)])
+    service = _service(client)
+
+    first_outcome = await service.process_claimed_job(run_id)
+    assert first_outcome.outcome == "created"
+
+    # Simulate `next_retry_at` having elapsed (real code waits ~45s;
+    # advancing time directly keeps this test fast and deterministic).
+    with session_scope() as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        run.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.flush()
+
+    with session_scope() as session:
+        reclaimed = AmazonIngestionRunRepository(session).claim_next_sales_traffic_job(
+            lease_owner="test-lease-2", lease_duration_seconds=300, max_global_active=10,
+            max_active_per_organization=10,
+        )
+    assert reclaimed is not None
+    assert reclaimed.id == run_id  # the exact same run — not a different one
+
+    report = _report(date_str="2026-08-01")
+    client._get_report_script = [ReportStatus("amzn-report-1", "DONE", "doc-1")]
+    client._get_report_document_script = [
+        ReportDocumentInfo(url="https://example.test/doc", compression_algorithm=None)
+    ]
+    client._download_script = [report]
+
+    second_outcome = await service.process_claimed_job(run_id)
+
+    assert second_outcome.outcome == "persisted"
+    assert client.get_report_calls == ["amzn-report-1"]
+    assert client.create_report_calls == [
+        CreateSalesAndTrafficReportRequest(
+            marketplace_id=MARKETPLACE, data_start_time=date(2026, 8, 1), data_end_time=date(2026, 8, 1)
+        )
+    ]  # createReport was never called a second time — the durable report_id was reused
+    run = _get_run(run_id)
+    assert run.status == "succeeded"
 
 
 @pytest.mark.asyncio
