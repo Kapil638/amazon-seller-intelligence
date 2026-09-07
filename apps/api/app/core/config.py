@@ -308,19 +308,21 @@ class Settings(BaseSettings):
     )
 
     # Worker liveness heartbeat — shared, database-backed availability
-    # signal used identically by the Listings, Orders, and Sales & Traffic
-    # workers/triggers (fix/ingestion-worker-runtime-availability). Each
-    # worker process writes its own `amazon_worker_heartbeats` row on a
-    # fixed cadence, independent of its claim/poll loop (so one long-
-    # running job in progress never makes the process look dead); each
-    # domain's sync-trigger service reads it before enqueueing a new job,
-    # so a Sync click when no matching worker is actually running gets a
+    # signal used identically by the Listings, Orders, Sales & Traffic,
+    # and Inventory workers/triggers (fix/ingestion-worker-runtime-
+    # availability, extended to Inventory once that milestone's own
+    # worker was integrated with this shared mechanism). Each worker
+    # process writes its own `amazon_worker_heartbeats` row on a fixed
+    # cadence, independent of its claim/poll loop (so one long-running
+    # job in progress never makes the process look dead); each domain's
+    # sync-trigger service reads it before enqueueing a new job, so a
+    # Sync click when no matching worker is actually running gets a
     # clear, immediate refusal instead of a job that queues forever. See
     # `app/amazon/worker_heartbeat.py`.
     worker_heartbeat_interval_seconds: float = Field(
         default=10.0, gt=0, le=300,
         description=(
-            "How often each worker process (Listings/Orders/Sales & Traffic) writes its own "
+            "How often each worker process (Listings/Orders/Sales & Traffic/Inventory) writes its own "
             "liveness heartbeat row, via a background loop independent of its claim/poll cycle — "
             "so a worker legitimately busy on one long-running job still reports itself alive."
         ),
@@ -343,6 +345,90 @@ class Settings(BaseSettings):
                 "worker_heartbeat_stale_after_seconds must exceed worker_heartbeat_interval_seconds "
                 "(it must tolerate at least one missed heartbeat, or every worker would appear "
                 "unavailable between writes)"
+            )
+        return self
+
+    # 12B.6B — FBA Inventory sync settings. Listings-shaped (in-memory
+    # accumulate-then-reconcile, no durable pagination token — see
+    # inventory_client.py's module docstring for why `nextToken`'s
+    # 30-second lifetime rules that out), so this block mirrors the
+    # Listings settings above field-for-field, plus two Inventory-specific
+    # additions (`inventory_sync_max_pages`, `inventory_worker_min_page_
+    # interval_seconds`) that have no Listings equivalent.
+    inventory_sync_max_attempts: int = Field(
+        default=5, ge=1, le=20,
+        description="Maximum claim attempts for one Inventory job before it terminalizes as failed rather than retrying again.",
+    )
+    inventory_sync_base_backoff_seconds: float = Field(
+        default=30.0, gt=0,
+        description="Base delay for an Inventory job's own retry backoff (used when Amazon's Retry-After is absent).",
+    )
+    inventory_sync_max_backoff_seconds: float = Field(
+        default=900.0, gt=0,
+        description="Hard cap on an Inventory job's own retry backoff delay, regardless of a larger Retry-After value.",
+    )
+    inventory_sync_max_total_retry_seconds: float = Field(
+        default=3600.0, gt=0,
+        description="Hard cap on the total elapsed wall-clock time (since first claim) an Inventory job may spend retrying before terminalizing as failed.",
+    )
+    inventory_sync_lease_duration_seconds: int = Field(
+        default=300, ge=30, le=3600,
+        description="How long a worker's exclusive claim on an Inventory job is valid before it is eligible for stale-lease recovery by another worker.",
+    )
+    inventory_sync_max_global_concurrent_jobs: int = Field(
+        default=4, ge=1, le=100,
+        description="Maximum number of Inventory jobs any worker fleet may run simultaneously, across all organizations.",
+    )
+    inventory_sync_max_concurrent_jobs_per_organization: int = Field(
+        default=1, ge=1, le=20,
+        description="Maximum number of Inventory jobs one organization may run simultaneously.",
+    )
+    inventory_sync_trigger_cooldown_seconds: int = Field(
+        default=300, ge=0, le=3600,
+        description="Minimum time after an Inventory job's own completion before the trigger endpoint accepts another request for the same marketplace participation.",
+    )
+    inventory_sync_max_queued_per_organization: int = Field(
+        default=25, ge=1, le=1000,
+        description="Queue-backlog safety valve for Inventory sync requests — never a worker-execution-capacity gate. See count_queued_inventory_runs_for_organization.",
+    )
+    inventory_sync_max_pages: int = Field(
+        default=500, ge=1, le=5000,
+        description=(
+            "ASI's own configurable safety bound on getInventorySummaries pagination — Amazon documents no hard "
+            "result ceiling for this operation the way Listings' searchListingsItems documents 1000 items/50 pages "
+            "(12B.6B audit finding: NOT DOCUMENTED). Hitting this bound while Amazon still returns a nextToken is a "
+            "terminal, non-retryable pagination_bound_exceeded failure — the visible signal to raise this setting, "
+            "never a silently truncated snapshot."
+        ),
+    )
+    inventory_worker_min_page_interval_seconds: float = Field(
+        default=0.5, ge=0, le=10,
+        description=(
+            "Proactive minimum delay between consecutive getInventorySummaries page requests within one traversal, "
+            "matching the pinned 2 requests/second usage-plan ceiling. Defense-in-depth only — never the sole "
+            "rate-limit mechanism; the actual authority is inventory_client.py's reactive handling of a real 429 "
+            "response (honors Amazon's own Retry-After when present)."
+        ),
+    )
+    inventory_worker_idle_poll_seconds: float = Field(
+        default=5.0, gt=0, le=300,
+        description="How long the Inventory worker sleeps between claim attempts when no eligible job was found.",
+    )
+    inventory_worker_poll_error_base_backoff_seconds: float = Field(
+        default=2.0, gt=0,
+        description="Base delay for the Inventory worker's own bounded exponential backoff after a recoverable error in the claim/poll step itself.",
+    )
+    inventory_worker_poll_error_max_backoff_seconds: float = Field(
+        default=60.0, gt=0,
+        description="Hard cap on the Inventory worker's own poll-error backoff delay — see inventory_worker_poll_error_base_backoff_seconds.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_inventory_worker_poll_error_backoff_bounds(self) -> "Settings":
+        if self.inventory_worker_poll_error_base_backoff_seconds > self.inventory_worker_poll_error_max_backoff_seconds:
+            raise ValueError(
+                "inventory_worker_poll_error_base_backoff_seconds must not exceed "
+                "inventory_worker_poll_error_max_backoff_seconds"
             )
         return self
 

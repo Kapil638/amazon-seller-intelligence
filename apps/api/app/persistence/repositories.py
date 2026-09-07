@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -10,6 +10,7 @@ from sqlalchemy import DateTime, Select, and_, case, func, or_, select, text, up
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, selectinload
 
+from app.amazon.inventory_normalization import NormalizedInventoryObservation
 from app.amazon.secrets import InvalidSecretReferenceError, parse_asi_amazon_secret_reference
 from app.core.config import get_settings
 from app.persistence.hashing import product_content_hash, sha256_bytes
@@ -42,6 +43,8 @@ from app.persistence.models import (
     AmazonSalesAndTrafficProductFact,
     AmazonSalesAndTrafficSyncCheckpoint,
     AmazonSellerAccount,
+    AmazonSellerInventory,
+    AmazonSellerInventoryObservation,
     AmazonSellerListing,
     AmazonSellerOrder,
     AmazonSellerOrderItem,
@@ -1631,6 +1634,15 @@ class SalesTrafficRunClaim:
 # required to keep a same-`created_at` `cancelled_before_start` row from
 # ever outranking a genuinely newer, actually-started one.
 _LATEST_LISTINGS_RUN_ORDER_BY = (
+    AmazonIngestionRun.created_at.desc(),
+    AmazonIngestionRun.started_at.is_not(None).desc(),
+    AmazonIngestionRun.id.desc(),
+)
+
+# 12B.6B — identical shape/reasoning as `_LATEST_LISTINGS_RUN_ORDER_BY`,
+# used by `get_latest_inventory_run`/`get_latest_cooldown_relevant_
+# inventory_run`.
+_LATEST_INVENTORY_RUN_ORDER_BY = (
     AmazonIngestionRun.created_at.desc(),
     AmazonIngestionRun.started_at.is_not(None).desc(),
     AmazonIngestionRun.id.desc(),
@@ -3493,6 +3505,382 @@ class AmazonIngestionRunRepository:
         )
         self.session.flush()
         return result.rowcount == 1
+
+    # --- 12B.6B: Inventory run lifecycle (mirrors the Listings methods
+    # above exactly — single-participation scope, in-memory accumulate-
+    # then-reconcile, no durable pagination token) -------------------------
+
+    # Reserved solely for `claim_next_inventory_job`'s claim-decision
+    # critical section — never reused by any other `pg_advisory_xact_lock`
+    # call. 663=Listings, 664=Orders, 665=Sales & Traffic; this is the
+    # next unused key in that sequence.
+    _INVENTORY_CLAIM_ADVISORY_LOCK_KEY = 847_539_201_666
+
+    def enqueue_inventory_run(
+        self,
+        *,
+        organization_id: UUID,
+        seller_account_id: UUID,
+        marketplace_participation_id: UUID,
+        region: str,
+        environment: str,
+        connection_id: UUID | None,
+    ) -> ListingsRunClaim:
+        """Creates a durable `status='queued'` Inventory job — no lease, no
+        `started_at`, no Amazon call. A separate worker process claims it
+        later via `claim_next_inventory_job`. Identical shape to
+        `enqueue_listings_run` — reuses `ListingsRunClaim` as the return
+        type since it carries nothing Listings-specific (just
+        `claimed`/`run_id`/`reason`)."""
+        seller_account = AmazonSellerAccountRepository(self.session).get_by_id(organization_id, seller_account_id)
+        if seller_account is None:
+            raise TypeError("Amazon inventory run cannot bind a seller account from another organization.")
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon inventory run cannot bind a marketplace participation from another organization."
+            )
+        if participation.seller_account_id != seller_account_id:
+            raise TypeError(
+                "Amazon inventory run marketplace participation does not belong to the given seller account."
+            )
+        if connection_id is not None:
+            connection = AmazonConnectionRepository(self.session).get_by_id(organization_id, connection_id)
+            if connection is None:
+                raise TypeError("Amazon inventory run cannot bind a connection from another organization.")
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.seller_account_id == seller_account_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        row = AmazonIngestionRun(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            seller_account_id=seller_account_id,
+            marketplace_participation_id=marketplace_participation_id,
+            run_type="inventory",
+            domain="fba_inventory",
+            status="queued",
+            region=region,
+            environment=environment,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            return ListingsRunClaim(claimed=False, reason="already_running")
+        return ListingsRunClaim(claimed=True, run_id=row.id)
+
+    def get_active_inventory_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+            .order_by(AmazonIngestionRun.created_at.desc())
+            .limit(1)
+        ).first()
+
+    def get_latest_inventory_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """Ordered by `created_at` (never null), with a started-ness
+        tiebreak — see `get_latest_listings_run`'s docstring for why: the
+        identical bug class (a stale never-started row outranking a
+        genuinely newer one) applies here just as much."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "inventory",
+            )
+            .order_by(*_LATEST_INVENTORY_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_latest_cooldown_relevant_inventory_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        """Terminal runs only (`succeeded`/`partial`/`failed`/`timed_out`)
+        — see `get_latest_cooldown_relevant_listings_run`'s docstring for
+        the exact race this excludes."""
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status.in_(("succeeded", "partial", "failed", "timed_out")),
+            )
+            .order_by(*_LATEST_INVENTORY_RUN_ORDER_BY)
+            .limit(1)
+        ).first()
+
+    def get_latest_successful_inventory_run(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonIngestionRun | None:
+        return self.session.scalars(
+            select(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.marketplace_participation_id == marketplace_participation_id,
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status == "succeeded",
+            )
+            .order_by(AmazonIngestionRun.started_at.desc(), AmazonIngestionRun.id.desc())
+            .limit(1)
+        ).first()
+
+    def claim_next_inventory_job(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        max_global_active: int,
+        max_active_per_organization: int,
+    ) -> AmazonIngestionRun | None:
+        """Worker-side claim — identical shape and safety properties to
+        `claim_next_listings_job` (single-row `SKIP LOCKED` candidate,
+        PostgreSQL-only transaction-scoped advisory lock serializing the
+        decision step, stale-`started`-lease reclaim first), using a
+        dedicated advisory-lock key never shared with any other run
+        type's claim method."""
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": self._INVENTORY_CLAIM_ADVISORY_LOCK_KEY},
+            )
+
+        self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at.is_not(None),
+                AmazonIngestionRun.lease_expires_at < func.now(),
+            )
+            .values(
+                status="timed_out",
+                completed_at=func.now(),
+                failure_class="lease_expired",
+                lease_owner=None,
+                pagination_complete=False,
+            )
+        )
+        self.session.flush()
+
+        _Global = aliased(AmazonIngestionRun)
+        global_active_count = (
+            select(func.count())
+            .select_from(_Global)
+            .where(_Global.run_type == "inventory", _Global.status == "started")
+            .scalar_subquery()
+        )
+        _Org = aliased(AmazonIngestionRun)
+        org_active_count = (
+            select(func.count())
+            .select_from(_Org)
+            .where(
+                _Org.run_type == "inventory",
+                _Org.status == "started",
+                _Org.organization_id == AmazonIngestionRun.organization_id,
+            )
+            .scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonIngestionRun.id)
+            .where(
+                AmazonIngestionRun.run_type == "inventory",
+                or_(
+                    AmazonIngestionRun.status == "queued",
+                    and_(
+                        AmazonIngestionRun.status == "waiting_to_retry",
+                        AmazonIngestionRun.next_retry_at.is_not(None),
+                        AmazonIngestionRun.next_retry_at <= func.now(),
+                    ),
+                ),
+                global_active_count < max_global_active,
+                org_active_count < max_active_per_organization,
+            )
+            .order_by(
+                func.coalesce(AmazonIngestionRun.next_retry_at, AmazonIngestionRun.created_at).asc(),
+                AmazonIngestionRun.id.asc(),
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+
+        claimed = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(AmazonIngestionRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                last_heartbeat_at=func.now(),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonIngestionRun.started_at, func.now()),
+                retry_count=case(
+                    (AmazonIngestionRun.status == "waiting_to_retry", AmazonIngestionRun.retry_count + 1),
+                    else_=AmazonIngestionRun.retry_count,
+                ),
+            )
+            .returning(AmazonIngestionRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
+
+    def heartbeat_inventory_run(
+        self, organization_id: UUID, run_id: UUID, *, lease_owner: str, lease_duration_seconds: int, pages_fetched: int
+    ) -> bool:
+        """Extends the lease and records progress for an in-flight
+        Inventory run. Same compare-and-set guarantee as
+        `heartbeat_listings_run` — see its docstring."""
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                lease_expires_at=self._lease_expiry_value(lease_duration_seconds),
+                pages_fetched=pages_fetched,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def complete_inventory_run(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        status: str,
+        records_received: int = 0,
+        records_accepted: int = 0,
+        records_rejected: int = 0,
+        pages_fetched: int = 0,
+        reported_total_results: int | None = None,
+        pagination_complete: bool = True,
+        failure_class: str | None = None,
+    ) -> bool:
+        """Atomic, lease-owner-gated completion — identical guarantee to
+        `complete_listings_run`. Never accepts `status='partial'` for
+        Inventory: pages are accumulated entirely in memory, so a
+        traversal either reconciles completely or produces no new
+        inventory state at all — there is no genuine partial-success
+        outcome for this domain to represent (12B.6B audit requirement)."""
+        if status not in self._VALID_STATUSES:
+            raise TypeError(f"Unsupported Amazon ingestion run status: {status!r}")
+        if status == "partial":
+            raise TypeError("Inventory runs never complete as 'partial' — see this method's own docstring.")
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status=status,
+                completed_at=func.now(),
+                records_received=records_received,
+                records_accepted=records_accepted,
+                records_rejected=records_rejected,
+                pages_fetched=pages_fetched,
+                reported_total_results=reported_total_results,
+                pagination_complete=pagination_complete,
+                failure_class=failure_class,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def reschedule_inventory_run_for_retry(
+        self,
+        organization_id: UUID,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        next_retry_at,
+        failure_class: str,
+        pages_fetched: int = 0,
+        records_received: int = 0,
+        reported_total_results: int | None = None,
+    ) -> bool:
+        """Releases the lease and moves a run to `waiting_to_retry` —
+        identical guarantee to `reschedule_listings_run_for_retry`."""
+        result = self.session.execute(
+            update(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id == run_id,
+                AmazonIngestionRun.lease_owner == lease_owner,
+                AmazonIngestionRun.status == "started",
+                AmazonIngestionRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="waiting_to_retry",
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                pages_fetched=pages_fetched,
+                records_received=records_received,
+                reported_total_results=reported_total_results,
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def count_queued_inventory_runs_for_organization(self, organization_id: UUID) -> int:
+        """Genuine queue-backlog count — `status='queued'` only. See
+        `count_queued_listings_runs_for_organization`'s identical
+        reasoning."""
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(AmazonIngestionRun)
+            .where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.run_type == "inventory",
+                AmazonIngestionRun.status == "queued",
+            )
+        )
+        return count or 0
 
 
 @dataclass(frozen=True)
@@ -5581,7 +5969,7 @@ class AmazonSalesTrafficProductFactRepository:
         )
 
 
-_KNOWN_WORKER_TYPES = frozenset({"listings", "orders", "sales_and_traffic_report"})
+_KNOWN_WORKER_TYPES = frozenset({"listings", "orders", "sales_and_traffic_report", "inventory"})
 
 
 @dataclass(frozen=True)
@@ -5698,6 +6086,360 @@ def _ensure_aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+@dataclass(frozen=True)
+class InventorySummaryCounts:
+    """Plain aggregate counts for one marketplace participation's FBA
+    inventory. 12B.6B read API. Never carries an identifier — purely
+    counts."""
+
+    total: int
+    active: int
+    inactive: int
+    with_asin: int
+    with_fnsku: int
+    zero_fulfillable: int
+
+
+# 12B.6B — every `AmazonSellerInventory`/`AmazonSellerInventoryObservation`
+# column name that comes directly from a `NormalizedInventoryObservation`
+# field, excluding the two identity fields (`seller_sku`, `condition`,
+# handled separately as lookup/insert keys, never re-assigned on update).
+# Field names are identical across the dataclass and both ORM models by
+# construction — see `inventory_normalization.py`.
+_INVENTORY_OBSERVATION_VALUE_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(NormalizedInventoryObservation) if f.name not in ("seller_sku", "condition")
+)
+
+
+def _observation_value_dict(observation: "NormalizedInventoryObservation") -> dict:
+    return {name: getattr(observation, name) for name in _INVENTORY_OBSERVATION_VALUE_FIELDS}
+
+
+class AmazonSellerInventoryRepository:
+    """Marketplace-participation-scoped canonical FBA inventory. 12B.6B.
+
+    `amazon_seller_inventory` has no `organization_id` column by design
+    (see `AmazonSellerInventory`'s docstring in `models.py`) — every
+    public read and write on this repository takes `organization_id` and
+    validates it against `marketplace_participation_id` first, identical
+    to `AmazonSellerListingRepository`'s own documented pattern.
+
+    Writes go through exactly one path: `reconcile_snapshot()`. It
+    validates ownership **once** per call, then upserts current state,
+    records one immutable observation per accepted row, and — always,
+    unconditionally, by this method's own contract — deactivates any
+    previously-active row absent from `observations`.
+
+    **This method must only ever be called by the ingestion service after
+    a genuinely complete traversal** (every page fetched successfully,
+    pagination ended naturally with no further `nextToken`, the page
+    count stayed within the configured safety bound) — exactly mirroring
+    `AmazonListingsIngestionService._reconcile`'s own invariant: it is
+    only ever reached when `traversal.failure_class is None`. This
+    repository method does not itself re-verify that invariant (it has no
+    way to); the safety property it provides is deactivating rows for
+    *whatever snapshot it is given*, in one transaction, atomically with
+    recording that snapshot's own observations — the *decision* of
+    whether a given traversal is complete enough to deserve deactivation
+    authority belongs to `AmazonInventoryIngestionService` alone (12B.6B
+    audit requirement: a timeout, token expiry, malformed page, or
+    max-page breach must never reach this method at all).
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def _require_participation_in_organization(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> None:
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            raise TypeError(
+                "Amazon seller inventory access cannot bind a marketplace participation from another organization."
+            )
+
+    def _get_owned_participation(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> AmazonMarketplaceParticipation | None:
+        return AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+
+    def get_by_natural_key(
+        self, organization_id: UUID, marketplace_participation_id: UUID, seller_sku: str, condition: str
+    ) -> AmazonSellerInventory | None:
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        return self._get_by_natural_key_unchecked(marketplace_participation_id, seller_sku, condition)
+
+    def _get_by_natural_key_unchecked(
+        self, marketplace_participation_id: UUID, seller_sku: str, condition: str
+    ) -> AmazonSellerInventory | None:
+        return self.session.scalars(
+            select(AmazonSellerInventory).where(
+                AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id,
+                AmazonSellerInventory.seller_sku == seller_sku,
+                AmazonSellerInventory.condition == condition,
+            )
+        ).first()
+
+    def reconcile_snapshot(
+        self,
+        *,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        observations: list["NormalizedInventoryObservation"],
+        ingestion_run_id: UUID,
+    ) -> tuple[int, int]:
+        """The one validated, organization-scoped write boundary for an
+        inventory snapshot. Validates ownership exactly once, then
+        upserts every entry in `observations`, records one immutable
+        observation row per entry, and deactivates whatever is missing
+        from it. Returns `(upserted_count, deactivated_count)`.
+
+        See class docstring: callers must only pass a fully validated,
+        authoritative (complete-traversal) snapshot — this method does
+        not itself decide traversal-completeness authority, only
+        ownership.
+        """
+        self._require_participation_in_organization(organization_id, marketplace_participation_id)
+        seen_identities: set[tuple[str, str]] = set()
+        for observation in observations:
+            self._upsert(
+                marketplace_participation_id=marketplace_participation_id,
+                observation=observation,
+                last_ingestion_run_id=ingestion_run_id,
+            )
+            self._insert_observation(
+                marketplace_participation_id=marketplace_participation_id,
+                observation=observation,
+                ingestion_run_id=ingestion_run_id,
+            )
+            seen_identities.add((observation.seller_sku, observation.condition))
+        deactivated = self._deactivate_missing(
+            marketplace_participation_id=marketplace_participation_id, seen_identities=seen_identities
+        )
+        return len(observations), deactivated
+
+    def _upsert(
+        self,
+        *,
+        marketplace_participation_id: UUID,
+        observation: "NormalizedInventoryObservation",
+        last_ingestion_run_id: UUID,
+    ) -> AmazonSellerInventory:
+        """Upsert by `(marketplace_participation_id, seller_sku,
+        condition)`. Preserves `first_seen_at`; reactivates a
+        previously-inactive row that reappears. `last_ingestion_run_id`
+        must already belong to the same `marketplace_participation_id` —
+        enforced by the database's own composite foreign key, not
+        re-validated here."""
+        now = datetime.now(UTC)
+        values = _observation_value_dict(observation)
+        existing = self._get_by_natural_key_unchecked(
+            marketplace_participation_id, observation.seller_sku, observation.condition
+        )
+        if existing is not None:
+            for column, value in values.items():
+                setattr(existing, column, value)
+            existing.is_active = True
+            existing.last_seen_at = now
+            existing.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return existing
+        row = AmazonSellerInventory(
+            marketplace_participation_id=marketplace_participation_id,
+            seller_sku=observation.seller_sku,
+            condition=observation.condition,
+            is_active=True,
+            last_ingestion_run_id=last_ingestion_run_id,
+            **values,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            # The single-writer lease should make a genuine natural-key
+            # race unreachable in practice — see
+            # `AmazonSellerListingRepository._upsert`'s identical
+            # reasoning for why this SAVEPOINT-and-retry exists anyway.
+            winner = self.session.scalars(
+                select(AmazonSellerInventory).where(
+                    AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id,
+                    AmazonSellerInventory.seller_sku == observation.seller_sku,
+                    AmazonSellerInventory.condition == observation.condition,
+                )
+            ).first()
+            if winner is None:
+                raise
+            for column, value in values.items():
+                setattr(winner, column, value)
+            winner.is_active = True
+            winner.last_seen_at = now
+            winner.last_ingestion_run_id = last_ingestion_run_id
+            self.session.flush()
+            return winner
+        return row
+
+    def _insert_observation(
+        self,
+        *,
+        marketplace_participation_id: UUID,
+        observation: "NormalizedInventoryObservation",
+        ingestion_run_id: UUID,
+    ) -> None:
+        """Immutable per-run history row — never updated after insert.
+        `ON CONFLICT`-safe via a SAVEPOINT: a retried reconcile attempt
+        for the exact same `ingestion_run_id` (should not happen in
+        normal operation — a run only ever reaches `reconcile_snapshot`
+        once — but defensive) is a silent no-op, never a duplicate row
+        or a crash."""
+        values = _observation_value_dict(observation)
+        row = AmazonSellerInventoryObservation(
+            marketplace_participation_id=marketplace_participation_id,
+            ingestion_run_id=ingestion_run_id,
+            seller_sku=observation.seller_sku,
+            condition=observation.condition,
+            **values,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(row)
+                self.session.flush()
+        except IntegrityError:
+            pass
+
+    def _deactivate_missing(
+        self,
+        *,
+        marketplace_participation_id: UUID,
+        seen_identities: set[tuple[str, str]],
+    ) -> int:
+        """Mark rows absent from the latest complete, authoritative
+        snapshot as inactive. **Never treated as zero stock** — every
+        quantity column is left at its last-known value, only `is_active`
+        and `last_seen_at` change. Mirrors
+        `AmazonSellerListingRepository._deactivate_missing`."""
+        rows = self.session.scalars(
+            select(AmazonSellerInventory).where(
+                AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id,
+                AmazonSellerInventory.is_active.is_(True),
+            )
+        ).all()
+        now = datetime.now(UTC)
+        deactivated = 0
+        for row in rows:
+            if (row.seller_sku, row.condition) not in seen_identities:
+                row.is_active = False
+                row.last_seen_at = now
+                deactivated += 1
+        if deactivated:
+            self.session.flush()
+        return deactivated
+
+    # --- 12B.6B: read-only, organization-scoped inventory access ----------
+
+    _SORT_COLUMNS: dict[str, Any] = {
+        "last_seen_at": AmazonSellerInventory.last_seen_at,
+        "first_seen_at": AmazonSellerInventory.first_seen_at,
+        "seller_sku": AmazonSellerInventory.seller_sku,
+        "asin": AmazonSellerInventory.asin,
+        "fulfillable_quantity": AmazonSellerInventory.fulfillable_quantity,
+        "total_quantity": AmazonSellerInventory.total_quantity,
+    }
+
+    def get_summary_counts(
+        self, organization_id: UUID, marketplace_participation_id: UUID
+    ) -> InventorySummaryCounts | None:
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+        row = self.session.execute(
+            select(
+                func.count().label("total"),
+                func.count().filter(AmazonSellerInventory.is_active.is_(True)).label("active"),
+                func.count().filter(AmazonSellerInventory.is_active.is_(False)).label("inactive"),
+                func.count().filter(AmazonSellerInventory.asin.is_not(None)).label("with_asin"),
+                func.count().filter(AmazonSellerInventory.fnsku.is_not(None)).label("with_fnsku"),
+                func.count().filter(AmazonSellerInventory.fulfillable_quantity == 0).label("zero_fulfillable"),
+            ).where(AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id)
+        ).one()
+        return InventorySummaryCounts(
+            total=row.total,
+            active=row.active,
+            inactive=row.inactive,
+            with_asin=row.with_asin,
+            with_fnsku=row.with_fnsku,
+            zero_fulfillable=row.zero_fulfillable,
+        )
+
+    def list_page(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        search: str | None = None,
+        is_active: bool | None = None,
+        sort_by: str = "last_seen_at",
+        sort_dir: str = "desc",
+        offset: int = 0,
+        limit: int = 25,
+    ) -> "tuple[list[AmazonSellerInventory], int] | None":
+        """Validated, filtered, deterministically-ordered inventory page,
+        scoped to one organization-owned marketplace participation.
+        Returns `None` if the participation does not belong to
+        `organization_id`. `search` matches seller SKU, FNSKU, or ASIN —
+        see `AmazonSellerListingRepository.list_page`'s identical
+        `_escape_like_term`/`NULLS LAST` reasoning, reused verbatim here."""
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+        if sort_by not in self._SORT_COLUMNS:
+            raise ValueError(f"Unsupported inventory sort field: {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"Unsupported inventory sort direction: {sort_dir!r}")
+
+        filters = [AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id]
+        search = (search or "").strip()
+        if search:
+            term = f"%{_escape_like_term(search)}%"
+            filters.append(
+                or_(
+                    AmazonSellerInventory.seller_sku.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                    AmazonSellerInventory.fnsku.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                    AmazonSellerInventory.asin.ilike(term, escape=_LIKE_ESCAPE_CHAR),
+                )
+            )
+        if is_active is not None:
+            filters.append(AmazonSellerInventory.is_active.is_(is_active))
+
+        total = self.session.scalar(select(func.count()).select_from(AmazonSellerInventory).where(*filters)) or 0
+
+        sort_column = self._SORT_COLUMNS[sort_by]
+        order = (sort_column.desc() if sort_dir == "desc" else sort_column.asc()).nulls_last()
+        statement = (
+            select(AmazonSellerInventory)
+            .where(*filters)
+            .order_by(order, AmazonSellerInventory.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = list(self.session.scalars(statement).all())
+        return rows, int(total)
+
+    def get_detail(
+        self, organization_id: UUID, marketplace_participation_id: UUID, inventory_id: UUID
+    ) -> AmazonSellerInventory | None:
+        if self._get_owned_participation(organization_id, marketplace_participation_id) is None:
+            return None
+        return self.session.scalars(
+            select(AmazonSellerInventory).where(
+                AmazonSellerInventory.id == inventory_id,
+                AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id,
+            )
+        ).first()
 
 
 def file_sha256(data: bytes) -> str:
