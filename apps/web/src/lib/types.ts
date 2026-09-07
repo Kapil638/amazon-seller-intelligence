@@ -2048,3 +2048,162 @@ export type SalesTrafficSyncTriggerResponse = {
   retry_allowed_at: string | null;
 };
 
+// --- 12B.6B: FBA Inventory Read API + Sync Trigger (backend contract) --
+//
+// **FBA-fulfilled inventory only.** Every value here comes from Amazon's
+// getInventorySummaries — there is no visibility into merchant-fulfilled
+// stock. Every UI surface built on these types must label itself "FBA
+// Inventory", never bare "Inventory" (see seller-inventory-view.ts and
+// docs/AI_HANDOVER/12B6B_FBA_INVENTORY_INGESTION.md).
+
+// Identical vocabulary shape to ListingsSyncStatus/SalesTrafficSyncStatus
+// — this codebase's own internal job-lifecycle states — but with no
+// "partial" value: Inventory pages accumulate entirely in memory, so a
+// run either fully reconciles or produces no new state at all (see
+// inventory_read.py's own docstring).
+export type InventorySyncStatus =
+  | "never_synchronized"
+  | "queued"
+  | "running"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "failed"
+  | "timed_out";
+
+export type InventorySortField =
+  | "last_seen_at"
+  | "first_seen_at"
+  | "seller_sku"
+  | "asin"
+  | "fulfillable_quantity"
+  | "total_quantity";
+
+export type InventorySyncEvidence = {
+  status: InventorySyncStatus;
+  failure_class: string | null;
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  pages_fetched: number | null;
+  records_received: number | null;
+  records_accepted: number | null;
+  records_rejected: number | null;
+  pagination_complete: boolean | null;
+  last_successful_synchronized_at: string | null;
+  next_retry_at: string | null;
+};
+
+export type InventorySummary = {
+  marketplace_participation_id: string;
+  total: number;
+  active_count: number;
+  inactive_count: number;
+  with_asin_count: number;
+  with_fnsku_count: number;
+  zero_fulfillable_count: number;
+  sync: InventorySyncEvidence;
+};
+
+export type InventoryCollectionItem = {
+  id: string;
+  seller_sku: string;
+  condition: string;
+  asin: string | null;
+  fnsku: string | null;
+  product_name: string | null;
+  // Amazon's own field, verbatim — never independently summed from the
+  // sub-buckets below (Amazon does not document that they add up to it).
+  total_quantity: number | null;
+  fulfillable_quantity: number | null;
+  reserved_total_quantity: number | null;
+  inbound_total_quantity: number | null;
+  unfulfillable_total_quantity: number | null;
+  // Absence from the latest complete sweep — never treated as zero
+  // stock. Quantities above are the *last known* values, not current.
+  is_active: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  amazon_last_updated_time: string | null;
+};
+
+export type InventoryCollectionResponse = {
+  items: InventoryCollectionItem[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type InventoryDetail = {
+  id: string;
+  seller_sku: string;
+  condition: string;
+  asin: string | null;
+  fnsku: string | null;
+  product_name: string | null;
+  total_quantity: number | null;
+  fulfillable_quantity: number | null;
+  inbound_working_quantity: number | null;
+  inbound_shipped_quantity: number | null;
+  inbound_receiving_quantity: number | null;
+  reserved_total_quantity: number | null;
+  reserved_pending_customer_order_quantity: number | null;
+  reserved_pending_transshipment_quantity: number | null;
+  reserved_fc_processing_quantity: number | null;
+  unfulfillable_total_quantity: number | null;
+  unfulfillable_customer_damaged_quantity: number | null;
+  unfulfillable_warehouse_damaged_quantity: number | null;
+  unfulfillable_distributor_damaged_quantity: number | null;
+  unfulfillable_carrier_damaged_quantity: number | null;
+  unfulfillable_defective_quantity: number | null;
+  unfulfillable_expired_quantity: number | null;
+  researching_total_quantity: number | null;
+  researching_quantity_short_term: number | null;
+  researching_quantity_mid_term: number | null;
+  researching_quantity_long_term: number | null;
+  is_active: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  amazon_last_updated_time: string | null;
+};
+
+export type InventoryRunStatus = "queued" | "started" | "waiting_to_retry" | "succeeded" | "failed" | "timed_out";
+
+// Never carries an organization id, seller id, connection id, lease
+// owner, credential, token reference, or page token.
+export type InventorySyncJobStatus = {
+  run_id: string;
+  run_type: string;
+  status: InventoryRunStatus;
+  marketplace_participation_id: string;
+  pages_fetched: number;
+  records_received: number;
+  records_accepted: number;
+  records_rejected: number;
+  reported_total_results: number | null;
+  pagination_complete: boolean;
+  attempt_count: number;
+  queued_at: string;
+  started_at: string | null;
+  last_heartbeat_at: string | null;
+  next_retry_at: string | null;
+  completed_at: string | null;
+  failure_class: string | null;
+};
+
+export type InventorySyncTriggerReason =
+  | "queued"
+  | "already_running"
+  | "cooldown"
+  | "queue_backlog_limit_reached"
+  | "scope_not_found"
+  | "scope_inactive"
+  | "identity_missing"
+  | "connection_unresolvable";
+
+export type InventorySyncTriggerResponse = {
+  reason: InventorySyncTriggerReason;
+  message: string | null;
+  job: InventorySyncJobStatus | null;
+  retry_allowed_at?: string | null;
+};
+

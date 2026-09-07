@@ -69,6 +69,11 @@ import type {
   SalesTrafficSummary,
   SalesTrafficSyncJobStatus,
   SalesTrafficSyncTriggerResponse,
+  InventoryCollectionResponse,
+  InventoryDetail,
+  InventorySortField,
+  InventorySummary,
+  InventorySyncTriggerResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -1418,6 +1423,124 @@ export async function triggerListingsSync(participationId: string): Promise<List
     return detail as ListingsSyncTriggerResponse;
   }
   throw new ListingsSyncError("Synchronization could not be started.", null, "unknown");
+}
+
+// --- 12B.6B: FBA Inventory Read API + Sync Trigger --------------------------
+//
+// **FBA-fulfilled inventory only** — see the matching note in types.ts.
+
+export class InventoryApiError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "not_found" | "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "InventoryApiError";
+  }
+}
+
+async function inventoryRequest<T>(path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+  } catch {
+    throw new InventoryApiError(
+      "FBA Inventory could not reach the server. Make sure the API is running.",
+      "unavailable",
+    );
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new InventoryApiError(detail || "This was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new InventoryApiError(detail || "FBA Inventory is not configured right now.", "unavailable");
+  }
+  throw new InventoryApiError(detail || "FBA Inventory could not complete this request.", "unknown");
+}
+
+export async function fetchInventorySummary(participationId: string): Promise<InventorySummary> {
+  return inventoryRequest<InventorySummary>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory/summary`,
+  );
+}
+
+export type InventoryQuery = {
+  q?: string;
+  isActive?: boolean;
+  sortBy?: InventorySortField;
+  sortDir?: SortDirection;
+  offset?: number;
+  limit?: number;
+};
+
+export async function fetchInventory(
+  participationId: string,
+  query: InventoryQuery = {},
+): Promise<InventoryCollectionResponse> {
+  const params = new URLSearchParams();
+  if (query.q) params.set("q", query.q);
+  if (query.isActive !== undefined) params.set("is_active", String(query.isActive));
+  params.set("sort_by", query.sortBy ?? "last_seen_at");
+  params.set("sort_dir", query.sortDir ?? "desc");
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 25));
+  return inventoryRequest<InventoryCollectionResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory?${params.toString()}`,
+  );
+}
+
+export async function fetchInventoryDetail(participationId: string, inventoryId: string): Promise<InventoryDetail> {
+  return inventoryRequest<InventoryDetail>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory/${encodeURIComponent(inventoryId)}`,
+  );
+}
+
+export class InventorySyncError extends Error {
+  constructor(
+    message: string,
+    readonly reason: string | null,
+    readonly kind: "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "InventorySyncError";
+  }
+}
+
+// Mirrors `triggerListingsSync`'s own contract exactly: the trigger
+// endpoint enqueues a durable job and returns immediately, so every
+// outcome (queued, already-running, cooldown, scope failure) is a
+// normal structured response, not an exception. Only a genuine
+// transport failure or an unparseable response throws.
+export async function triggerInventorySync(participationId: string): Promise<InventorySyncTriggerResponse> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${apiBaseUrl()}/api/v1/amazon/marketplace-participations/${encodeURIComponent(participationId)}/inventory/sync`,
+      { method: "POST", cache: "no-store" },
+    );
+  } catch {
+    throw new InventorySyncError("Could not reach the server to start synchronization.", null, "unavailable");
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new InventorySyncError("Synchronization could not be started.", null, "unknown");
+  }
+
+  if (response.ok) {
+    return body as InventorySyncTriggerResponse;
+  }
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object") {
+    return detail as InventorySyncTriggerResponse;
+  }
+  throw new InventorySyncError("Synchronization could not be started.", null, "unknown");
 }
 
 // --- 12B.4D: Seller Orders Read API + Sync Trigger -------------------------
