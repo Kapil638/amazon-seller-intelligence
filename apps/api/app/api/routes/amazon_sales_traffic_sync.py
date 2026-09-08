@@ -95,7 +95,12 @@ def _status_for_trigger_reason(reason: str) -> int:
 
 
 @router.post("/sales-traffic/sync", response_model=SalesTrafficSyncTriggerResponse, status_code=202)
-async def sync_sales_traffic(
+# fix/inventory-empty-response-and-failure-classification — plain `def`,
+# not `async def`: `service.trigger()` is a blocking sync-SQLAlchemy
+# call; see `amazon_inventory_sync.py::sync_inventory`'s identical
+# comment for the full root-cause explanation (a live 30s client
+# timeout traced to this exact pattern stalling the shared event loop).
+def sync_sales_traffic(
     request: SalesTrafficSyncTriggerRequest,
     service: AmazonSalesTrafficSyncTriggerService = Depends(get_amazon_sales_traffic_sync_service),
 ) -> SalesTrafficSyncTriggerResponse:
