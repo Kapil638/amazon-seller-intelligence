@@ -61,6 +61,7 @@ __all__ = [
     "InventorySummary",
     "Granularity",
     "InventoryPagination",
+    "SpApiErrorEntry",
     "GetInventorySummariesResult",
     "InventoryPage",
     "InventoryPageProvenance",
@@ -173,6 +174,22 @@ class InventoryPagination(BaseModel):
     next_token: optional_not_null(str) = Field(default=None, alias="nextToken")
 
 
+class SpApiErrorEntry(BaseModel):
+    """One entry of the pinned schema's `Error` object — `code` is the
+    only required field; `message`/`details` are independently optional.
+    Structural only: this model exists so `inventory_client.py` can tell
+    whether Amazon explained an absent `payload` with its own error
+    object, never to surface `message`/`details` text anywhere (both may
+    describe the request in terms that echo seller-identifying
+    parameters) — callers of this model must only ever read `code`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    message: optional_not_null(str) = None
+    details: optional_not_null(str) = None
+
+
 class GetInventorySummariesResult(BaseModel):
     """Both fields are genuinely required by the pinned schema —
     `inventorySummaries` may still be an empty list (a seller with no
@@ -187,14 +204,23 @@ class GetInventorySummariesResult(BaseModel):
 
 class GetInventorySummariesResponse(BaseModel):
     """Top-level response envelope. `payload` is documented optional (an
-    error-only response omits it); `errors` likewise. This client treats a
-    response with no `payload` as a parse failure — see
-    `inventory_client.py`."""
+    error-only response omits it); `errors` likewise — both were
+    previously unparsed here (`errors` silently dropped by `extra=
+    "ignore"`), which meant a `payload`-absent response could never be
+    distinguished from an Amazon-explained error from a genuinely
+    undocumented empty state. `errors` is now parsed structurally (see
+    `SpApiErrorEntry`) so `inventory_client.py` can tell them apart. This
+    client still treats a response with no `payload` and no `errors` as
+    a parse failure, never as an empty result — the pinned contract's
+    own documented shape for a seller with zero FBA inventory is
+    `payload` *present* with `inventorySummaries: []`, not `payload`
+    absent (see `GetInventorySummariesResult`'s own docstring)."""
 
     model_config = ConfigDict(extra="ignore")
 
     payload: optional_not_null(GetInventorySummariesResult) = None
     pagination: optional_not_null(InventoryPagination) = None
+    errors: optional_not_null(list[SpApiErrorEntry]) = None
 
 
 class InventoryPageProvenance(BaseModel):

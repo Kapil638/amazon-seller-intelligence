@@ -69,6 +69,7 @@ from app.amazon.lwa import LwaClient
 from app.core.exceptions import (
     SpApiAuthenticationError,
     SpApiConfigurationError,
+    SpApiErrorEnvelopeError,
     SpApiInvalidRequestError,
     SpApiParseFailedError,
     SpApiRateLimitedError,
@@ -309,16 +310,41 @@ class AmazonSpApiInventoryClient:
         raise SpApiInvalidRequestError(f"Amazon SP-API inventory request was rejected (status={status}).")
 
     def _parse_response(self, response: httpx.Response) -> GetInventorySummariesResponse:
+        """Classifies a syntactically-successful (HTTP 200) response body
+        into one of several distinct, sanitized-loggable shapes — never
+        assumes a `payload`-absent response means empty inventory (the
+        pinned contract's own documented shape for zero inventory is
+        `payload` *present* with `inventorySummaries: []`, not `payload`
+        absent — see `GetInventorySummariesResult`'s docstring). Every
+        `logger.warning` below logs structural facts only (which key was
+        absent/null/wrong-typed, an error's `code`) — never response
+        body content, seller identifiers, SKUs, or quantities."""
         try:
             body = response.json()
         except ValueError:
+            logger.warning("SP-API inventory response was not valid JSON")
             raise SpApiParseFailedError("Amazon SP-API inventory response was not JSON.") from None
+
         try:
             parsed = GetInventorySummariesResponse.model_validate(body)
         except ValidationError:
+            shape = (
+                "wrong_top_level_type"
+                if not isinstance(body, dict)
+                else ("payload_null_or_wrong_type" if "payload" in body else "unparseable")
+            )
+            logger.warning("SP-API inventory response failed schema validation shape=%s", shape)
             raise SpApiParseFailedError("Amazon SP-API inventory payload was malformed.") from None
+
+        if parsed.errors:
+            code = parsed.errors[0].code
+            logger.warning("SP-API inventory response carried an Amazon error envelope code=%s", code)
+            raise SpApiErrorEnvelopeError(code)
+
         if parsed.payload is None:
+            logger.warning("SP-API inventory response carried no payload and no error envelope")
             raise SpApiParseFailedError("Amazon SP-API inventory response carried no payload.")
+
         return parsed
 
     def _to_page(

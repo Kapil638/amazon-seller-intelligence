@@ -11,6 +11,7 @@ from app.amazon.inventory_client import AmazonSpApiInventoryClient, InventoryPag
 from app.core.exceptions import (
     SpApiAuthenticationError,
     SpApiConfigurationError,
+    SpApiErrorEnvelopeError,
     SpApiInvalidRequestError,
     SpApiParseFailedError,
     SpApiRateLimitedError,
@@ -199,12 +200,117 @@ async def test_malformed_json_raises_parse_failed_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_response_with_no_payload_raises_parse_failed_error() -> None:
+async def test_response_with_no_payload_and_no_errors_raises_parse_failed_error() -> None:
+    """fix/inventory-empty-response-and-failure-classification — the
+    live defect this closes, reproduced directly: an HTTP 200 response
+    that carries neither `payload` nor `errors` is never a documented
+    valid shape (the pinned contract's own shape for zero inventory is
+    `payload` *present* with `inventorySummaries: []` — see
+    `GetInventorySummariesResult`'s docstring) — so this must never be
+    silently treated as an empty result, only as malformed."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         if "auth/o2/token" in str(request.url):
             return _lwa_token_response()
-        return httpx.Response(200, json={"errors": [{"code": "Whatever", "message": "no payload"}]})
+        return httpx.Response(200, json={})
 
     client = _client(handler)
     with pytest.raises(SpApiParseFailedError):
         await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+
+@pytest.mark.asyncio
+async def test_response_with_explicit_null_payload_raises_parse_failed_error() -> None:
+    """Distinct from a merely *absent* `payload` key — Swagger 2.0 (this
+    contract's own spec version) has no `nullable`/`x-nullable` keyword
+    anywhere, so an explicit JSON `null` is never a documented shape for
+    an optional field (`optional_not_null` rejects it at the model
+    layer) even though a missing key is fine."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return httpx.Response(200, json={"payload": None})
+
+    client = _client(handler)
+    with pytest.raises(SpApiParseFailedError):
+        await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+
+@pytest.mark.asyncio
+async def test_response_with_wrong_payload_type_raises_parse_failed_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return httpx.Response(200, json={"payload": "not-an-object"})
+
+    client = _client(handler)
+    with pytest.raises(SpApiParseFailedError):
+        await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+
+@pytest.mark.asyncio
+async def test_response_with_error_envelope_raises_error_envelope_not_parse_failed() -> None:
+    """The other half of the live defect: a `payload`-absent response
+    that *does* carry Amazon's own documented `errors` array must be
+    distinguishable from the plain "nothing, unexplained" case above —
+    both used to collapse into the same generic `SpApiParseFailedError`,
+    losing Amazon's own explanation entirely (`errors` was previously
+    not even parsed — silently dropped by `extra="ignore"`)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return httpx.Response(200, json={"errors": [{"code": "Unauthorized", "message": "no payload"}]})
+
+    client = _client(handler)
+    with pytest.raises(SpApiErrorEnvelopeError) as exc_info:
+        await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert exc_info.value.code == "Unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_valid_empty_inventory_summaries_succeeds_with_no_next_token() -> None:
+    """The one genuinely valid empty-result shape: `payload` *present*,
+    `inventorySummaries` an empty list, no `nextToken` — a seller with
+    no FBA inventory at this marketplace. Must succeed, never raise."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=[])
+
+    client = _client(handler)
+    page = await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert page.summaries == []
+    assert page.next_token is None
+
+
+@pytest.mark.asyncio
+async def test_error_envelope_message_and_details_never_reach_the_logs(caplog) -> None:
+    """`message`/`details` may echo seller-identifying request parameters
+    back (per `SpApiErrorEnvelopeError`'s own docstring) — only `code`
+    may ever be logged. Deliberately plants SKU/quantity-shaped text in
+    both to prove neither leaks, not merely that a generic message is
+    absent."""
+    sensitive_message = "Seller SKU MY-SECRET-SKU-123 has quantity 4567 at marketplace"
+    sensitive_details = "seller_account_id=99999999-9999-4999-8999-999999999999"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return httpx.Response(
+            200,
+            json={"errors": [{"code": "Unauthorized", "message": sensitive_message, "details": sensitive_details}]},
+        )
+
+    client = _client(handler)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SpApiErrorEnvelopeError):
+            await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+    all_log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "MY-SECRET-SKU-123" not in all_log_text
+    assert "4567" not in all_log_text
+    assert "99999999-9999-4999-8999-999999999999" not in all_log_text
+    assert "Unauthorized" in all_log_text  # the one field that IS expected to appear
