@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0016_inventory_foundation (head)" /tmp/heads.txt
+          grep -q "0017_inventory_heartbeat (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0016_inventory_foundation" /tmp/current.txt
+          grep -q "0017_inventory_heartbeat" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
