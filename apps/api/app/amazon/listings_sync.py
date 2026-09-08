@@ -33,6 +33,7 @@ from app.persistence.models import AmazonIngestionRun
 from app.persistence.repositories import (
     AmazonIngestionRunRepository,
     AmazonMarketplaceParticipationRepository,
+    WorkerHeartbeatRepository,
 )
 
 
@@ -71,18 +72,26 @@ class ListingsSyncTriggerOutcome:
     `"already_running"`, `"cooldown"`, `"queue_backlog_limit_reached"`
     (this organization's *queue* — never worker execution capacity — has
     grown unreasonably large; see `count_queued_listings_runs_for_
-    organization`), or one of `_check_scope`'s own failure reasons
-    (`"scope_not_found"`, `"scope_inactive"`, `"identity_missing"`,
-    `"connection_unresolvable"`). `job` is populated for `"queued"` and
-    `"already_running"` (and, where available, `"cooldown"`) so the caller
-    has something concrete to show/poll; it is always `None` for a scope
-    failure, since no run exists to describe.
+    organization`), `"worker_unavailable"` (fix/ingestion-worker-runtime-
+    availability — no Listings worker process has reported a heartbeat
+    recently enough; see `app.amazon.worker_heartbeat`), or one of
+    `_check_scope`'s own failure reasons (`"scope_not_found"`,
+    `"scope_inactive"`, `"identity_missing"`, `"connection_unresolvable"`).
+    `job` is populated for `"queued"` and `"already_running"` (and, where
+    available, `"cooldown"`) so the caller has something concrete to
+    show/poll; it is always `None` for a scope failure or
+    `"worker_unavailable"`, since no run exists to describe.
 
-    Deliberately absent: any reason tied to worker execution capacity
+    Deliberately absent: any reason tied to worker *execution capacity*
     being full. A legitimate new job is never rejected merely because
-    workers are busy — it is accepted as `queued` and simply waits;
-    `claim_next_listings_job`'s own `started`-only counts are the only
-    place execution capacity is enforced, strictly at claim time.
+    already-running workers are busy — it is accepted as `queued` and
+    simply waits; `claim_next_listings_job`'s own `started`-only counts
+    are the only place execution capacity is enforced, strictly at claim
+    time. `"worker_unavailable"` is a categorically different condition —
+    zero worker processes of this type exist at all right now — checked
+    once at trigger time specifically so the caller is never left
+    guessing between "queued, will be picked up shortly" and "queued,
+    nothing will ever claim this."
 
     `retry_allowed_at` is populated only for `reason="cooldown"` — the
     database-computed moment (the cooldown-relevant run's `created_at`
@@ -216,6 +225,20 @@ class AmazonListingsSyncTriggerService:
                 >= cfg.listings_sync_max_queued_per_organization
             ):
                 return ListingsSyncTriggerOutcome(reason="queue_backlog_limit_reached")
+
+            # fix/ingestion-worker-runtime-availability: refuse to enqueue
+            # a job no process is currently alive to claim, rather than
+            # accepting it and leaving it queued indefinitely with no
+            # actionable signal. Checked last, after every other
+            # rejection reason, so an already-queued/cooldown/backlog
+            # outcome is still reported accurately even when the worker
+            # also happens to be unavailable — those are more specific
+            # and more actionable than a blanket "no worker" message.
+            availability = WorkerHeartbeatRepository(session).check_availability(
+                "listings", stale_after_seconds=cfg.worker_heartbeat_stale_after_seconds
+            )
+            if not availability.available:
+                return ListingsSyncTriggerOutcome(reason="worker_unavailable")
 
             claim = runs.enqueue_listings_run(
                 organization_id=organization_id,

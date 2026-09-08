@@ -1671,6 +1671,11 @@ export type ListingsSyncTriggerReason =
   // rejection. A legitimate new job is never rejected merely because
   // workers are busy; only an unreasonably large *queue* triggers this.
   | "queue_backlog_limit_reached"
+  // fix/ingestion-worker-runtime-availability: no Listings worker process
+  // has reported a heartbeat recently enough — categorically different
+  // from queue_backlog_limit_reached (zero workers exist at all, vs.
+  // workers exist but the queue is unreasonably deep). Never creates a job.
+  | "worker_unavailable"
   | "scope_not_found"
   | "scope_inactive"
   | "identity_missing"

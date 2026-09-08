@@ -17,13 +17,43 @@
 # process manager dependency is added; this is plain bash job control.
 #
 # Usage:
-#   ./scripts/dev.sh
+#   ./scripts/dev.sh                    # backend + frontend only (safe default)
+#   ./scripts/dev.sh --with-workers     # also starts all three sync workers
+#   ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh   # start just one worker
+#
+# fix/ingestion-worker-runtime-availability: `--with-workers` is the one
+# opt-in flag for connected-seller local development — it sets all three
+# ASI_*_WORKER_ENABLED flags internally so nobody has to remember or
+# type three separate environment variables. It changes nothing else:
+# the safe default (no flag, no env vars set) still starts zero workers,
+# exactly as before — cloning this repository or copying `.env.example`
+# and running `./scripts/dev.sh` still never starts a live worker.
+# Equivalent to (and interchangeable with) setting all three
+# ASI_*_WORKER_ENABLED env vars by hand; either path is fully supported.
 #
 # Ctrl-C (SIGINT) or `kill <pid>` (SIGTERM) on this script's own process
 # stops every child it started.
 
 set -uo pipefail
 set -m # job control: each backgrounded child becomes its own process group leader
+
+for arg in "$@"; do
+  case "$arg" in
+    --with-workers)
+      export ASI_LISTINGS_WORKER_ENABLED=true
+      export ASI_ORDERS_WORKER_ENABLED=true
+      export ASI_SALES_TRAFFIC_WORKER_ENABLED=true
+      ;;
+    -h|--help)
+      grep '^# ' "${BASH_SOURCE[0]}" | head -30 | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "[dev.sh] Unrecognized argument: $arg (see --help)" >&2
+      exit 1
+      ;;
+  esac
+done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_DIR="$ROOT_DIR/apps/api"

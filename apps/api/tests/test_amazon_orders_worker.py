@@ -102,7 +102,11 @@ def _worker(script: list, *, settings: Settings | None = None, resolver=None) ->
         resolver=resolver or _FakeResolver(),
         orders_client_factory=factory,
     )
-    worker = OrdersWorker(settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker")
+    # enable_heartbeat=False — see the identical note in
+    # test_amazon_listings_worker.py's own _worker() helper.
+    worker = OrdersWorker(
+        settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker", enable_heartbeat=False
+    )
     return worker, client
 
 
@@ -449,3 +453,29 @@ def test_enabled_worker_declares_the_orders_worker_db_runtime_context(monkeypatc
 def test_worker_poll_error_backoff_rejects_base_exceeding_max() -> None:
     with pytest.raises(ValidationError, match="must not exceed"):
         _test_settings(orders_worker_poll_error_base_backoff_seconds=10.0, orders_worker_poll_error_max_backoff_seconds=5.0)
+
+
+# --- fix/ingestion-worker-runtime-availability: worker heartbeat --------
+
+
+@pytest.mark.asyncio
+async def test_run_forever_writes_a_heartbeat_that_makes_the_worker_appear_available() -> None:
+    from app.amazon.worker_heartbeat import check_availability
+
+    cfg = _test_settings()
+    worker, _client = _worker([])
+    worker = OrdersWorker(
+        settings=cfg,
+        ingestion_service=worker._ingestion_service,
+        lease_owner="heartbeat-test",
+        idle_poll_seconds=0.01,
+        enable_heartbeat=True,
+    )
+
+    task = asyncio.create_task(worker.run_forever())
+    try:
+        await asyncio.sleep(0)
+        assert check_availability("orders", settings=cfg).available is True
+    finally:
+        worker.request_stop()
+        await asyncio.wait_for(task, timeout=2)

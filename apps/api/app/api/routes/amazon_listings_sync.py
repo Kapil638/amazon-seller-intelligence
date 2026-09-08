@@ -44,6 +44,12 @@ _TRIGGER_MESSAGES: dict[str, str] = {
     "queue_backlog_limit_reached": (
         "Too many Listings synchronizations are already queued for this account. Try again shortly."
     ),
+    "worker_unavailable": (
+        "The Listings sync worker is not running, so this job would never be picked up. "
+        "Start local development with the connected-seller runtime: "
+        "./scripts/dev.sh --with-workers (or ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh), "
+        "then try again."
+    ),
 }
 _DEFAULT_FAILURE_MESSAGE = "Listings synchronization could not be started."
 _JOB_NOT_FOUND_MESSAGE = "This synchronization job was not found."
@@ -67,7 +73,7 @@ class ListingsSyncTriggerResponse(BaseModel):
 def _status_for_trigger_reason(reason: str) -> int:
     if reason == "scope_not_found":
         return 404
-    if reason in {"scope_inactive", "identity_missing", "connection_unresolvable"}:
+    if reason in {"scope_inactive", "identity_missing", "connection_unresolvable", "worker_unavailable"}:
         return 503
     if reason == "already_running":
         return 409

@@ -79,11 +79,15 @@ from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
 from app.amazon.sales_traffic_ingestion import AmazonSalesTrafficIngestionService
+from app.amazon.worker_heartbeat import new_instance_id, start_heartbeat_loop
 from app.core.config import Settings, get_settings
 from app.persistence.database import session_scope
 from app.persistence.repositories import AmazonIngestionRunRepository
 
 logger = logging.getLogger(__name__)
+
+# Reuses amazon_ingestion_runs.run_type's own vocabulary.
+WORKER_TYPE = "sales_and_traffic_report"
 
 DEFAULT_IDLE_POLL_SECONDS = 5.0
 DEFAULT_POLL_ERROR_BASE_BACKOFF_SECONDS = 2.0
@@ -129,6 +133,7 @@ class SalesTrafficWorker:
         idle_poll_seconds: float | None = None,
         poll_error_base_backoff_seconds: float | None = None,
         poll_error_max_backoff_seconds: float | None = None,
+        enable_heartbeat: bool = True,
     ) -> None:
         self._settings = settings
         self._ingestion_service = ingestion_service or AmazonSalesTrafficIngestionService(settings=settings)
@@ -149,6 +154,8 @@ class SalesTrafficWorker:
         )
         self._stop_requested = False
         self._current_poll_error_backoff_seconds = self._poll_error_base_backoff_seconds
+        self._instance_id = new_instance_id()
+        self._enable_heartbeat = enable_heartbeat
 
     def _cfg(self) -> Settings:
         return self._settings or get_settings()
@@ -162,7 +169,25 @@ class SalesTrafficWorker:
         self._stop_requested = True
 
     async def run_forever(self) -> None:
-        logger.info("amazon sales and traffic worker started")
+        logger.info(
+            "amazon sales and traffic worker started worker_type=%s instance_id=%s", WORKER_TYPE, self._instance_id
+        )
+        cfg = self._cfg()
+        heartbeat = None
+        if self._enable_heartbeat:
+            heartbeat = start_heartbeat_loop(WORKER_TYPE, instance_id=self._instance_id, settings=cfg)
+            logger.info(
+                "amazon sales and traffic worker database connection OK; claim loop ready worker_type=%s",
+                WORKER_TYPE,
+            )
+        try:
+            await self._poll_loop()
+        finally:
+            if heartbeat is not None:
+                await heartbeat.stop()
+        logger.info("amazon sales and traffic worker stopped worker_type=%s", WORKER_TYPE)
+
+    async def _poll_loop(self) -> None:
         while not self._stop_requested:
             try:
                 claimed_something = await self.run_once()
@@ -180,7 +205,6 @@ class SalesTrafficWorker:
             self._current_poll_error_backoff_seconds = self._poll_error_base_backoff_seconds
             if not claimed_something:
                 await asyncio.sleep(self._idle_poll_seconds)
-        logger.info("amazon sales and traffic worker stopped")
 
     async def run_once(self) -> bool:
         """Claims and processes at most one job. Returns True if a job was

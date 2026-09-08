@@ -307,6 +307,45 @@ class Settings(BaseSettings):
         description="Hard cap on the Sales and Traffic worker's own poll-error backoff delay — see sales_traffic_worker_poll_error_base_backoff_seconds.",
     )
 
+    # Worker liveness heartbeat — shared, database-backed availability
+    # signal used identically by the Listings, Orders, and Sales & Traffic
+    # workers/triggers (fix/ingestion-worker-runtime-availability). Each
+    # worker process writes its own `amazon_worker_heartbeats` row on a
+    # fixed cadence, independent of its claim/poll loop (so one long-
+    # running job in progress never makes the process look dead); each
+    # domain's sync-trigger service reads it before enqueueing a new job,
+    # so a Sync click when no matching worker is actually running gets a
+    # clear, immediate refusal instead of a job that queues forever. See
+    # `app/amazon/worker_heartbeat.py`.
+    worker_heartbeat_interval_seconds: float = Field(
+        default=10.0, gt=0, le=300,
+        description=(
+            "How often each worker process (Listings/Orders/Sales & Traffic) writes its own "
+            "liveness heartbeat row, via a background loop independent of its claim/poll cycle — "
+            "so a worker legitimately busy on one long-running job still reports itself alive."
+        ),
+    )
+    worker_heartbeat_stale_after_seconds: float = Field(
+        default=45.0, gt=0, le=3600,
+        description=(
+            "How old a worker's last heartbeat may be before the trigger endpoints treat that "
+            "worker type as unavailable and refuse to enqueue a new job. Deliberately larger than "
+            "worker_heartbeat_interval_seconds (a few missed intervals' worth of tolerance) so an "
+            "isolated slow heartbeat write or brief GC pause never produces a false 'unavailable' "
+            "refusal for a worker that is actually fine."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_worker_heartbeat_bounds(self) -> "Settings":
+        if self.worker_heartbeat_stale_after_seconds <= self.worker_heartbeat_interval_seconds:
+            raise ValueError(
+                "worker_heartbeat_stale_after_seconds must exceed worker_heartbeat_interval_seconds "
+                "(it must tolerate at least one missed heartbeat, or every worker would appear "
+                "unavailable between writes)"
+            )
+        return self
+
     @model_validator(mode="after")
     def _validate_sales_traffic_worker_poll_error_backoff_bounds(self) -> "Settings":
         if (

@@ -136,7 +136,15 @@ def _worker(script: list, *, resolver=None, settings: Settings | None = None) ->
         resolver=resolver or _FakeResolver(),
         listings_client_factory=factory,
     )
-    worker = ListingsWorker(settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker")
+    # enable_heartbeat=False: these tests assert on exact asyncio.sleep
+    # call sequences (idle-poll cadence, poll-error backoff) — a
+    # background heartbeat task sleeping independently would interleave
+    # with and break those assertions. The heartbeat loop itself is
+    # covered directly by test_amazon_worker_heartbeat.py and the
+    # dedicated worker-heartbeat-loop test below.
+    worker = ListingsWorker(
+        settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker", enable_heartbeat=False
+    )
     return worker, client
 
 
@@ -761,3 +769,36 @@ async def test_logs_never_contain_seller_or_organization_identifiers(caplog) -> 
     assert str(scope["connection_id"]) not in log_text
     assert "SKU-1" not in log_text
     assert "test-refresh-token" not in log_text
+
+
+# --- fix/ingestion-worker-runtime-availability: worker heartbeat --------
+
+
+@pytest.mark.asyncio
+async def test_run_forever_writes_a_heartbeat_that_makes_the_worker_appear_available() -> None:
+    """The whole point of the heartbeat loop: once `run_forever()` has
+    actually started, `check_availability("listings", ...)` — the exact
+    call the sync-trigger service makes before enqueueing — reports this
+    worker type as available."""
+    from app.amazon.worker_heartbeat import check_availability
+
+    cfg = _test_settings()
+    worker, _client = _worker([])
+    worker = ListingsWorker(
+        settings=cfg,
+        ingestion_service=worker._ingestion_service,
+        lease_owner="heartbeat-test",
+        idle_poll_seconds=0.01,
+        enable_heartbeat=True,
+    )
+
+    task = asyncio.create_task(worker.run_forever())
+    try:
+        # The heartbeat loop writes its first row synchronously before
+        # run_forever's own claim loop starts — no sleep needed here to
+        # observe it (this is the "startup grace" guarantee itself).
+        await asyncio.sleep(0)
+        assert check_availability("listings", settings=cfg).available is True
+    finally:
+        worker.request_stop()
+        await asyncio.wait_for(task, timeout=2)

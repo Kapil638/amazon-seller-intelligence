@@ -44,6 +44,7 @@ from app.persistence.repositories import (
     AmazonIngestionRunRepository,
     AmazonMarketplaceParticipationRepository,
     AmazonSellerAccountRepository,
+    WorkerHeartbeatRepository,
 )
 
 _VALID_DATE_GRANULARITIES = frozenset({"DAY", "WEEK", "MONTH"})
@@ -79,9 +80,13 @@ class SalesTrafficSyncJobStatus(BaseModel):
 class SalesTrafficSyncTriggerOutcome:
     """`reason` is one of: `"queued"`, `"already_running"`, `"cooldown"`,
     `"scope_not_found"`, `"scope_inactive"`, `"connection_unresolvable"`,
-    or `"invalid_request"`. `job` is populated for `"queued"`,
+    `"invalid_request"`, or `"worker_unavailable"` (fix/ingestion-worker-
+    runtime-availability — no Sales and Traffic worker process has
+    reported a heartbeat recently enough; see
+    `app.amazon.worker_heartbeat`). `job` is populated for `"queued"`,
     `"already_running"`, and `"cooldown"`; always `None` for a scope or
-    validation failure, since no run exists to describe."""
+    validation failure or `"worker_unavailable"`, since no run exists to
+    describe."""
 
     reason: str
     job: SalesTrafficSyncJobStatus | None = None
@@ -176,6 +181,14 @@ class AmazonSalesTrafficSyncTriggerService:
                     return SalesTrafficSyncTriggerOutcome(
                         reason="cooldown", job=_job_status_from_row(latest), retry_allowed_at=retry_allowed_at
                     )
+
+            # fix/ingestion-worker-runtime-availability — see the identical
+            # check and reasoning in listings_sync.py's own trigger().
+            availability = WorkerHeartbeatRepository(session).check_availability(
+                "sales_and_traffic_report", stale_after_seconds=cfg.worker_heartbeat_stale_after_seconds
+            )
+            if not availability.available:
+                return SalesTrafficSyncTriggerOutcome(reason="worker_unavailable")
 
             try:
                 claim = runs.enqueue_sales_traffic_run(

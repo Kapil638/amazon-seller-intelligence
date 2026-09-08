@@ -103,7 +103,11 @@ def _worker(
     ingestion_service = AmazonSalesTrafficIngestionService(
         settings=cfg, resolver=resolver or _FakeResolver(), reports_client_factory=factory,
     )
-    worker = SalesTrafficWorker(settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker")
+    # enable_heartbeat=False — see the identical note in
+    # test_amazon_listings_worker.py's own _worker() helper.
+    worker = SalesTrafficWorker(
+        settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker", enable_heartbeat=False
+    )
     return worker, client
 
 
@@ -405,3 +409,29 @@ def test_worker_poll_error_backoff_rejects_base_exceeding_max() -> None:
             sales_traffic_worker_poll_error_base_backoff_seconds=10.0,
             sales_traffic_worker_poll_error_max_backoff_seconds=5.0,
         )
+
+
+# --- fix/ingestion-worker-runtime-availability: worker heartbeat --------
+
+
+@pytest.mark.asyncio
+async def test_run_forever_writes_a_heartbeat_that_makes_the_worker_appear_available() -> None:
+    from app.amazon.worker_heartbeat import check_availability
+
+    cfg = _test_settings()
+    worker, _client = _worker()
+    worker = SalesTrafficWorker(
+        settings=cfg,
+        ingestion_service=worker._ingestion_service,
+        lease_owner="heartbeat-test",
+        idle_poll_seconds=0.01,
+        enable_heartbeat=True,
+    )
+
+    task = asyncio.create_task(worker.run_forever())
+    try:
+        await asyncio.sleep(0)
+        assert check_availability("sales_and_traffic_report", settings=cfg).available is True
+    finally:
+        worker.request_stop()
+        await asyncio.wait_for(task, timeout=2)
