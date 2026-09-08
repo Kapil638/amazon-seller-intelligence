@@ -179,3 +179,58 @@ def test_concurrent_first_heartbeat_writes_for_the_same_worker_type_never_crash_
         row = WorkerHeartbeatRepository(session).get_heartbeat("orders")
         assert row is not None
         assert row.instance_id in ("worker-a", "worker-b")
+
+
+# 5: fix/inventory-heartbeat-check-constraint — the actual live bug this
+# migration closes, reproduced directly against real PostgreSQL: an
+# 'inventory' heartbeat is rejected by the CHECK constraint as it stood
+# after 0015/0016 (the Inventory worker crashed on every startup attempt
+# with exactly this IntegrityError), and accepted once 0017 has run.
+def test_inventory_heartbeat_rejected_before_0017_and_accepted_after(disposable_engine) -> None:
+    url = _guard.disposable_url()
+    cfg = _alembic_config(url)
+    insert_inventory_heartbeat = text(
+        "INSERT INTO amazon_worker_heartbeats "
+        "(worker_type, instance_id, started_at, last_heartbeat_at) "
+        "VALUES ('inventory', 'x', now(), now())"
+    )
+
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0016_inventory_foundation")
+    with disposable_engine.begin() as conn:
+        with pytest.raises(IntegrityError):
+            conn.execute(insert_inventory_heartbeat)
+
+    # A failed statement leaves the transaction unusable in PostgreSQL —
+    # the fixture's own connection needs a fresh one for the next attempt.
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0017_inventory_heartbeat")
+    with disposable_engine.begin() as conn:
+        conn.execute(insert_inventory_heartbeat)  # must not raise
+        count = conn.execute(
+            text("SELECT COUNT(*) FROM amazon_worker_heartbeats WHERE worker_type = 'inventory'")
+        ).scalar()
+        assert count == 1
+
+
+# 6: downgrade narrows the CHECK back — proven to fail loudly (not
+# silently corrupt data) if an 'inventory' row still exists, exactly the
+# "unsafe to downgrade with the wider type still in use" case a CHECK
+# narrowing must guard against.
+def test_downgrade_0017_refuses_while_an_inventory_row_still_exists(disposable_engine) -> None:
+    url = _guard.disposable_url()
+    cfg = _alembic_config(url)
+    with _alembic_environment(url):
+        command.upgrade(cfg, "0017_inventory_heartbeat")
+    with disposable_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO amazon_worker_heartbeats "
+                "(worker_type, instance_id, started_at, last_heartbeat_at) "
+                "VALUES ('inventory', 'x', now(), now())"
+            )
+        )
+
+    with _alembic_environment(url):
+        with pytest.raises(IntegrityError):
+            command.downgrade(cfg, "0016_inventory_foundation")
