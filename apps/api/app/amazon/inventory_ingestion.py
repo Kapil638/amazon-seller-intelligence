@@ -87,6 +87,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     SpApiAuthenticationError,
     SpApiConfigurationError,
+    SpApiErrorEnvelopeError,
     SpApiInvalidRequestError,
     SpApiParseFailedError,
     SpApiRateLimitedError,
@@ -110,6 +111,53 @@ from app.persistence.repositories import (
 # raise the bound (an operator/config action), not something a retry
 # attempt fixes on its own.
 RETRYABLE_INVENTORY_FAILURE_CLASSES = frozenset({"throttled", "transient_request_failed", "malformed_page"})
+
+# fix/inventory-empty-response-and-failure-classification — a run that
+# exhausts its retry budget while its most recent attempt's own
+# `failure_class` was one of these keys is terminalized with the mapped,
+# specific reason instead of a blanket "rate_limited" — the live defect
+# this closes: a run that retried 5 times against `malformed_page`
+# (never an actual 429) was recorded as `rate_limited`, actively
+# misleading anyone reading it afterward. `throttled` is deliberately
+# absent — exhausting the budget on genuine repeated throttling *is*
+# correctly `rate_limited`, the one case the old blanket label was
+# actually right for. Mirrors `orders_ingestion.py`'s own
+# `_EXHAUSTION_REASON_BY_FAILURE_CLASS` precedent exactly.
+_EXHAUSTION_REASON_BY_FAILURE_CLASS: dict[str, str] = {
+    "malformed_page": "malformed_page_retry_exhausted",
+    "transient_request_failed": "transient_request_retry_exhausted",
+}
+
+# Amazon's own documented SP-API error codes this project has direct
+# evidence for (SP-API's shared error-code vocabulary, reused across
+# operations) — mapped to a stable, sanitized ASI failure_class so an
+# operator reading `amazon_ingestion_runs.failure_class` can tell
+# "Amazon rejected this for a permission reason" from "Amazon rejected
+# this for a validation reason" without ever needing the raw `message`/
+# `details` text (never logged or stored — see `SpApiErrorEnvelopeError`).
+# An unrecognized code — including any this project has not yet directly
+# observed — deliberately falls back to the generic `error_envelope`
+# class rather than guessing a more specific one.
+_ERROR_ENVELOPE_FAILURE_CLASS_BY_CODE: dict[str, str] = {
+    # Reuses this module's own already-established class names exactly
+    # (see the `except SpApi...Error:` mappings in `_traverse` below) so
+    # an error-envelope-carried failure is indistinguishable, once
+    # classified, from the same conceptual failure signaled via a plain
+    # HTTP status — never a parallel, near-duplicate vocabulary.
+    "Unauthorized": "authentication_failed",
+    "AccessDenied": "authentication_failed",
+    "Forbidden": "authentication_failed",
+    "InvalidInput": "invalid_request",
+    "InvalidParameterValue": "invalid_request",
+    "QuotaExceeded": "throttled",  # retryable; exhausts to "rate_limited" exactly like a real 429 would.
+    "ServiceUnavailable": "transient_request_failed",
+    "InternalFailure": "transient_request_failed",
+}
+
+
+def _error_envelope_failure_class(code: str) -> str:
+    return _ERROR_ENVELOPE_FAILURE_CLASS_BY_CODE.get(code, "error_envelope")
+
 
 logger = logging.getLogger(__name__)
 
@@ -423,10 +471,11 @@ class AmazonInventoryIngestionService:
         max_total_retry_seconds = cfg.inventory_sync_max_total_retry_seconds
         budget_exhausted = attempt_number >= max_attempts or elapsed_seconds >= max_total_retry_seconds
         if budget_exhausted:
+            exhaustion_reason = _EXHAUSTION_REASON_BY_FAILURE_CLASS.get(traversal.failure_class, "rate_limited")
             self._fail_claimed_run(
                 organization_id=organization_id,
                 run=claimed,
-                reason="rate_limited",
+                reason=exhaustion_reason,
                 pages_fetched=traversal.pages_fetched,
                 records_received=traversal.records_received,
                 pagination_complete=traversal.pagination_complete,
@@ -435,7 +484,7 @@ class AmazonInventoryIngestionService:
                 succeeded=False,
                 seller_account_id=claimed.seller_account_id,
                 marketplace_participation_id=marketplace_participation_id,
-                reason="rate_limited",
+                reason=exhaustion_reason,
                 ingestion_run_id=claimed.run_id,
                 pages_fetched=traversal.pages_fetched,
                 records_received=traversal.records_received,
@@ -575,6 +624,9 @@ class AmazonInventoryIngestionService:
                 break
             except SpApiParseFailedError:
                 failure_class = "malformed_page"
+                break
+            except SpApiErrorEnvelopeError as exc:
+                failure_class = _error_envelope_failure_class(exc.code)
                 break
             except SpApiRequestFailedError:
                 failure_class = "transient_request_failed"
