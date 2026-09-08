@@ -542,8 +542,87 @@ parallel/duplicated one:
   or already-claimed Inventory run remains recoverable exactly as
   before once its worker starts.
 
-No new tables, migrations, or duplicated heartbeat logic were added for
-Inventory — `AmazonWorkerHeartbeat`'s own `worker_type` CHECK constraint
-already includes `'inventory'` (added when this fix's own
-`0015_worker_heartbeats` migration and this branch's `0016_inventory_
-foundation` migration were reconciled during the rebase).
+No new tables or duplicated heartbeat logic were added for Inventory.
+**Correction (fix/inventory-empty-response-and-failure-classification):**
+the line above originally claimed `AmazonWorkerHeartbeat`'s own
+`worker_type` CHECK constraint "already includes `'inventory'`" — true
+of the ORM model (`app/persistence/models.py`) since the PR #22 rebase,
+but the *migration* for that constraint (`0015_worker_heartbeats`,
+authored before Inventory existed) was never given a matching update.
+The database and the ORM model had silently diverged: `KNOWN_WORKER_
+TYPES` (Python) already listed `'inventory'`, but the live constraint
+did not, and the Inventory worker crashed on every single startup
+attempt trying to publish one — see `0017_inventory_heartbeat` and
+`docs/AI_HANDOVER/`'s own migration file for the fix and the live
+verification that found it.
+
+## 12. Response-contract and failure-classification correction
+(fix/inventory-empty-response-and-failure-classification)
+
+A live controlled Inventory sync (run `f5626f55-…`) failed 5 times in a
+row with `payload` absent from an otherwise-successful (HTTP 200)
+`getInventorySummaries` response, and the retry-budget-exhaustion path
+then recorded the terminal `failure_class` as `rate_limited` even
+though no attempt had ever actually been throttled (confirmed via the
+worker's own log: every request logged `HTTP/1.1 200`, never `429`).
+
+**Contract re-verification** (re-fetched the pinned model file directly
+from GitHub at its pinned commit; SHA-256 matched
+`7c14bcdb22de8ca2df45e5a40f2a422cff344d45985a68b9515b2e800edcc5ab`
+exactly — see §1 above — and cross-checked against the current official
+`getInventorySummaries` reference page, which shares the identical
+`GetInventorySummariesResponse` schema across the 200 response and
+every documented error status): `payload`, `pagination`, and `errors`
+are all independently optional at the top level, with no top-level
+`required` list at all. **The documented shape for a seller with zero
+FBA inventory is `payload` *present* with `inventorySummaries: []`** —
+never `payload` absent. A `payload`-absent, `errors`-absent response is
+not a documented success shape for any status code this schema is
+shared across.
+
+**Sanitized live diagnostic** (one read-only `getInventorySummaries`
+call via the real client/secret-resolution path, no ingestion run
+created, only structural metadata ever inspected): the connected
+seller's real Inventory data is well-formed and non-empty (19
+`inventorySummaries` entries, `errors` absent) — confirming the
+original 5-attempt failure was a transient Amazon-side condition, not a
+persistent contract mismatch with this seller's data, and confirming
+the existing conservative choice (never silently treat an absent
+`payload` as an empty result) was correct.
+
+**Fixes applied:**
+
+- `inventory_models.py` / `inventory_client.py`: `errors` is now parsed
+  (previously silently dropped by `extra="ignore"`) into a new
+  `SpApiErrorEnvelopeError(code)` — sanitized (`code` only, never
+  `message`/`details`, which may echo seller-identifying request
+  parameters) — raised whenever `errors` is non-empty, entirely
+  distinct from the `malformed_page` classification a `payload`-absent-
+  and-`errors`-absent response still receives.
+- `inventory_ingestion.py`: known SP-API error codes map to this
+  project's own existing failure-class vocabulary
+  (`_ERROR_ENVELOPE_FAILURE_CLASS_BY_CODE`); an unrecognized code falls
+  back to a new generic `error_envelope` class rather than guessing.
+- Both `inventory_ingestion.py` and `listings_ingestion.py` (confirmed,
+  via direct code inspection, to have the identical defect) now
+  preserve the real retryable failure class through retry-budget
+  exhaustion via `_EXHAUSTION_REASON_BY_FAILURE_CLASS` — e.g.
+  `malformed_page` → `malformed_page_retry_exhausted` — mirroring
+  `orders_ingestion.py`'s own pre-existing, already-correct precedent.
+  `throttled` is deliberately excluded from both new mappings: exhausted
+  genuine throttling still correctly terminalizes as `rate_limited`.
+- Separately, the same live investigation found every Amazon sync-
+  trigger route (Inventory/Listings/Orders/Sales-Traffic) and both
+  `/health`/`/health/workers` declared `async def` while calling this
+  project's synchronous SQLAlchemy engine directly — blocking the
+  single shared asyncio event loop for the duration of every such call
+  and serializing every other concurrent request behind it (the actual
+  root cause of a live 30-second client timeout on the enqueue route,
+  despite the server having already committed the job). Changed to
+  plain `def` on all six routes, matching every already-correct
+  read-only route in this codebase — Starlette dispatches a plain `def`
+  route to its own bounded worker thread pool automatically. Proven
+  directly: `tests/test_amazon_inventory_sync_api.py::
+  test_enqueue_route_does_not_block_a_concurrent_request` fails
+  (~0.9s, serialized) against the old `async def` route and passes
+  (<0.5s, concurrent) against the fix.
