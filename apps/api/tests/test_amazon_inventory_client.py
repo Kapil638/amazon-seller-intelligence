@@ -8,6 +8,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.amazon.inventory_client import AmazonSpApiInventoryClient, InventoryPageRequest
+from app.amazon.inventory_models import GetInventorySummariesResponse
 from app.core.exceptions import (
     SpApiAuthenticationError,
     SpApiConfigurationError,
@@ -314,3 +315,144 @@ async def test_error_envelope_message_and_details_never_reach_the_logs(caplog) -
     assert "4567" not in all_log_text
     assert "99999999-9999-4999-8999-999999999999" not in all_log_text
     assert "Unauthorized" in all_log_text  # the one field that IS expected to appear
+
+
+# --- the "central contradiction" root cause, proven directly -------------
+# A one-off diagnostic script (never part of this codebase — throwaway,
+# used only to inspect live structural metadata) called `_single_attempt`
+# directly and inspected the raw JSON with shallow dict-key checks; it
+# never called `_parse_response()` at all, so it could not have detected
+# a validation failure nested inside one of N `InventorySummary` entries
+# even though its own top-level shape check (payload present, N
+# `inventorySummaries`) looked identical to what the real worker
+# received. These tests prove that gap directly: full production
+# parsing DOES reject data a shallow top-level-keys check would accept.
+
+
+def _valid_summary_dict(sku: str) -> dict:
+    return {"sellerSku": sku, "condition": "NewItem", "totalQuantity": 5}
+
+
+@pytest.mark.asyncio
+async def test_one_invalid_item_among_many_valid_ones_fails_the_whole_page(caplog) -> None:
+    """The exact shape a shallow "payload present, N inventorySummaries"
+    check (as a diagnostic script bypassing `_parse_response()` would
+    perform) cannot distinguish from fully-valid data — proving `payload`
+    being a well-formed dict at the top level does not mean every nested
+    `InventorySummary` entry passes validation."""
+    summaries = [_valid_summary_dict(f"SKU-{i}") for i in range(18)]
+    summaries.append({"sellerSku": "SKU-BAD", "condition": "NewItem", "totalQuantity": "not-a-number"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=summaries)
+
+    client = _client(handler)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SpApiParseFailedError):
+            await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+    all_log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "shape=payload_present_nested_validation_failed" in all_log_text
+    # The field PATH (structural — index + field name) is safe and useful
+    # to log; the actual invalid value ("not-a-number") must never appear.
+    assert "totalQuantity" in all_log_text
+    assert "not-a-number" not in all_log_text
+    assert "SKU-BAD" not in all_log_text  # no seller-identifying value either
+
+
+@pytest.mark.asyncio
+async def test_literally_null_payload_is_distinguished_from_a_nested_failure(caplog) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return httpx.Response(200, json={"payload": None})
+
+    client = _client(handler)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SpApiParseFailedError):
+            await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+    all_log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "shape=payload_null_or_wrong_type" in all_log_text
+    assert "shape=payload_present_nested_validation_failed" not in all_log_text
+
+
+@pytest.mark.asyncio
+async def test_nineteen_structurally_valid_summaries_survive_full_production_parsing() -> None:
+    """Directly answers "prove 19 structurally valid summaries would
+    survive the real worker parsing path" — a rich, 19-entry fixture
+    (fictional identifiers/quantities, matching the shape the live
+    diagnostic observed) run through the exact production chain:
+    `_single_attempt` → `_parse_response` (full Pydantic validation,
+    every entry) → `_to_page` → `InventoryPage`."""
+    summaries = [
+        {
+            "sellerSku": f"FICTIONAL-SKU-{i}",
+            "condition": "NewItem",
+            "asin": f"B0FICTIONAL{i:02d}",
+            "fnSku": f"FNFICTIONAL{i:02d}",
+            "totalQuantity": i * 3,
+            "lastUpdatedTime": "2026-09-01T12:00:00Z",
+            "inventoryDetails": {
+                "fulfillableQuantity": i,
+                "reservedQuantity": {"totalReservedQuantity": 0},
+            },
+        }
+        for i in range(19)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=summaries)
+
+    client = _client(handler)
+    page = await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert len(page.summaries) == 19
+    assert {s.seller_sku for s in page.summaries} == {f"FICTIONAL-SKU-{i}" for i in range(19)}
+
+
+@pytest.mark.asyncio
+async def test_response_body_can_be_read_only_once_per_attempt() -> None:
+    """`response.json()` decodes from `response.content`, which httpx
+    buffers on a non-streamed response — safe to call more than once on
+    the SAME response object (proven here calling `_parse_response`
+    twice), and each of the worker's own retries constructs a genuinely
+    new `httpx.Response` via a fresh `_single_attempt` call, never
+    reusing a previously-consumed one."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=[_valid_summary_dict("SKU-1")])
+
+    client = _client(handler)
+    page = await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert len(page.summaries) == 1
+
+    # A second, independent fetch (a fresh HTTP exchange, exactly what a
+    # worker retry does) parses correctly too — nothing from the first
+    # attempt's response object leaks into or blocks the second.
+    page2 = await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert len(page2.summaries) == 1
+
+
+@pytest.mark.asyncio
+async def test_already_parsed_model_is_never_passed_back_through_json_parsing() -> None:
+    """Guards against a completely different class of bug this
+    investigation's own hypothesis list named explicitly: a caller
+    accidentally passing an already-`GetInventorySummariesResponse`-
+    parsed object back into `_parse_response`, which expects a real
+    `httpx.Response`. `BaseModel` happens to carry its own (deprecated)
+    `.json()` method returning a JSON *string*, not a decoded dict —
+    proven here to fail safely (a clean `SpApiParseFailedError` with
+    `shape=wrong_top_level_type`), never an unhandled `AttributeError`
+    or, worse, a silent misinterpretation as valid data."""
+    client = _client(lambda request: _lwa_token_response())
+    parsed_already = GetInventorySummariesResponse.model_validate(
+        {"payload": {"granularity": {}, "inventorySummaries": []}}
+    )
+    with pytest.raises(SpApiParseFailedError):
+        client._parse_response(parsed_already)  # type: ignore[arg-type]
