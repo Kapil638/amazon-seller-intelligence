@@ -1950,3 +1950,48 @@ class AmazonSalesAndTrafficSyncCheckpoint(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class AmazonWorkerHeartbeat(Base):
+    """fix/ingestion-worker-runtime-availability — a database-backed
+    liveness signal for the durable-job workers (Listings, Orders, Sales
+    & Traffic; not tied to any future worker type by construction). One
+    row per `worker_type`, upserted by that worker's own process on a
+    fixed cadence (`app/amazon/worker_heartbeat.py`), independent of its
+    claim/poll loop so a worker legitimately busy on one long-running job
+    still reports itself alive.
+
+    `worker_type` reuses `amazon_ingestion_runs.run_type`'s own
+    vocabulary (`'listings'`, `'orders'`, `'sales_and_traffic_report'`)
+    rather than inventing a second one.
+
+    Deliberately **not** a lease: no `lease_owner`, no exclusivity, no
+    interaction whatsoever with `amazon_ingestion_runs`' own claim/lease
+    columns. This table only ever answers "has *some* process of this
+    worker type reported itself alive recently" — it must never gate or
+    block a job claim/reclaim, which stays governed entirely by the
+    existing lease-expiry mechanism on `amazon_ingestion_runs` itself.
+
+    `instance_id` is a random per-process identifier (regenerated on
+    every worker restart) — purely observational, never a secret, never
+    used for authorization; it lets an operator see "the same process
+    has been heartbeating since X" versus "a new process took over."
+    """
+
+    __tablename__ = "amazon_worker_heartbeats"
+    __table_args__ = (
+        CheckConstraint(
+            "worker_type IN ('listings', 'orders', 'sales_and_traffic_report')",
+            name="ck_amazon_worker_heartbeats_worker_type",
+        ),
+    )
+
+    worker_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

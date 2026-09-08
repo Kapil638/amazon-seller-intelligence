@@ -45,6 +45,7 @@ from app.persistence.models import (
     AmazonSellerListing,
     AmazonSellerOrder,
     AmazonSellerOrderItem,
+    AmazonWorkerHeartbeat,
 )
 
 
@@ -5578,6 +5579,108 @@ class AmazonSalesTrafficProductFactRepository:
                 )
             ).all()
         )
+
+
+_KNOWN_WORKER_TYPES = frozenset({"listings", "orders", "sales_and_traffic_report"})
+
+
+@dataclass(frozen=True)
+class WorkerAvailability:
+    """`available` is `True` iff a heartbeat row exists for this worker
+    type and its `last_heartbeat_at` is no older than `stale_after_
+    seconds`. `last_heartbeat_at` is always the raw stored value (or
+    `None` if no row exists at all) — the caller decides what to show,
+    this repository only decides the boolean."""
+
+    available: bool
+    last_heartbeat_at: datetime | None
+
+
+class WorkerHeartbeatRepository:
+    """fix/ingestion-worker-runtime-availability — database-backed worker
+    liveness. One row per `worker_type` (`amazon_worker_heartbeats`,
+    `AmazonWorkerHeartbeat`). Deliberately not organization-scoped: a
+    worker process is a shared, cross-organization resource, not
+    per-tenant data — matching how `claim_next_listings_job` etc. already
+    treat worker capacity as global/fleet-wide, never per-organization
+    ownership.
+
+    Deliberately not a lease: this class never reads or writes anything
+    on `amazon_ingestion_runs`. See `AmazonWorkerHeartbeat`'s own
+    docstring for why that separation is load-bearing (a stale-heartbeat
+    read here must never be able to block a legitimate lease reclaim on
+    the job ledger).
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def record_heartbeat(self, worker_type: str, *, instance_id: str, pid: int | None) -> None:
+        """Upsert. Idempotent, safe to call every `worker_heartbeat_
+        interval_seconds` for the lifetime of the process. `started_at`
+        is set once, the first time this exact `instance_id` is seen for
+        this `worker_type` (i.e. on insert, or when a different process
+        has taken over the row); every other call only advances
+        `last_heartbeat_at`."""
+        if worker_type not in _KNOWN_WORKER_TYPES:
+            raise TypeError(f"Unknown worker_type for a heartbeat: {worker_type!r}")
+        now = datetime.now(UTC)
+        existing = self.session.get(AmazonWorkerHeartbeat, worker_type)
+        if existing is None:
+            row = AmazonWorkerHeartbeat(
+                worker_type=worker_type, instance_id=instance_id, pid=pid, started_at=now, last_heartbeat_at=now
+            )
+            try:
+                with self.session.begin_nested():
+                    self.session.add(row)
+                    self.session.flush()
+                return
+            except IntegrityError:
+                # A concurrent first-heartbeat race from a second process
+                # of the same worker_type starting at almost the same
+                # instant — vanishingly rare in practice (one worker
+                # process per type in normal operation), but this must
+                # never crash either loser. Fall through to the update
+                # path below against whichever row actually won.
+                existing = self.session.get(AmazonWorkerHeartbeat, worker_type)
+                if existing is None:
+                    raise
+        if existing.instance_id != instance_id:
+            existing.instance_id = instance_id
+            existing.pid = pid
+            existing.started_at = now
+        existing.last_heartbeat_at = now
+        self.session.flush()
+
+    def get_heartbeat(self, worker_type: str) -> AmazonWorkerHeartbeat | None:
+        return self.session.get(AmazonWorkerHeartbeat, worker_type)
+
+    def check_availability(self, worker_type: str, *, stale_after_seconds: float) -> WorkerAvailability:
+        """Database time, not the API process's own clock — the same
+        authority this codebase already insists on for lease/retry/
+        cooldown timing (see e.g. `AmazonListingsSyncTriggerService.
+        trigger`'s own cooldown check), so a skewed application clock can
+        never distort the availability decision in either direction."""
+        row = self.get_heartbeat(worker_type)
+        if row is None:
+            return WorkerAvailability(available=False, last_heartbeat_at=None)
+        db_now = self.session.execute(select(func.now())).scalar_one()
+        age_seconds = (_ensure_aware(db_now) - _ensure_aware(row.last_heartbeat_at)).total_seconds()
+        return WorkerAvailability(available=age_seconds <= stale_after_seconds, last_heartbeat_at=row.last_heartbeat_at)
+
+
+def _ensure_aware(value: datetime) -> datetime:
+    """SQLite returns naive `datetime`s for `func.now()`/stored
+    `DateTime(timezone=True)` values even though PostgreSQL returns
+    aware ones — normalizes both to UTC-aware before subtracting, so the
+    same comparison logic is correct under both dialects (mirrors this
+    codebase's existing `app.amazon.common.ensure_utc` helper, duplicated
+    narrowly here rather than imported to avoid a persistence-layer ->
+    domain-layer import direction that does not exist anywhere else in
+    this module)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 def file_sha256(data: bytes) -> str:
