@@ -415,6 +415,52 @@ jobs:
       # (`pytest tests/postgres/`) rather than duplicated here as raw
       # shell/SQL.
 
+  existing-database-upgrade-0017:
+    name: Existing PostgreSQL (0016) — upgrade to 0017
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0017
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0016 (simulates an existing pre-fix database, already carrying Inventory's own schema)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0016_inventory_foundation
+      - name: alembic upgrade to 0017 (fix/inventory-heartbeat-check-constraint's own upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0017_inventory_heartbeat
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0017_inventory_heartbeat"
+      # The deeper behavioral proof (an 'inventory' heartbeat rejected
+      # before this migration and accepted after it, real PostgreSQL
+      # CHECK enforcement rather than only the application-layer
+      # TypeError, and the downgrade's refusal while an 'inventory' row
+      # still exists) lives in `tests/postgres/
+      # test_disposable_postgres_worker_heartbeats.py`, exercised by the
+      # `postgres-identity-concurrency` job below (`pytest tests/
+      # postgres/`) rather than duplicated here as raw shell/SQL.
+
   postgres-identity-concurrency:
     name: PostgreSQL — OAuth identity concurrency validation
     runs-on: ubuntu-latest
