@@ -38,6 +38,7 @@ from app.persistence.models import AmazonIngestionRun
 from app.persistence.repositories import (
     AmazonIngestionRunRepository,
     AmazonMarketplaceParticipationRepository,
+    WorkerHeartbeatRepository,
 )
 
 
@@ -76,18 +77,24 @@ class InventorySyncTriggerOutcome:
     `"already_running"`, `"cooldown"`, `"queue_backlog_limit_reached"`
     (this organization's *queue* — never worker execution capacity — has
     grown unreasonably large; see `count_queued_inventory_runs_for_
-    organization`), or one of `_check_scope`'s own failure reasons
-    (`"scope_not_found"`, `"scope_inactive"`, `"identity_missing"`,
-    `"connection_unresolvable"`). `job` is populated for `"queued"` and
-    `"already_running"` (and, where available, `"cooldown"`) so the caller
-    has something concrete to show/poll; it is always `None` for a scope
-    failure, since no run exists to describe.
+    organization`), `"worker_unavailable"` (fix/ingestion-worker-runtime-
+    availability, integrated into Inventory after that fix merged — no
+    Inventory worker process has reported a heartbeat recently enough;
+    see `app.amazon.worker_heartbeat`), or one of `_check_scope`'s own
+    failure reasons (`"scope_not_found"`, `"scope_inactive"`,
+    `"identity_missing"`, `"connection_unresolvable"`). `job` is
+    populated for `"queued"` and `"already_running"` (and, where
+    available, `"cooldown"`) so the caller has something concrete to
+    show/poll; it is always `None` for a scope failure or
+    `"worker_unavailable"`, since no run exists to describe.
 
-    Deliberately absent: any reason tied to worker execution capacity
+    Deliberately absent: any reason tied to worker *execution capacity*
     being full. A legitimate new job is never rejected merely because
-    workers are busy — it is accepted as `queued` and simply waits;
-    `claim_next_inventory_job`'s own `started`-only counts are the only
-    place execution capacity is enforced, strictly at claim time.
+    already-running workers are busy — it is accepted as `queued` and
+    simply waits; `claim_next_inventory_job`'s own `started`-only counts
+    are the only place execution capacity is enforced, strictly at claim
+    time. `"worker_unavailable"` is categorically different: zero worker
+    processes of this type exist at all right now.
 
     `retry_allowed_at` is populated only for `reason="cooldown"` — the
     database-computed moment (the cooldown-relevant run's `created_at`
@@ -221,6 +228,14 @@ class AmazonInventorySyncTriggerService:
                 >= cfg.inventory_sync_max_queued_per_organization
             ):
                 return InventorySyncTriggerOutcome(reason="queue_backlog_limit_reached")
+
+            # fix/ingestion-worker-runtime-availability — see the identical
+            # check and reasoning in listings_sync.py's own trigger().
+            availability = WorkerHeartbeatRepository(session).check_availability(
+                "inventory", stale_after_seconds=cfg.worker_heartbeat_stale_after_seconds
+            )
+            if not availability.available:
+                return InventorySyncTriggerOutcome(reason="worker_unavailable")
 
             claim = runs.enqueue_inventory_run(
                 organization_id=organization_id,

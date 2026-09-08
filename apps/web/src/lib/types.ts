@@ -2195,6 +2195,10 @@ export type InventorySyncTriggerReason =
   | "already_running"
   | "cooldown"
   | "queue_backlog_limit_reached"
+  // fix/ingestion-worker-runtime-availability, integrated into Inventory
+  // after that fix merged — no Inventory worker process has reported a
+  // heartbeat recently enough. Never creates a job.
+  | "worker_unavailable"
   | "scope_not_found"
   | "scope_inactive"
   | "identity_missing"

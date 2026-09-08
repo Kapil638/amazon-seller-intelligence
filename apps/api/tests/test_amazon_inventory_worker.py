@@ -115,7 +115,13 @@ def _worker(
     ingestion_service = AmazonInventoryIngestionService(
         settings=cfg, resolver=resolver or _FakeResolver(), inventory_client_factory=factory, sleep=_noop_sleep,
     )
-    worker = InventoryWorker(settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker")
+    # enable_heartbeat=False — see the identical note in
+    # test_amazon_listings_worker.py's own _worker() helper: these tests
+    # assert on exact asyncio.sleep call sequences, which a background
+    # heartbeat task sleeping independently would otherwise break.
+    worker = InventoryWorker(
+        settings=cfg, ingestion_service=ingestion_service, lease_owner="test-worker", enable_heartbeat=False
+    )
     return worker, client
 
 
@@ -419,3 +425,36 @@ def test_worker_poll_error_backoff_rejects_base_exceeding_max() -> None:
             inventory_worker_poll_error_base_backoff_seconds=10.0,
             inventory_worker_poll_error_max_backoff_seconds=5.0,
         )
+
+
+# --- fix/ingestion-worker-runtime-availability integration: worker heartbeat --
+
+
+@pytest.mark.asyncio
+async def test_run_forever_writes_a_heartbeat_that_makes_the_worker_appear_available() -> None:
+    """The whole point of the shared heartbeat loop: once `run_forever()`
+    has actually started, `check_availability("inventory", ...)` — the
+    exact call the Inventory sync-trigger service makes before
+    enqueueing — reports this worker type as available."""
+    from app.amazon.worker_heartbeat import check_availability
+
+    cfg = _test_settings()
+    worker, _client = _worker()
+    worker = InventoryWorker(
+        settings=cfg,
+        ingestion_service=worker._ingestion_service,
+        lease_owner="heartbeat-test",
+        idle_poll_seconds=0.01,
+        enable_heartbeat=True,
+    )
+
+    task = asyncio.create_task(worker.run_forever())
+    try:
+        # The heartbeat loop writes its first row synchronously before
+        # run_forever's own claim loop starts — no sleep needed here to
+        # observe it (this is the "startup grace" guarantee itself).
+        await asyncio.sleep(0)
+        assert check_availability("inventory", settings=cfg).available is True
+    finally:
+        worker.request_stop()
+        await asyncio.wait_for(task, timeout=2)

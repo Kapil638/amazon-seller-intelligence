@@ -268,6 +268,32 @@ describe("SellerInventory", () => {
     await waitFor(() => expect(screen.getByText(/Please wait a moment/i)).toBeInTheDocument());
   });
 
+  it("shows a clear, actionable message and never queues when the Inventory worker is unavailable", async () => {
+    // fix/ingestion-worker-runtime-availability, integrated into
+    // Inventory: the backend refuses the trigger outright
+    // (reason="worker_unavailable") when no matching worker has
+    // reported a recent heartbeat — this falls through the component's
+    // own generic non-"queued" branch, so it renders exactly like any
+    // other structured rejection (cooldown) with zero component-
+    // specific code for this reason.
+    vi.mocked(triggerInventorySync).mockResolvedValue({
+      reason: "worker_unavailable",
+      message:
+        "The Inventory sync worker is not running, so this job would never be picked up. " +
+        "Start local development with the connected-seller runtime: " +
+        "./scripts/dev.sh --with-workers (or ASI_INVENTORY_WORKER_ENABLED=true ./scripts/dev.sh), " +
+        "then try again.",
+      job: null,
+    });
+    render(<SellerInventory />);
+    await waitFor(() => expect(screen.getByText("Not yet synchronized")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /Sync FBA Inventory/i }));
+
+    await waitFor(() => expect(screen.getByText(/worker is not running/i)).toBeInTheDocument());
+    expect(screen.getByText(/--with-workers/i)).toBeInTheDocument();
+  });
+
   it("filters the list by search term", async () => {
     vi.mocked(fetchInventorySummary).mockResolvedValue(summary({ sync: sync({ status: "succeeded" }) }));
     vi.mocked(fetchInventory).mockResolvedValue(collection({ items: [item()], total: 1 }));

@@ -488,3 +488,62 @@ the next push.
    bound, not an Amazon-documented ceiling — a catalog that genuinely
    exceeds it produces a clear terminal failure requiring an operator to
    raise the configured bound, never a silent truncation.
+
+## 14. Worker liveness heartbeat and availability integration
+(fix/ingestion-worker-runtime-availability)
+
+An independently developed, urgent production-path fix
+(`fix/ingestion-worker-runtime-availability`, merged into `main` ahead of
+this milestone) discovered and repaired a real runtime defect: a Sync
+click created a durable job regardless of whether any matching worker
+process actually existed to claim it, so with no worker running (the
+normal outcome of starting the app via a bare `npm run dev` / `uv run
+uvicorn ...`, or via `scripts/dev.sh` without the right flag) a job sat
+`queued` forever with no actionable signal. That fix added a shared,
+database-backed worker liveness heartbeat
+(`amazon_worker_heartbeats`/`AmazonWorkerHeartbeat`, migration
+`0015_worker_heartbeats`) and a trigger-time availability gate for
+Listings, Orders, and Sales & Traffic. This migration (`0016`,
+renumbered from its original `0015` after that fix claimed the number
+first — see the migration file's own header) sits directly on top of
+`0015_worker_heartbeats`, and `inventory_worker.py`/`inventory_sync.py`
+are integrated with that exact same shared mechanism, not a
+parallel/duplicated one:
+
+- `InventoryWorker.run_forever()` starts `app.amazon.worker_heartbeat.
+  start_heartbeat_loop("inventory", ...)` before entering its own
+  claim/poll loop — an immediate synchronous first write (the "startup
+  grace" guarantee), then one write every `worker_heartbeat_interval_
+  seconds` (10s default) via a background task fully decoupled from
+  whatever job is currently being processed, so a worker legitimately
+  busy on one large catalog traversal still reports itself alive.
+- `AmazonInventorySyncTriggerService.trigger()` checks
+  `WorkerHeartbeatRepository.check_availability("inventory", ...)`
+  (reusing the trigger's own open session — never a separate nested
+  `session_scope()`) immediately before enqueueing, after every other
+  rejection reason (scope, cooldown, queue-backlog) so a more specific
+  outcome is still reported accurately even when the Inventory worker
+  also happens to be unavailable. An unavailable worker returns
+  `reason="worker_unavailable"` with `job=None` — no row is created —
+  mapped by the route to `503` with a message naming
+  `ASI_INVENTORY_WORKER_ENABLED`/`./scripts/dev.sh --with-workers`.
+  `worker_heartbeat_stale_after_seconds` (45s default) is the same
+  cross-domain setting Listings/Orders/Sales-and-Traffic already use —
+  no Inventory-specific staleness threshold was introduced.
+- `./scripts/dev.sh --with-workers` now sets
+  `ASI_INVENTORY_WORKER_ENABLED=true` alongside the original three
+  flags — one opt-in, four workers, safe default (no flag, no env vars)
+  unchanged.
+- Nothing about the FBA-only disclosure (§11), the deactivation-only-
+  after-a-complete-sweep guarantee (§5), or the corrected observation
+  grain (§0/§8) changes — the heartbeat is purely a liveness signal
+  gating *new* trigger acceptance; it has no interaction whatsoever with
+  `amazon_ingestion_runs`' own lease/claim columns, so an already-queued
+  or already-claimed Inventory run remains recoverable exactly as
+  before once its worker starts.
+
+No new tables, migrations, or duplicated heartbeat logic were added for
+Inventory — `AmazonWorkerHeartbeat`'s own `worker_type` CHECK constraint
+already includes `'inventory'` (added when this fix's own
+`0015_worker_heartbeats` migration and this branch's `0016_inventory_
+foundation` migration were reconciled during the rebase).
