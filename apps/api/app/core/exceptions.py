@@ -322,6 +322,19 @@ class AmazonSellerListingNotFoundError(Exception):
         super().__init__(f"Listing {listing_id} was not found.")
 
 
+class AmazonSellerInventoryNotFoundError(Exception):
+    """12B.6B — an inventory row could not be resolved within its
+    (already-validated) marketplace participation — same sanitized shape
+    for missing, foreign, or cross-participation inventory row ids.
+    Dedicated rather than reusing `AmazonSellerListingNotFoundError`,
+    matching `AmazonSellerOrderNotFoundError`'s own precedent, so error
+    messages stay accurate to which domain actually raised them."""
+
+    def __init__(self, inventory_id: str) -> None:
+        self.inventory_id = inventory_id
+        super().__init__(f"Inventory row {inventory_id} was not found.")
+
+
 class SpApiInvalidRequestError(Exception):
     """A non-transient 4xx response (not authentication, not rate limiting).
 

@@ -48,15 +48,17 @@ no_sleep100_survivors() {
   ! pgrep -f "sleep 100" >/dev/null 2>&1
 }
 
-# --- 1: correct five child commands, all started ---------------------------
+# --- 1: correct six child commands, all started ----------------------------
 
-test_starts_five_children_and_shuts_down_cleanly() {
+test_starts_six_children_and_shuts_down_cleanly() {
   local log
   log="$(mktemp)"
   ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true \
+    ASI_INVENTORY_WORKER_ENABLED=true \
     BACKEND_PORT=18211 FRONTEND_PORT=18212 \
     DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
     DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
+    DEV_SH_INVENTORY_WORKER_CMD="sleep 100" \
     "$DEV_SH" >"$log" 2>&1 &
   local script_pid=$!
 
@@ -68,10 +70,10 @@ test_starts_five_children_and_shuts_down_cleanly() {
   fi
   local running
   running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
-  if [ "$running" -ne 5 ]; then
-    fail "startup: expected 5 'sleep 100' children, found $running"
+  if [ "$running" -ne 6 ]; then
+    fail "startup: expected 6 'sleep 100' children, found $running"
   else
-    pass "startup: exactly 5 child processes running (backend, frontend, listings/orders/sales-traffic workers)"
+    pass "startup: exactly 6 child processes running (backend, frontend, listings/orders/sales-traffic/inventory workers)"
   fi
 
   kill -TERM "$script_pid" 2>/dev/null || true
@@ -293,28 +295,31 @@ test_command_construction_never_prints_secrets() {
 test_worker_not_started_without_the_enable_flag() {
   local log
   log="$(mktemp)"
-  # Deliberately none of the three ASI_*_WORKER_ENABLED flags at all —
+  # Deliberately none of the four ASI_*_WORKER_ENABLED flags at all —
   # the default, fail-closed state this whole gate exists to prove, for
-  # all three workers independently.
+  # all four workers independently.
   env -u ASI_LISTINGS_WORKER_ENABLED -u ASI_ORDERS_WORKER_ENABLED -u ASI_SALES_TRAFFIC_WORKER_ENABLED \
+    -u ASI_INVENTORY_WORKER_ENABLED \
     BACKEND_PORT=18223 FRONTEND_PORT=18224 \
     DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
     DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
+    DEV_SH_INVENTORY_WORKER_CMD="sleep 100" \
     "$DEV_SH" >"$log" 2>&1 &
   local script_pid=$!
   wait_until 5 grep -q "all requested processes are running" "$log" || true
 
   if grep -q "ASI_LISTINGS_WORKER_ENABLED is not set to true" "$log" \
     && grep -q "ASI_ORDERS_WORKER_ENABLED is not set to true" "$log" \
-    && grep -q "ASI_SALES_TRAFFIC_WORKER_ENABLED is not set to true" "$log"; then
-    pass "worker gate: dev.sh explained why it is not starting any of the three workers"
+    && grep -q "ASI_SALES_TRAFFIC_WORKER_ENABLED is not set to true" "$log" \
+    && grep -q "ASI_INVENTORY_WORKER_ENABLED is not set to true" "$log"; then
+    pass "worker gate: dev.sh explained why it is not starting any of the four workers"
   else
     fail "worker gate: missing explanation for at least one disabled worker ($log)"
   fi
   local running
   running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
   if [ "$running" -eq 2 ]; then
-    pass "worker gate: only backend and frontend started (all three workers withheld by default)"
+    pass "worker gate: only backend and frontend started (all four workers withheld by default)"
   else
     fail "worker gate: expected exactly 2 children (backend, frontend) without any flag, found $running"
   fi
@@ -383,16 +388,19 @@ test_runtime_output_never_contains_a_database_url_or_token() {
 
 # --- 8: --with-workers is one opt-in flag for the connected-seller mode ---
 
-test_with_workers_flag_starts_all_three_workers_without_env_vars() {
+test_with_workers_flag_starts_all_four_workers_without_env_vars() {
   local log
   log="$(mktemp)"
-  # Deliberately none of the three ASI_*_WORKER_ENABLED flags set by
+  # Deliberately none of the four ASI_*_WORKER_ENABLED flags set by
   # hand — --with-workers alone must be sufficient (fix/ingestion-
-  # worker-runtime-availability's own opt-in mode).
+  # worker-runtime-availability's own opt-in mode, extended to Inventory
+  # once PR #22 rebased onto it).
   env -u ASI_LISTINGS_WORKER_ENABLED -u ASI_ORDERS_WORKER_ENABLED -u ASI_SALES_TRAFFIC_WORKER_ENABLED \
+    -u ASI_INVENTORY_WORKER_ENABLED \
     BACKEND_PORT=18227 FRONTEND_PORT=18228 \
     DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
     DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
+    DEV_SH_INVENTORY_WORKER_CMD="sleep 100" \
     "$DEV_SH" --with-workers >"$log" 2>&1 &
   local script_pid=$!
 
@@ -404,10 +412,10 @@ test_with_workers_flag_starts_all_three_workers_without_env_vars() {
   fi
   local running
   running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
-  if [ "$running" -eq 5 ]; then
-    pass "--with-workers: exactly 5 children running with no env vars set by hand"
+  if [ "$running" -eq 6 ]; then
+    pass "--with-workers: exactly 6 children running with no env vars set by hand"
   else
-    fail "--with-workers: expected exactly 5 children, found $running"
+    fail "--with-workers: expected exactly 6 children, found $running"
   fi
 
   kill -TERM "$script_pid" 2>/dev/null || true
@@ -474,7 +482,7 @@ test_unrecognized_flag_is_rejected() {
   rm -f "$log"
 }
 
-test_starts_five_children_and_shuts_down_cleanly
+test_starts_six_children_and_shuts_down_cleanly
 test_enabling_only_sales_traffic_worker_starts_only_that_one
 test_partial_start_failure_cleans_up
 test_non_critical_worker_startup_failure_does_not_stop_the_stack
@@ -484,7 +492,7 @@ test_worker_not_started_without_the_enable_flag
 test_shutdown_never_touches_an_unrelated_process
 test_runtime_output_never_contains_a_database_url_or_token
 test_command_construction_never_prints_secrets
-test_with_workers_flag_starts_all_three_workers_without_env_vars
+test_with_workers_flag_starts_all_four_workers_without_env_vars
 test_second_concurrent_invocation_is_refused_by_the_pid_file
 test_unrecognized_flag_is_rejected
 

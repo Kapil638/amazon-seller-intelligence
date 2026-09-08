@@ -21,12 +21,12 @@
 #
 # Usage:
 #   ./scripts/dev.sh                    # backend + frontend only (safe default)
-#   ./scripts/dev.sh --with-workers     # also starts all three sync workers
+#   ./scripts/dev.sh --with-workers     # also starts all four sync workers
 #   ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh   # start just one worker
 #
 # `--with-workers` is the one opt-in flag for connected-seller local
 # development — it sets every ASI_*_WORKER_ENABLED flag internally so
-# nobody has to remember or type three separate environment variables.
+# nobody has to remember or type four separate environment variables.
 # It changes nothing else: the safe default (no flag, no env vars set)
 # still starts zero workers, exactly as before — cloning this repository
 # or copying `.env.example` and running `./scripts/dev.sh` still never

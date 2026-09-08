@@ -25,13 +25,14 @@ afterEach(() => {
 });
 
 describe("SellerLocalNav", () => {
-  it("renders Overview, Listings, Orders, and Sales & Traffic tabs", () => {
+  it("renders Overview, Listings, Orders, Sales & Traffic, and FBA Inventory tabs", () => {
     useSearchParamsMock.mockReturnValue(new URLSearchParams());
     render(<SellerLocalNav active="overview" />);
     expect(screen.getByRole("link", { name: "Overview" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Listings" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Orders" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Sales & Traffic" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "FBA Inventory" })).toBeInTheDocument();
   });
 
   it("marks the Sales & Traffic tab active with aria-current", () => {
@@ -39,6 +40,13 @@ describe("SellerLocalNav", () => {
     render(<SellerLocalNav active="sales-traffic" />);
     expect(screen.getByRole("link", { name: "Sales & Traffic" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("link", { name: "Orders" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("marks the FBA Inventory tab active with aria-current", () => {
+    useSearchParamsMock.mockReturnValue(new URLSearchParams());
+    render(<SellerLocalNav active="inventory" />);
+    expect(screen.getByRole("link", { name: "FBA Inventory" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("link", { name: "Sales & Traffic" })).not.toHaveAttribute("aria-current");
   });
 
   it("marks the active tab with aria-current", () => {

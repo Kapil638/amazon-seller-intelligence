@@ -13,8 +13,8 @@
 ./scripts/dev.sh
 ```
 
-Starts the backend API and frontend. **None of the three sync workers
-(Listings, Orders, Sales & Traffic) start by default** —
+Starts the backend API and frontend. **None of the four sync workers
+(Listings, Orders, Sales & Traffic, Inventory) start by default** —
 `./scripts/dev.sh` alone gives you the frontend and API only. To also
 start every worker (so a triggered sync actually gets claimed and
 processed), use the one connected-seller opt-in flag:
@@ -23,9 +23,9 @@ processed), use the one connected-seller opt-in flag:
 ./scripts/dev.sh --with-workers
 ```
 
-This is exactly equivalent to setting all three flags below by hand —
+This is exactly equivalent to setting all four flags below by hand —
 `--with-workers` exists purely so you don't have to remember or type
-three separate environment variables — and either form is fully
+four separate environment variables — and either form is fully
 supported. You can still enable a subset directly if you only want one
 or two workers running:
 
@@ -33,9 +33,10 @@ or two workers running:
 ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh
 ASI_ORDERS_WORKER_ENABLED=true ./scripts/dev.sh
 ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
+ASI_INVENTORY_WORKER_ENABLED=true ./scripts/dev.sh
 
-# or all three together, the long way (`--with-workers` above is the short one):
-ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
+# or all four together, the long way (`--with-workers` above is the short one):
+ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true ASI_INVENTORY_WORKER_ENABLED=true ./scripts/dev.sh
 ```
 
 The safe default (no flag, no env vars) is deliberate, not an
@@ -50,35 +51,38 @@ or copying `.env.example` never starts one on its own. Every worker
 module enforces this same check itself (fail-closed) even if you run it
 directly, so there is no way to start a live worker by accident through
 any path. See `app/amazon/listings_worker.py`, `orders_worker.py`,
-and `sales_traffic_worker.py`'s own module docstrings, and `docs/
-AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`, for the full design.
+`sales_traffic_worker.py`, and `inventory_worker.py`'s own module
+docstrings, and `docs/AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`,
+for the full design.
 
 Each process's output is prefixed (`[backend]`, `[frontend]`, `[worker]`,
-`[orders-worker]`, `[sales-traffic-worker]` — the latter three only when
-enabled). A single Ctrl-C stops everything that was started cleanly.
-Detects if a port is already in use or a worker of a given type is
-already running (never starts a duplicate of that type) before starting
-anything. This does not replace the individual commands below — both
-remain fully supported; use whichever fits what you're doing. See
-`scripts/test_dev_sh.sh` for this script's own test suite.
+`[orders-worker]`, `[sales-traffic-worker]`, `[inventory-worker]` — the
+latter four only when enabled). A single Ctrl-C stops everything that
+was started cleanly. Detects if a port is already in use or a worker of
+a given type is already running (never starts a duplicate of that type)
+before starting anything. This does not replace the individual commands
+below — both remain fully supported; use whichever fits what you're
+doing. See `scripts/test_dev_sh.sh` for this script's own test suite.
 
 ### Worker availability — what happens without a worker running
 
 **Without a job type's worker enabled (via any path above), a Sync
 click for that job type is now refused immediately** with a clear
 `503 worker_unavailable` response explaining which worker to start
-(fix/ingestion-worker-runtime-availability) — it no longer silently
-accepts the job and leaves it `queued` forever with no signal. Each
-running worker writes a database heartbeat (`amazon_worker_heartbeats`)
-every few seconds, independent of whatever job it may currently be
-processing; each sync-trigger endpoint checks that heartbeat before
-enqueueing. If you started `./scripts/dev.sh --with-workers` (or the
-individual env var) and a Sync click is still refused as unavailable,
-give the worker a couple of seconds to write its first heartbeat and
-try again — this is normal for the first request of a session, not a
-bug. Existing previously-synced data for that job type is never
-affected either way, and a job that was already queued before its
-worker started remains claimable once that worker comes up.
+(fix/ingestion-worker-runtime-availability, extended to Inventory once
+that milestone's own worker was integrated with this shared mechanism)
+— it no longer silently accepts the job and leaves it `queued` forever
+with no signal. Each running worker writes a database heartbeat
+(`amazon_worker_heartbeats`) every few seconds, independent of whatever
+job it may currently be processing; each sync-trigger endpoint checks
+that heartbeat before enqueueing. If you started `./scripts/dev.sh
+--with-workers` (or the individual env var) and a Sync click is still
+refused as unavailable, give the worker a couple of seconds to write
+its first heartbeat and try again — this is normal for the first
+request of a session, not a bug. Existing previously-synced data for
+that job type is never affected either way, and a job that was already
+queued before its worker started remains claimable once that worker
+comes up.
 
 ## Backend
 
@@ -168,6 +172,25 @@ running (or enabled), a triggered sync stays `queued` indefinitely
 (harmlessly — existing sales/traffic data is never affected). Graceful
 shutdown via Ctrl-C or `SIGTERM`. See `app/amazon/sales_traffic_worker.py`'s
 own module docstring and `docs/AI_HANDOVER/12B6A_SALES_TRAFFIC_REPORTS.md`.
+
+## Inventory worker (standalone)
+
+```bash
+cd apps/api
+ASI_INVENTORY_WORKER_ENABLED=true uv run python -m app.amazon.inventory_worker
+```
+
+Identical shape and safety gate to the Listings worker above
+(`ASI_INVENTORY_WORKER_ENABLED=true` required, independent of the other
+three flags). A separate, long-running process — never started
+implicitly by the API or by `./scripts/dev.sh`. Claims and processes
+durable FBA Inventory synchronization jobs; without it running (or
+enabled), a Sync click is refused immediately with a `503
+worker_unavailable` response rather than left `queued` indefinitely
+(fix/ingestion-worker-runtime-availability — see "Worker availability"
+above). Graceful shutdown via Ctrl-C or `SIGTERM`. See
+`app/amazon/inventory_worker.py`'s own module docstring and `docs/
+AI_HANDOVER/12B6B_FBA_INVENTORY_INGESTION.md`.
 
 ## Amazon local notes
 
