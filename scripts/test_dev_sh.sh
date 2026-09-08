@@ -341,6 +341,56 @@ test_runtime_output_never_contains_a_database_url_or_token() {
   pkill -f "sleep 100" 2>/dev/null || true
 }
 
+# --- 8: --with-workers is one opt-in flag for the connected-seller mode ---
+
+test_with_workers_flag_starts_all_three_workers_without_env_vars() {
+  local log
+  log="$(mktemp)"
+  # Deliberately none of the three ASI_*_WORKER_ENABLED flags set by
+  # hand — --with-workers alone must be sufficient (fix/ingestion-
+  # worker-runtime-availability's own opt-in mode).
+  env -u ASI_LISTINGS_WORKER_ENABLED -u ASI_ORDERS_WORKER_ENABLED -u ASI_SALES_TRAFFIC_WORKER_ENABLED \
+    BACKEND_PORT=18227 FRONTEND_PORT=18228 \
+    DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
+    DEV_SH_ORDERS_WORKER_CMD="sleep 100" DEV_SH_SALES_TRAFFIC_WORKER_CMD="sleep 100" \
+    "$DEV_SH" --with-workers >"$log" 2>&1 &
+  local script_pid=$!
+
+  if ! wait_until 5 grep -q "all requested processes are running" "$log"; then
+    fail "--with-workers: did not reach 'all requested processes are running' ($log)"
+    kill -KILL "$script_pid" 2>/dev/null || true
+    pkill -f "sleep 100" 2>/dev/null || true
+    return
+  fi
+  local running
+  running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
+  if [ "$running" -eq 5 ]; then
+    pass "--with-workers: exactly 5 children running with no env vars set by hand"
+  else
+    fail "--with-workers: expected exactly 5 children, found $running"
+  fi
+
+  kill -TERM "$script_pid" 2>/dev/null || true
+  wait_until 5 no_sleep100_survivors || true
+  rm -f "$log"
+  pkill -f "sleep 100" 2>/dev/null || true
+}
+
+# --- 9: an unrecognized flag is rejected, not silently ignored -------------
+
+test_unrecognized_flag_is_rejected() {
+  local log
+  log="$(mktemp)"
+  "$DEV_SH" --not-a-real-flag >"$log" 2>&1
+  local exit_code=$?
+  if [ "$exit_code" -ne 0 ] && grep -q "Unrecognized argument" "$log"; then
+    pass "unrecognized flag: rejected with a clear message and nonzero exit, nothing started"
+  else
+    fail "unrecognized flag: expected a nonzero exit and a clear message ($log)"
+  fi
+  rm -f "$log"
+}
+
 test_starts_five_children_and_shuts_down_cleanly
 test_enabling_only_sales_traffic_worker_starts_only_that_one
 test_partial_start_failure_cleans_up
@@ -350,6 +400,8 @@ test_worker_not_started_without_the_enable_flag
 test_shutdown_never_touches_an_unrelated_process
 test_runtime_output_never_contains_a_database_url_or_token
 test_command_construction_never_prints_secrets
+test_with_workers_flag_starts_all_three_workers_without_env_vars
+test_unrecognized_flag_is_rejected
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

@@ -16,29 +16,40 @@
 Starts the backend API and frontend. **None of the three sync workers
 (Listings, Orders, Sales & Traffic) start by default** —
 `./scripts/dev.sh` alone gives you the frontend and API only. To also
-start one or more workers (so a triggered sync actually gets claimed
-and processed), set the corresponding flag(s) — any subset may be
-combined:
+start every worker (so a triggered sync actually gets claimed and
+processed), use the one connected-seller opt-in flag:
+
+```bash
+./scripts/dev.sh --with-workers
+```
+
+This is exactly equivalent to setting all three flags below by hand —
+`--with-workers` exists purely so you don't have to remember or type
+three separate environment variables — and either form is fully
+supported. You can still enable a subset directly if you only want one
+or two workers running:
 
 ```bash
 ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh
 ASI_ORDERS_WORKER_ENABLED=true ./scripts/dev.sh
 ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
 
-# or all three together:
+# or all three together, the long way (`--with-workers` above is the short one):
 ASI_LISTINGS_WORKER_ENABLED=true ASI_ORDERS_WORKER_ENABLED=true ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh
 ```
 
-This is deliberate, not an oversight: this repository's local `.env`
-points `DATABASE_URL` at a real, live Supabase project, not a disposable
-one. A worker that started automatically the moment you ran a
-convenience script would begin claiming and processing *real* jobs —
-real Amazon SP-API calls — the instant one existed, with no explicit
-action from you. Each `ASI_*_WORKER_ENABLED=true` flag is the one
-explicit signal that authorizes that worker. Every worker module
-enforces this same check itself (fail-closed) even if you run it
+The safe default (no flag, no env vars) is deliberate, not an
+oversight: this repository's local `.env` points `DATABASE_URL` at a
+real, live Supabase project, not a disposable one. A worker that
+started automatically the moment you ran a convenience script would
+begin claiming and processing *real* jobs — real Amazon SP-API calls —
+the instant one existed, with no explicit action from you. `--with-
+workers` and each individual `ASI_*_WORKER_ENABLED=true` flag are the
+only explicit signals that authorize a worker; cloning this repository
+or copying `.env.example` never starts one on its own. Every worker
+module enforces this same check itself (fail-closed) even if you run it
 directly, so there is no way to start a live worker by accident through
-either path. See `app/amazon/listings_worker.py`, `orders_worker.py`,
+any path. See `app/amazon/listings_worker.py`, `orders_worker.py`,
 and `sales_traffic_worker.py`'s own module docstrings, and `docs/
 AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md`, for the full design.
 
@@ -51,11 +62,23 @@ anything. This does not replace the individual commands below — both
 remain fully supported; use whichever fits what you're doing. See
 `scripts/test_dev_sh.sh` for this script's own test suite.
 
-**Without a job type's worker enabled (via either path above), a
-triggered sync of that type will sit `queued` forever** — every worker
-is a separate process from the API and is never started implicitly, by
-design. Existing previously-synced data for that job type is never
-affected either way.
+### Worker availability — what happens without a worker running
+
+**Without a job type's worker enabled (via any path above), a Sync
+click for that job type is now refused immediately** with a clear
+`503 worker_unavailable` response explaining which worker to start
+(fix/ingestion-worker-runtime-availability) — it no longer silently
+accepts the job and leaves it `queued` forever with no signal. Each
+running worker writes a database heartbeat (`amazon_worker_heartbeats`)
+every few seconds, independent of whatever job it may currently be
+processing; each sync-trigger endpoint checks that heartbeat before
+enqueueing. If you started `./scripts/dev.sh --with-workers` (or the
+individual env var) and a Sync click is still refused as unavailable,
+give the worker a couple of seconds to write its first heartbeat and
+try again — this is normal for the first request of a session, not a
+bug. Existing previously-synced data for that job type is never
+affected either way, and a job that was already queued before its
+worker started remains claimable once that worker comes up.
 
 ## Backend
 
