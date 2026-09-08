@@ -20,7 +20,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import DataError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -102,7 +102,7 @@ def test_unknown_worker_type_rejected_by_real_postgres_check_constraint(disposab
         command.upgrade(cfg, "head")
 
     with disposable_engine.begin() as conn:
-        with pytest.raises(DataError):
+        with pytest.raises(IntegrityError):
             conn.execute(
                 text(
                     "INSERT INTO amazon_worker_heartbeats "

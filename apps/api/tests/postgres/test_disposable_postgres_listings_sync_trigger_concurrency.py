@@ -56,7 +56,7 @@ from app.persistence.models import (
     AmazonSellerAccount,
     Organization,
 )
-from app.persistence.repositories import AmazonIngestionRunRepository
+from app.persistence.repositories import AmazonIngestionRunRepository, WorkerHeartbeatRepository
 from tests.postgres import _guard
 
 pytestmark = pytest.mark.skipif(bool(_guard.skip_reason()), reason=_guard.skip_reason() or "")
@@ -204,6 +204,13 @@ def _seed_default_org_scope(engine) -> tuple[UUID, UUID, UUID]:
                 is_participating=True,
             )
         )
+        # fix/ingestion-worker-runtime-availability: trigger() now refuses
+        # to enqueue (reason="worker_unavailable") unless a Listings
+        # worker has reported a recent heartbeat — every test in this
+        # file exercises trigger()'s own concurrency/ownership behavior,
+        # not the availability gate itself, so a healthy heartbeat is
+        # part of this shared scope fixture.
+        WorkerHeartbeatRepository(session).record_heartbeat("listings", instance_id="postgres-test-worker", pid=1)
         session.commit()
     return org_id, seller_account_id, participation_id
 
