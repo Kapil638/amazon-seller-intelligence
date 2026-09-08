@@ -45,6 +45,12 @@ _TRIGGER_MESSAGES: dict[str, str] = {
     "connection_unresolvable": "No Amazon connection is bound to this seller account.",
     "cooldown": "Please wait a moment before synchronizing Sales and Traffic again.",
     "invalid_request": "The requested date range or granularity was invalid.",
+    "worker_unavailable": (
+        "The Sales and Traffic sync worker is not running, so this job would never be picked up. "
+        "Start local development with the connected-seller runtime: "
+        "./scripts/dev.sh --with-workers (or ASI_SALES_TRAFFIC_WORKER_ENABLED=true ./scripts/dev.sh), "
+        "then try again."
+    ),
 }
 _DEFAULT_FAILURE_MESSAGE = "Sales and Traffic synchronization could not be started."
 _JOB_NOT_FOUND_MESSAGE = "This synchronization job was not found."
@@ -77,7 +83,7 @@ class SalesTrafficSyncTriggerResponse(BaseModel):
 def _status_for_trigger_reason(reason: str) -> int:
     if reason == "scope_not_found":
         return 404
-    if reason in {"scope_inactive", "connection_unresolvable"}:
+    if reason in {"scope_inactive", "connection_unresolvable", "worker_unavailable"}:
         return 503
     if reason == "already_running":
         return 409

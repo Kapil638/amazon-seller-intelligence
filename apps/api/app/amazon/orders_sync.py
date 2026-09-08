@@ -34,6 +34,7 @@ from app.persistence.models import AmazonIngestionRun, AmazonIngestionRunMarketp
 from app.persistence.repositories import (
     AmazonIngestionRunMarketplaceParticipationRepository,
     AmazonIngestionRunRepository,
+    WorkerHeartbeatRepository,
 )
 
 
@@ -71,16 +72,21 @@ class OrdersSyncJobStatus(BaseModel):
 @dataclass(frozen=True)
 class OrdersSyncTriggerOutcome:
     """`reason` is one of: `"queued"` (a new durable job was created),
-    `"already_running"`, `"cooldown"`, `"queue_backlog_limit_reached"`, or
-    one of `_check_scope`'s own failure reasons (`"scope_not_found"`,
-    `"scope_inactive"`, `"scope_ambiguous"`, `"identity_missing"`,
-    `"connection_unresolvable"`). `job` is populated for `"queued"` and
-    `"already_running"` (and, where available, `"cooldown"`); always
-    `None` for a scope failure, since no run exists to describe.
+    `"already_running"`, `"cooldown"`, `"queue_backlog_limit_reached"`,
+    `"worker_unavailable"` (fix/ingestion-worker-runtime-availability —
+    no Orders worker process has reported a heartbeat recently enough;
+    see `app.amazon.worker_heartbeat`), or one of `_check_scope`'s own
+    failure reasons (`"scope_not_found"`, `"scope_inactive"`,
+    `"scope_ambiguous"`, `"identity_missing"`, `"connection_unresolvable"`).
+    `job` is populated for `"queued"` and `"already_running"` (and, where
+    available, `"cooldown"`); always `None` for a scope failure or
+    `"worker_unavailable"`, since no run exists to describe.
 
-    Deliberately absent: any reason tied to worker execution capacity
+    Deliberately absent: any reason tied to worker *execution capacity*
     being full — a legitimate new job is never rejected merely because
-    workers are busy; it is accepted as `queued` and simply waits.
+    already-running workers are busy; it is accepted as `queued` and
+    simply waits. `"worker_unavailable"` is categorically different: zero
+    worker processes of this type exist at all right now.
     """
 
     reason: str
@@ -180,6 +186,14 @@ class AmazonOrdersSyncTriggerService:
 
             if runs.count_queued_orders_runs_for_organization(organization_id) >= cfg.orders_sync_max_queued_per_organization:
                 return OrdersSyncTriggerOutcome(reason="queue_backlog_limit_reached")
+
+            # fix/ingestion-worker-runtime-availability — see the identical
+            # check and reasoning in listings_sync.py's own trigger().
+            availability = WorkerHeartbeatRepository(session).check_availability(
+                "orders", stale_after_seconds=cfg.worker_heartbeat_stale_after_seconds
+            )
+            if not availability.available:
+                return OrdersSyncTriggerOutcome(reason="worker_unavailable")
 
             claim = AmazonIngestionRunMarketplaceParticipationRepository(session).enqueue_orders_run(
                 organization_id=organization_id,

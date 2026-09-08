@@ -14,6 +14,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from app.amazon.listings_sync import AmazonListingsSyncTriggerService
 from app.core.config import Settings
 from app.persistence.database import current_organization_id, session_scope
@@ -23,9 +25,22 @@ from app.persistence.repositories import (
     AmazonIngestionRunRepository,
     AmazonMarketplaceParticipationRepository,
     AmazonSellerAccountRepository,
+    WorkerHeartbeatRepository,
 )
 
 MARKETPLACE = "ATVPDKIKX0DER"
+
+
+@pytest.fixture(autouse=True)
+def _healthy_listings_worker_heartbeat():
+    """fix/ingestion-worker-runtime-availability: every test in this file
+    exercises cooldown/backlog/scope/dedup logic, not worker-availability
+    logic — a healthy heartbeat is the default baseline so those
+    pre-existing behaviors are unaffected. See the dedicated
+    worker_unavailable tests below for the availability gate itself."""
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("listings", instance_id="test-worker", pid=1)
+        session.commit()
 
 
 def _settings(**overrides) -> Settings:
@@ -796,3 +811,78 @@ def test_get_status_never_mutates_a_queued_run_no_matter_how_stale() -> None:
         assert status is not None
         assert status.status == "queued"
     assert snapshot() == before
+
+
+# --- fix/ingestion-worker-runtime-availability: worker-unavailable gate --
+
+
+def test_trigger_refuses_and_creates_no_job_when_no_listings_worker_heartbeat_exists(monkeypatch) -> None:
+    """The root-cause fix's core behavior: with no Listings worker
+    heartbeat at all (the `_healthy_listings_worker_heartbeat` autouse
+    fixture is bypassed here by clearing the row this test itself just
+    wrote), a Sync trigger must refuse immediately and durably create no
+    job — never accept it and leave it queued forever."""
+    from app.persistence.models import AmazonWorkerHeartbeat
+
+    with session_scope() as session:
+        row = session.get(AmazonWorkerHeartbeat, "listings")
+        if row is not None:
+            session.delete(row)
+        session.commit()
+
+    scope = _seed_scope()
+    trigger = AmazonListingsSyncTriggerService(settings=_settings())
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+
+    assert outcome.reason == "worker_unavailable"
+    assert outcome.job is None
+    with session_scope() as session:
+        count = (
+            session.query(AmazonIngestionRun)
+            .filter_by(marketplace_participation_id=scope["marketplace_participation_id"], run_type="listings")
+            .count()
+        )
+    assert count == 0
+
+
+def test_trigger_refuses_when_the_listings_worker_heartbeat_is_stale() -> None:
+    from app.persistence.models import AmazonWorkerHeartbeat
+
+    with session_scope() as session:
+        row = session.get(AmazonWorkerHeartbeat, "listings")
+        row.last_heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    scope = _seed_scope()
+    trigger = AmazonListingsSyncTriggerService(
+        settings=_settings(worker_heartbeat_stale_after_seconds=45.0)
+    )
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+
+    assert outcome.reason == "worker_unavailable"
+    with session_scope() as session:
+        count = (
+            session.query(AmazonIngestionRun)
+            .filter_by(marketplace_participation_id=scope["marketplace_participation_id"], run_type="listings")
+            .count()
+        )
+    assert count == 0
+
+
+def test_trigger_succeeds_once_the_worker_heartbeat_becomes_fresh_again() -> None:
+    """An existing queued job created before the worker started remains
+    recoverable — this test proves the inverse (and complementary) half:
+    once a heartbeat exists, triggering works normally again, exactly as
+    it did before this fix for every other pre-existing trigger test."""
+    from app.persistence.repositories import WorkerHeartbeatRepository
+
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("listings", instance_id="fresh-worker", pid=42)
+        session.commit()
+
+    scope = _seed_scope()
+    trigger = AmazonListingsSyncTriggerService(settings=_settings())
+    outcome = trigger.trigger(scope["marketplace_participation_id"])
+
+    assert outcome.reason == "queued"
+    assert outcome.job is not None

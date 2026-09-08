@@ -137,6 +137,7 @@ def test_scope_not_found_returns_sanitized_404(client) -> None:
         ("scope_inactive", 503),
         ("identity_missing", 503),
         ("connection_unresolvable", 503),
+        ("worker_unavailable", 503),
         ("cooldown", 429),
         ("queue_backlog_limit_reached", 429),
     ],

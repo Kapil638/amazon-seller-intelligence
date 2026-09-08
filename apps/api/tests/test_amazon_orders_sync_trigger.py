@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from app.amazon.orders_sync import AmazonOrdersSyncTriggerService
 from app.core.config import Settings
 from app.persistence.database import current_organization_id, session_scope
@@ -20,10 +22,20 @@ from app.persistence.repositories import (
     AmazonIngestionRunMarketplaceParticipationRepository,
     AmazonMarketplaceParticipationRepository,
     AmazonSellerAccountRepository,
+    WorkerHeartbeatRepository,
 )
 
 MARKETPLACE = "ATVPDKIKX0DER"
 MARKETPLACE_2 = "A2EUQ1WTGCTBG2"
+
+
+@pytest.fixture(autouse=True)
+def _healthy_orders_worker_heartbeat():
+    """fix/ingestion-worker-runtime-availability — see the identical
+    fixture and reasoning in test_amazon_listings_sync_trigger.py."""
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("orders", instance_id="test-worker", pid=1)
+        session.commit()
 
 
 def _settings(**overrides) -> Settings:
@@ -325,3 +337,62 @@ def test_get_status_never_exposes_forbidden_fields() -> None:
     dumped = outcome.job.model_dump()
     forbidden = {"organization_id", "seller_account_id", "connection_id", "lease_owner", "token_reference", "pagination_token"}
     assert forbidden.isdisjoint(dumped.keys())
+
+
+# --- fix/ingestion-worker-runtime-availability: worker-unavailable gate --
+
+
+def test_trigger_refuses_and_creates_no_job_when_no_orders_worker_heartbeat_exists() -> None:
+    from app.persistence.models import AmazonWorkerHeartbeat
+
+    with session_scope() as session:
+        row = session.get(AmazonWorkerHeartbeat, "orders")
+        if row is not None:
+            session.delete(row)
+        session.commit()
+
+    scope = _seed_scope()
+    service = AmazonOrdersSyncTriggerService(settings=_settings())
+    outcome = service.trigger(
+        seller_account_id=scope["seller_account_id"],
+        marketplace_participation_ids=[scope["marketplace_participation_id"]],
+    )
+
+    assert outcome.reason == "worker_unavailable"
+    assert outcome.job is None
+    with session_scope() as session:
+        count = session.query(AmazonIngestionRun).filter_by(run_type="orders").count()
+    assert count == 0
+
+
+def test_trigger_refuses_when_the_orders_worker_heartbeat_is_stale() -> None:
+    from app.persistence.models import AmazonWorkerHeartbeat
+
+    with session_scope() as session:
+        row = session.get(AmazonWorkerHeartbeat, "orders")
+        row.last_heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+    scope = _seed_scope()
+    service = AmazonOrdersSyncTriggerService(settings=_settings(worker_heartbeat_stale_after_seconds=45.0))
+    outcome = service.trigger(
+        seller_account_id=scope["seller_account_id"],
+        marketplace_participation_ids=[scope["marketplace_participation_id"]],
+    )
+    assert outcome.reason == "worker_unavailable"
+
+
+def test_trigger_succeeds_once_the_orders_worker_heartbeat_becomes_fresh_again() -> None:
+    from app.persistence.repositories import WorkerHeartbeatRepository
+
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("orders", instance_id="fresh-worker", pid=42)
+        session.commit()
+
+    scope = _seed_scope()
+    service = AmazonOrdersSyncTriggerService(settings=_settings())
+    outcome = service.trigger(
+        seller_account_id=scope["seller_account_id"],
+        marketplace_participation_ids=[scope["marketplace_participation_id"]],
+    )
+    assert outcome.reason == "queued"
