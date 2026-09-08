@@ -1093,6 +1093,39 @@ describe("Sync listings action", () => {
     );
   });
 
+  it("shows a clear, actionable message and never queues when the Listings worker is unavailable", async () => {
+    // fix/ingestion-worker-runtime-availability: the backend refuses the
+    // trigger outright (reason="worker_unavailable") when no matching
+    // worker has reported a recent heartbeat — this falls through this
+    // component's own generic non-"queued" branch, so it renders exactly
+    // like any other structured rejection (cooldown, already_running)
+    // with zero component-specific code for this new reason.
+    vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
+    vi.mocked(fetchListingsSummary).mockResolvedValueOnce(richSummary);
+    vi.mocked(fetchListings).mockResolvedValue(richCollection);
+    vi.mocked(triggerListingsSync).mockResolvedValue(
+      triggerResponse({
+        reason: "worker_unavailable",
+        message:
+          "The Listings sync worker is not running, so this job would never be picked up. " +
+          "Start local development with the connected-seller runtime: " +
+          "./scripts/dev.sh --with-workers (or ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh), " +
+          "then try again.",
+        job: null,
+      }),
+    );
+    vi.mocked(fetchListingsSummary).mockResolvedValue(richSummary);
+    setup(`participation=${US_ID}`);
+
+    await waitFor(() => expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /^sync listings$/i }));
+
+    await waitFor(() => expect(screen.getByText(/worker is not running/i)).toBeInTheDocument());
+    expect(screen.getByText(/--with-workers/i)).toBeInTheDocument();
+    // Never left showing "Queued" — no job was actually created.
+    expect(screen.queryByRole("button", { name: /^queued$/i })).not.toBeInTheDocument();
+  });
+
   it("ignores a trigger response for a marketplace the user has since switched away from", async () => {
     vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
     vi.mocked(fetchListingsSummary).mockImplementation(async (id: string) =>
