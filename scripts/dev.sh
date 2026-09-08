@@ -1,339 +1,58 @@
 #!/usr/bin/env bash
-# 12B.3H — Unified local development startup: frontend + backend API +
-# each of the Listings, Orders, and Sales & Traffic workers that has
-# been explicitly enabled, in one terminal, one Ctrl-C.
+# fix/supervise-ingestion-runtime — thin entry point into the real
+# process supervisor: scripts/supervisor.py.
 #
-# Supported platforms: macOS and Linux only (this repo's other local
-# tooling — e.g. the disposable-Postgres backup scripts under
-# docs/AI_HANDOVER — already assumes the same; Windows is not a
-# supported local development target). Requires: bash, lsof, pgrep,
-# uv, npm — all already required by this project's existing individual
-# start commands.
+# 12B.3H originally implemented this script's own startup/shutdown logic
+# directly in bash — plain job control, `wait` on every child, no
+# restart, no readiness, no heartbeat awareness. That was enough to
+# start a stack, but not enough to notice or recover when a child died
+# mid-session, which is exactly the gap fix/supervise-ingestion-runtime
+# closes: a live inspection found the frontend and API both refusing
+# connections with no supervisor anywhere to have noticed or restarted
+# them. All of that logic now lives in scripts/supervisor.py (stdlib
+# Python, no third-party dependency, unit-tested directly — see
+# apps/api/tests/test_dev_supervisor.py) so it can be tested as real
+# code rather than only as bash-script black-box behavior. This file
+# stays as the documented, discoverable entry point.
 #
-# This does not replace the existing individual commands (still
-# documented in docs/AI_HANDOVER/14_LOCAL_DEVELOPMENT_SETUP.md) — it
-# only saves opening several terminals for the common case of wanting
-# the backend, frontend, and one or more workers running together. No
-# process manager dependency is added; this is plain bash job control.
+# Supported platforms: macOS and Linux only (matches every other local
+# tool in this repository). Requires: bash, python3 (3.12+, stdlib
+# only — supervisor.py has no third-party dependency), uv, npm.
 #
 # Usage:
 #   ./scripts/dev.sh                    # backend + frontend only (safe default)
 #   ./scripts/dev.sh --with-workers     # also starts all three sync workers
 #   ASI_LISTINGS_WORKER_ENABLED=true ./scripts/dev.sh   # start just one worker
 #
-# fix/ingestion-worker-runtime-availability: `--with-workers` is the one
-# opt-in flag for connected-seller local development — it sets all three
-# ASI_*_WORKER_ENABLED flags internally so nobody has to remember or
-# type three separate environment variables. It changes nothing else:
-# the safe default (no flag, no env vars set) still starts zero workers,
-# exactly as before — cloning this repository or copying `.env.example`
-# and running `./scripts/dev.sh` still never starts a live worker.
-# Equivalent to (and interchangeable with) setting all three
-# ASI_*_WORKER_ENABLED env vars by hand; either path is fully supported.
+# `--with-workers` is the one opt-in flag for connected-seller local
+# development — it sets every ASI_*_WORKER_ENABLED flag internally so
+# nobody has to remember or type three separate environment variables.
+# It changes nothing else: the safe default (no flag, no env vars set)
+# still starts zero workers, exactly as before — cloning this repository
+# or copying `.env.example` and running `./scripts/dev.sh` still never
+# starts a live worker. Equivalent to (and interchangeable with) setting
+# each ASI_*_WORKER_ENABLED env var by hand; either path is fully
+# supported.
 #
-# Ctrl-C (SIGINT) or `kill <pid>` (SIGTERM) on this script's own process
-# stops every child it started.
+# **This process must stay running in the foreground.** It is the
+# supervisor — closing this terminal, or killing this process, stops
+# the frontend, the API, and every worker it started, and stops
+# synchronization from happening. Do not background it (`&`) or run it
+# from a short-lived command — start it in a terminal you intend to
+# keep open for the duration of your development session. Ctrl-C (SIGINT)
+# or `kill <pid>` (SIGTERM) on this process stops everything it started,
+# cleanly, and only then exits.
+#
+# Logs for every child are written under logs/dev/ (gitignored) and the
+# exact path is printed on startup.
 
 set -uo pipefail
-set -m # job control: each backgrounded child becomes its own process group leader
-
-for arg in "$@"; do
-  case "$arg" in
-    --with-workers)
-      export ASI_LISTINGS_WORKER_ENABLED=true
-      export ASI_ORDERS_WORKER_ENABLED=true
-      export ASI_SALES_TRAFFIC_WORKER_ENABLED=true
-      ;;
-    -h|--help)
-      grep '^# ' "${BASH_SOURCE[0]}" | head -30 | sed 's/^# \{0,1\}//'
-      exit 0
-      ;;
-    *)
-      echo "[dev.sh] Unrecognized argument: $arg (see --help)" >&2
-      exit 1
-      ;;
-  esac
-done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-API_DIR="$ROOT_DIR/apps/api"
-WEB_DIR="$ROOT_DIR/apps/web"
-BACKEND_PORT="${BACKEND_PORT:-8000}"
-FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 
-# PIDs of children this invocation actually started — only these are
-# ever signaled or waited on. A worker this script chose not to start
-# (see the duplicate-worker check below) is never added here.
-declare -a CHILD_PIDS=()
-declare -a CHILD_NAMES=()
-SHUTTING_DOWN=0
-
-log() {
-  printf '[dev.sh] %s\n' "$1"
-}
-
-port_in_use() {
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
-}
-
-# Prefixes a child's combined stdout/stderr with a short tag, without
-# ever touching the content itself — never a place secrets could be
-# redacted-and-missed, since nothing here parses or rewrites log lines.
-prefixed() {
-  local tag="$1"
-  sed -u "s/^/[$tag] /"
-}
-
-start_child() {
-  local name="$1" dir="$2"
-  shift 2
-  # Process substitution, not a `| prefixed` pipe: backgrounding a
-  # pipeline's `$!` gives the PID of its *last* stage (the `sed`
-  # prefixer here), not the actual command — `shutdown` would then be
-  # signaling the log formatter while the real backend/frontend/worker
-  # process it was piped into keeps running, undetected, as an orphan.
-  # `> >(...)` keeps the backgrounded command's own PID in `$!`.
-  (
-    cd "$dir" || exit 1
-    exec "$@"
-  ) > >(prefixed "$name") 2>&1 &
-  local pid=$!
-  CHILD_PIDS+=("$pid")
-  CHILD_NAMES+=("$name")
-  log "started $name (pid $pid)"
-}
-
-child_alive() {
-  kill -0 "$1" 2>/dev/null
-}
-
-shutdown() {
-  if [ "$SHUTTING_DOWN" -eq 1 ]; then
-    return
-  fi
-  SHUTTING_DOWN=1
-  # Guard every array expansion on the count first — under bash 3.2's
-  # `set -u` (macOS's default, non-interactive /bin/bash), expanding
-  # `${!ARRAY[@]}` or `${ARRAY[@]}` for a still-empty array raises
-  # "unbound variable" instead of iterating zero times like newer bash.
-  # Reached whenever shutdown fires before any child ever started (e.g.
-  # the port pre-flight check failed) — must be a clean no-op, not a
-  # second error on top of the real one.
-  if [ "${#CHILD_PIDS[@]}" -eq 0 ]; then
-    return
-  fi
-  log "shutting down..."
-  local i pid name
-  for i in "${!CHILD_PIDS[@]}"; do
-    pid="${CHILD_PIDS[$i]}"
-    name="${CHILD_NAMES[$i]}"
-    if child_alive "$pid"; then
-      log "stopping $name (pid $pid)"
-      # Negative PID = the whole process group `set -m` gave this child,
-      # so uv/npm/next's own subprocesses are signaled too, not just the
-      # immediate wrapper — this is what actually avoids an orphaned
-      # next-server or uvicorn reloader child surviving this script.
-      kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
-  # Grace period for cooperative shutdown (matches the worker's own
-  # cooperative-stop design — see app/amazon/listings_worker.py) before
-  # escalating to SIGKILL for anything still alive.
-  local waited=0 any_alive
-  while [ "$waited" -lt 10 ]; do
-    any_alive=0
-    for i in "${!CHILD_PIDS[@]}"; do
-      if child_alive "${CHILD_PIDS[$i]}"; then
-        any_alive=1
-      fi
-    done
-    if [ "$any_alive" -eq 0 ]; then
-      break
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  for i in "${!CHILD_PIDS[@]}"; do
-    pid="${CHILD_PIDS[$i]}"
-    if child_alive "$pid"; then
-      log "force-stopping ${CHILD_NAMES[$i]} (pid $pid)"
-      kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    fi
-  done
-  log "all children stopped"
-}
-
-trap shutdown INT TERM
-trap shutdown EXIT
-
-# --- pre-flight: port conflicts --------------------------------------------
-
-if port_in_use "$BACKEND_PORT"; then
-  log "ERROR: port $BACKEND_PORT is already in use — is the backend already running (this script or another terminal)?"
-  exit 1
-fi
-if port_in_use "$FRONTEND_PORT"; then
-  log "ERROR: port $FRONTEND_PORT is already in use — is the frontend already running (this script or another terminal)?"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[dev.sh] ERROR: python3 is required (see Prerequisites in docs/AI_HANDOVER/14_LOCAL_DEVELOPMENT_SETUP.md)" >&2
   exit 1
 fi
 
-# --- pre-flight: worker authorization gates ---------------------------------
-# 12B.3H (Listings), extended for Orders and Sales & Traffic — starting
-# this unified stack must never *silently* begin claiming and processing
-# real jobs (real Amazon calls, against whatever DATABASE_URL is
-# configured — a live Supabase project in this repo's actual local .env,
-# not a disposable one) just because a developer ran this script without
-# thinking about it. Each worker module enforces this same gate itself
-# (fail-closed, checked first thing in its own `main()`) — checking it
-# here too means a disabled worker is never even attempted, rather than
-# started and immediately exiting with a visible error. The three flags
-# are independent: any subset may be enabled at once (see each worker's
-# own `is_worker_enabled` docstring).
-
-SKIP_WORKER=0
-if [ "${ASI_LISTINGS_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_LISTINGS_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
-  log "ASI_LISTINGS_WORKER_ENABLED is not set to true — not starting a Listings worker."
-  log "(backend and frontend still start normally; set ASI_LISTINGS_WORKER_ENABLED=true to also start the worker — see docs/AI_HANDOVER/12B3H_LISTINGS_WORKER_OPERATIONS.md)"
-  SKIP_WORKER=1
-fi
-
-SKIP_ORDERS_WORKER=0
-if [ "${ASI_ORDERS_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_ORDERS_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
-  log "ASI_ORDERS_WORKER_ENABLED is not set to true — not starting an Orders worker."
-  log "(backend and frontend still start normally; set ASI_ORDERS_WORKER_ENABLED=true to also start the worker)"
-  SKIP_ORDERS_WORKER=1
-fi
-
-SKIP_SALES_TRAFFIC_WORKER=0
-if [ "${ASI_SALES_TRAFFIC_WORKER_ENABLED:-}" != "1" ] && [ "$(printf '%s' "${ASI_SALES_TRAFFIC_WORKER_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
-  log "ASI_SALES_TRAFFIC_WORKER_ENABLED is not set to true — not starting a Sales and Traffic worker."
-  log "(backend and frontend still start normally; set ASI_SALES_TRAFFIC_WORKER_ENABLED=true to also start the worker)"
-  SKIP_SALES_TRAFFIC_WORKER=1
-fi
-
-# --- pre-flight: duplicate workers -------------------------------------------
-
-if [ "$SKIP_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.listings_worker" >/dev/null 2>&1; then
-  log "a Listings worker process already appears to be running — not starting a second one."
-  log "(this script never claims two workers are safe to run without checking; see app/amazon/listings_worker.py's own module docstring for why a duplicate worker is otherwise harmless, just wasteful — this check exists purely to avoid confusing duplicate log output)"
-  SKIP_WORKER=1
-fi
-
-if [ "$SKIP_ORDERS_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.orders_worker" >/dev/null 2>&1; then
-  log "an Orders worker process already appears to be running — not starting a second one."
-  SKIP_ORDERS_WORKER=1
-fi
-
-if [ "$SKIP_SALES_TRAFFIC_WORKER" -eq 0 ] && pgrep -f "app\.amazon\.sales_traffic_worker" >/dev/null 2>&1; then
-  log "a Sales and Traffic worker process already appears to be running — not starting a second one."
-  SKIP_SALES_TRAFFIC_WORKER=1
-fi
-
-# --- start ------------------------------------------------------------------
-# Each command can be overridden via a single environment variable purely
-# so an automated test can substitute a safe, deterministic fake process
-# (e.g. `sleep 100`) in place of the real backend/frontend/worker — never
-# intended for interactive/production use, and a normal invocation of
-# this script (none of these set) runs exactly the real commands below.
-# Word-split deliberately (an override is a whole command + its
-# arguments, e.g. "sleep 100"); never used with untrusted input.
-
-if [ -n "${DEV_SH_BACKEND_CMD:-}" ]; then
-  # shellcheck disable=SC2206
-  BACKEND_CMD=($DEV_SH_BACKEND_CMD)
-else
-  BACKEND_CMD=(uv run uvicorn app.main:app --reload --port "$BACKEND_PORT")
-fi
-
-if [ -n "${DEV_SH_FRONTEND_CMD:-}" ]; then
-  # shellcheck disable=SC2206
-  FRONTEND_CMD=($DEV_SH_FRONTEND_CMD)
-else
-  FRONTEND_CMD=(npm run dev)
-fi
-
-if [ -n "${DEV_SH_WORKER_CMD:-}" ]; then
-  # shellcheck disable=SC2206
-  WORKER_CMD=($DEV_SH_WORKER_CMD)
-else
-  WORKER_CMD=(uv run python -m app.amazon.listings_worker)
-fi
-
-if [ -n "${DEV_SH_ORDERS_WORKER_CMD:-}" ]; then
-  # shellcheck disable=SC2206
-  ORDERS_WORKER_CMD=($DEV_SH_ORDERS_WORKER_CMD)
-else
-  ORDERS_WORKER_CMD=(uv run python -m app.amazon.orders_worker)
-fi
-
-if [ -n "${DEV_SH_SALES_TRAFFIC_WORKER_CMD:-}" ]; then
-  # shellcheck disable=SC2206
-  SALES_TRAFFIC_WORKER_CMD=($DEV_SH_SALES_TRAFFIC_WORKER_CMD)
-else
-  SALES_TRAFFIC_WORKER_CMD=(uv run python -m app.amazon.sales_traffic_worker)
-fi
-
-# ASI_DB_RUNTIME_CONTEXT=api authorizes the backend process (only) to
-# open a non-loopback database connection — see
-# `apps/api/app/persistence/database.py`'s own module docstring for the
-# full production-database guard design. Scoped to this one child via
-# `env`, not `export`ed into this script's own shell, so the frontend
-# and worker children below never inherit it (each worker declares its
-# own context internally regardless, after its own separate
-# ASI_*_WORKER_ENABLED check).
-start_child "backend" "$API_DIR" env ASI_DB_RUNTIME_CONTEXT=api "${BACKEND_CMD[@]}"
-start_child "frontend" "$WEB_DIR" "${FRONTEND_CMD[@]}"
-
-if [ "$SKIP_WORKER" -eq 0 ]; then
-  start_child "worker" "$API_DIR" "${WORKER_CMD[@]}"
-fi
-if [ "$SKIP_ORDERS_WORKER" -eq 0 ]; then
-  start_child "orders-worker" "$API_DIR" "${ORDERS_WORKER_CMD[@]}"
-fi
-if [ "$SKIP_SALES_TRAFFIC_WORKER" -eq 0 ]; then
-  start_child "sales-traffic-worker" "$API_DIR" "${SALES_TRAFFIC_WORKER_CMD[@]}"
-fi
-
-# --- partial-start-failure check --------------------------------------------
-# A brief grace period, then confirm everything actually stayed up before
-# settling in to `wait` — a child that crashes immediately (bad config,
-# missing dependency, etc.) must tear the others down, not leave them
-# running alone.
-
-sleep 2
-if [ "$SHUTTING_DOWN" -eq 1 ]; then
-  # A shutdown signal arrived during this grace period — `shutdown` has
-  # already stopped everything intentionally; every child now being dead
-  # is the expected result of that, never a startup failure to report.
-  exit 0
-fi
-FAILED=0
-for i in "${!CHILD_PIDS[@]}"; do
-  if ! child_alive "${CHILD_PIDS[$i]}"; then
-    log "ERROR: ${CHILD_NAMES[$i]} exited immediately during startup"
-    FAILED=1
-  fi
-done
-if [ "$FAILED" -eq 1 ]; then
-  exit 1
-fi
-
-log "all requested processes are running. Press Ctrl-C to stop everything."
-
-# Deliberately `wait`, not a `while ...; sleep 1; done` polling loop: a
-# trapped signal only reliably interrupts a shell that is blocked in
-# `wait` — verified directly, in this exact environment, against a
-# `sleep`-in-a-loop polling pattern, which left a pending SIGINT/SIGTERM
-# undelivered to the trap for as long as the loop kept running. `wait -n`
-# (bash 4.3+, "return as soon as any one of these exits") is not used
-# either — macOS ships bash 3.2 by default, and this script must work
-# there without requiring a newer bash to be installed. Waiting on every
-# child means a Ctrl-C/SIGTERM is always caught immediately (the `wait`
-# is interrupted the instant the signal arrives, regardless of which
-# child it was "waiting" on) — the one tradeoff is that if a single
-# child crashes on its own *mid-session* (not during the startup grace
-# period already checked above) while the others keep running, this
-# script will not proactively notice until every child has exited or a
-# shutdown signal arrives; it never fails to react to an actual Ctrl-C.
-wait "${CHILD_PIDS[@]}" 2>/dev/null || true
-log "child processes exited"
+exec python3 "$ROOT_DIR/scripts/supervisor.py" "$@"
