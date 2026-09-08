@@ -1,0 +1,40 @@
+{
+  // fix/supervise-ingestion-runtime — discoverable VS Code entry points
+  // into the same canonical supervisor scripts/dev.sh already provides
+  // (Terminal > Run Task…, or Cmd/Ctrl+Shift+P > "Tasks: Run Task").
+  // Both invoke ./scripts/dev.sh directly rather than reimplementing
+  // any startup logic — this file is a launcher, not a second
+  // implementation. Runs in a dedicated terminal panel that stays open
+  // for the life of the task; closing that panel (or stopping the
+  // task) stops the whole supervised stack, exactly like closing an
+  // ordinary terminal running ./scripts/dev.sh would.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ASI: Start dev stack (frontend + API)",
+      "type": "shell",
+      "command": "./scripts/dev.sh",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "detail": "Safe default — starts the frontend and API only. No worker starts; no Amazon call is possible."
+    },
+    {
+      "label": "ASI: Start dev stack (connected-seller, with workers)",
+      "type": "shell",
+      "command": "./scripts/dev.sh --with-workers",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "detail": "Starts the frontend, API, and every sync worker — Sync buttons will actually be claimed and processed. Keep this task running for the duration of your session; stopping it stops synchronization."
+    }
+  ]
+}

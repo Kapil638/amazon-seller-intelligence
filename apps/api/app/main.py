@@ -60,3 +60,41 @@ async def health() -> dict[str, str]:
 
     payload["persistence"] = "configured" if persistence_enabled() else "disabled"
     return payload
+
+
+@app.get("/health/workers")
+async def health_workers() -> dict[str, dict[str, dict[str, object]]]:
+    """fix/supervise-ingestion-runtime — a sanitized, per-worker-type
+    liveness surface built directly on the same `amazon_worker_
+    heartbeats` table and `WorkerHeartbeatRepository.check_availability`
+    the sync-trigger services already use (fix/ingestion-worker-runtime-
+    availability) — this route never invents a second notion of
+    "available." Used by `scripts/supervisor.py` to wait for each
+    enabled worker's first heartbeat during startup, and safe to poll
+    from the frontend for a user-facing runtime-health surface. Never
+    carries an organization id, seller id, connection id, lease owner,
+    credential, or any Amazon payload — only worker_type, a boolean,
+    and a timestamp.
+    """
+    from app.amazon.worker_heartbeat import KNOWN_WORKER_TYPES
+    from app.persistence.database import persistence_enabled, session_scope
+    from app.persistence.repositories import WorkerHeartbeatRepository
+
+    if not persistence_enabled():
+        return {"workers": {wt: {"available": False, "last_heartbeat_at": None} for wt in KNOWN_WORKER_TYPES}}
+
+    cfg = get_settings()
+    result: dict[str, dict[str, object]] = {}
+    with session_scope() as session:
+        repo = WorkerHeartbeatRepository(session)
+        for worker_type in KNOWN_WORKER_TYPES:
+            availability = repo.check_availability(
+                worker_type, stale_after_seconds=cfg.worker_heartbeat_stale_after_seconds
+            )
+            result[worker_type] = {
+                "available": availability.available,
+                "last_heartbeat_at": (
+                    availability.last_heartbeat_at.isoformat() if availability.last_heartbeat_at else None
+                ),
+            }
+    return {"workers": result}

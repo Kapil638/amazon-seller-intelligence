@@ -122,20 +122,23 @@ test_enabling_only_sales_traffic_worker_starts_only_that_one() {
   pkill -f "sleep 100" 2>/dev/null || true
 }
 
-# --- 2: partial-start failure cleans up already-started children ----------
+# --- 2: partial-start failure of a CRITICAL child cleans up everything ----
+# (backend/frontend are the only critical children — see ChildSpec.critical
+# in scripts/supervisor.py — so this uses DEV_SH_BACKEND_CMD="false" to
+# simulate the backend itself failing to start.)
 
 test_partial_start_failure_cleans_up() {
   local log
   log="$(mktemp)"
   ASI_LISTINGS_WORKER_ENABLED=true BACKEND_PORT=18213 FRONTEND_PORT=18214 \
-    DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="false" \
+    DEV_SH_BACKEND_CMD="false" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
     "$DEV_SH" >"$log" 2>&1
   local exit_code=$?
 
   if [ "$exit_code" -ne 0 ]; then
     pass "partial failure: dev.sh exited non-zero ($exit_code)"
   else
-    fail "partial failure: dev.sh exited 0 despite a child failing to start"
+    fail "partial failure: dev.sh exited 0 despite a critical child failing to start"
   fi
   if grep -q "exited immediately during startup" "$log"; then
     pass "partial failure: reported which child failed to start"
@@ -143,10 +146,47 @@ test_partial_start_failure_cleans_up() {
     fail "partial failure: no 'exited immediately during startup' message ($log)"
   fi
   if no_sleep100_survivors; then
-    pass "partial failure: backend/frontend were torn down, no orphans"
+    pass "partial failure: frontend/worker were torn down, no orphans"
   else
     fail "partial failure: a 'sleep 100' child survived the failed startup"
   fi
+  rm -f "$log"
+  pkill -f "sleep 100" 2>/dev/null || true
+}
+
+# --- 2b: a NON-critical worker failing at startup never takes the stack ----
+# down — an absent/broken worker must be a safe, well-defined state (Sync
+# returns a structured 503; frontend/API and any other worker keep running).
+
+test_non_critical_worker_startup_failure_does_not_stop_the_stack() {
+  local log
+  log="$(mktemp)"
+  ASI_LISTINGS_WORKER_ENABLED=true BACKEND_PORT=18229 FRONTEND_PORT=18230 \
+    DEV_SH_READINESS_TIMEOUT_SECONDS="${DEV_SH_READINESS_TIMEOUT_SECONDS:-2}" \
+    DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="false" \
+    "$DEV_SH" >"$log" 2>&1 &
+  local script_pid=$!
+
+  if wait_until 10 grep -q "all requested processes are running" "$log"; then
+    pass "non-critical worker failure: backend + frontend still reached the running state"
+  else
+    fail "non-critical worker failure: stack never reached the running state ($log)"
+  fi
+  if grep -q "exited immediately during startup" "$log"; then
+    pass "non-critical worker failure: reported which worker failed to start"
+  else
+    fail "non-critical worker failure: no 'exited immediately during startup' message ($log)"
+  fi
+  local running
+  running=$(pgrep -f "sleep 100" | wc -l | tr -d " ")
+  if [ "$running" -eq 2 ]; then
+    pass "non-critical worker failure: backend and frontend both still running"
+  else
+    fail "non-critical worker failure: expected exactly 2 surviving 'sleep 100' children, found $running"
+  fi
+
+  kill -TERM "$script_pid" 2>/dev/null || true
+  wait_until 5 no_sleep100_survivors || true
   rm -f "$log"
   pkill -f "sleep 100" 2>/dev/null || true
 }
@@ -376,6 +416,49 @@ test_with_workers_flag_starts_all_three_workers_without_env_vars() {
   pkill -f "sleep 100" 2>/dev/null || true
 }
 
+# --- 9b: a second concurrent invocation is refused via the PID file -------
+# (fix/supervise-ingestion-runtime: scripts/supervisor.py's own PID file,
+# not a port check — different ports are used here specifically so the
+# only thing that can refuse the second invocation is the PID file.)
+
+test_second_concurrent_invocation_is_refused_by_the_pid_file() {
+  local log1 log2
+  log1="$(mktemp)"
+  log2="$(mktemp)"
+  ASI_LISTINGS_WORKER_ENABLED=true BACKEND_PORT=18231 FRONTEND_PORT=18232 \
+    DEV_SH_BACKEND_CMD="sleep 100" DEV_SH_FRONTEND_CMD="sleep 100" DEV_SH_WORKER_CMD="sleep 100" \
+    "$DEV_SH" >"$log1" 2>&1 &
+  local first_pid=$!
+  if ! wait_until 5 grep -q "all requested processes are running" "$log1"; then
+    fail "pid file: first supervisor never reached the running state ($log1)"
+    kill -KILL "$first_pid" 2>/dev/null || true
+    pkill -f "sleep 100" 2>/dev/null || true
+    rm -f "$log1" "$log2"
+    return
+  fi
+
+  BACKEND_PORT=18233 FRONTEND_PORT=18234 "$DEV_SH" >"$log2" 2>&1
+  local second_exit=$?
+
+  if [ "$second_exit" -ne 0 ] && grep -qi "already" "$log2"; then
+    pass "pid file: a second concurrent invocation was refused, citing the live supervisor"
+  else
+    fail "pid file: second invocation was not cleanly refused (exit=$second_exit, $log2)"
+  fi
+  # The second, refused invocation must never have started its own
+  # children on its own (different) ports.
+  if pgrep -f "sleep 100" | wc -l | tr -d " " | grep -q "^3$"; then
+    pass "pid file: the refused second invocation started no children of its own"
+  else
+    fail "pid file: unexpected child-process count after the refused second invocation"
+  fi
+
+  kill -TERM "$first_pid" 2>/dev/null || true
+  wait_until 5 no_sleep100_survivors || true
+  rm -f "$log1" "$log2"
+  pkill -f "sleep 100" 2>/dev/null || true
+}
+
 # --- 9: an unrecognized flag is rejected, not silently ignored -------------
 
 test_unrecognized_flag_is_rejected() {
@@ -394,6 +477,7 @@ test_unrecognized_flag_is_rejected() {
 test_starts_five_children_and_shuts_down_cleanly
 test_enabling_only_sales_traffic_worker_starts_only_that_one
 test_partial_start_failure_cleans_up
+test_non_critical_worker_startup_failure_does_not_stop_the_stack
 test_port_conflict_is_detected
 test_does_not_start_a_duplicate_worker
 test_worker_not_started_without_the_enable_flag
@@ -401,6 +485,7 @@ test_shutdown_never_touches_an_unrelated_process
 test_runtime_output_never_contains_a_database_url_or_token
 test_command_construction_never_prints_secrets
 test_with_workers_flag_starts_all_three_workers_without_env_vars
+test_second_concurrent_invocation_is_refused_by_the_pid_file
 test_unrecognized_flag_is_rejected
 
 echo ""

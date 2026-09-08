@@ -5655,6 +5655,23 @@ class WorkerHeartbeatRepository:
     def get_heartbeat(self, worker_type: str) -> AmazonWorkerHeartbeat | None:
         return self.session.get(AmazonWorkerHeartbeat, worker_type)
 
+    def invalidate(self, worker_type: str, *, instance_id: str) -> bool:
+        """fix/supervise-ingestion-runtime — called on a worker's own
+        graceful shutdown so availability drops the instant it stops,
+        rather than waiting up to `worker_heartbeat_stale_after_seconds`
+        for the row to merely go stale. Deletes the row only if it still
+        belongs to `instance_id` — a slow/delayed shutdown call from an
+        old process must never delete a *newer* process's already-
+        published heartbeat (the ordinary "old instance dies, new one
+        starts" race this check exists to close). Returns True iff a
+        row was actually deleted."""
+        existing = self.get_heartbeat(worker_type)
+        if existing is None or existing.instance_id != instance_id:
+            return False
+        self.session.delete(existing)
+        self.session.flush()
+        return True
+
     def check_availability(self, worker_type: str, *, stale_after_seconds: float) -> WorkerAvailability:
         """Database time, not the API process's own clock — the same
         authority this codebase already insists on for lease/retry/

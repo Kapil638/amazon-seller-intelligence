@@ -17,6 +17,7 @@ import pytest
 
 from app.amazon.worker_heartbeat import (
     check_availability,
+    invalidate_heartbeat,
     new_instance_id,
     record_heartbeat,
     start_heartbeat_loop,
@@ -186,3 +187,72 @@ async def test_heartbeat_loop_survives_a_transient_write_failure(monkeypatch) ->
         assert calls["count"] >= 3
     finally:
         await handle.stop()
+
+
+# --- fix/supervise-ingestion-runtime: graceful-shutdown invalidation ----
+
+
+def test_invalidate_heartbeat_deletes_the_owning_instances_row() -> None:
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("listings", instance_id="inst-a", pid=1)
+        session.commit()
+
+    invalidate_heartbeat("listings", instance_id="inst-a")
+
+    with session_scope() as session:
+        assert session.get(AmazonWorkerHeartbeat, "listings") is None
+    assert check_availability("listings").available is False
+
+
+def test_invalidate_heartbeat_never_deletes_a_newer_instances_row() -> None:
+    """The exact race this exists to close: an old process's delayed
+    shutdown call must never delete a *different*, newer process's
+    already-published heartbeat."""
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("orders", instance_id="inst-old", pid=1)
+        session.commit()
+
+    # A newer instance takes over the row before the old one's shutdown
+    # invalidation call arrives (record_heartbeat's own upsert already
+    # proves this transition — see test_record_heartbeat_updates_
+    # started_at_when_a_new_instance_takes_over).
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("orders", instance_id="inst-new", pid=2)
+        session.commit()
+
+    invalidate_heartbeat("orders", instance_id="inst-old")
+
+    with session_scope() as session:
+        row = session.get(AmazonWorkerHeartbeat, "orders")
+        assert row is not None
+        assert row.instance_id == "inst-new"
+    assert check_availability("orders").available is True
+
+
+def test_invalidate_heartbeat_is_a_safe_no_op_when_no_row_exists() -> None:
+    invalidate_heartbeat("sales_and_traffic_report", instance_id="never-started")  # must not raise
+
+
+def test_invalidate_heartbeat_swallows_a_database_failure(monkeypatch) -> None:
+    import app.amazon.worker_heartbeat as module
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("simulated database failure")
+
+    monkeypatch.setattr(module, "session_scope", _raise)
+    invalidate_heartbeat("listings", instance_id="inst-a")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_stop_invalidates_availability_immediately() -> None:
+    """The actual production behavior this fix adds: a worker's
+    graceful shutdown must make it unavailable *immediately*, not only
+    once worker_heartbeat_stale_after_seconds has elapsed."""
+    handle = start_heartbeat_loop("sales_and_traffic_report", instance_id="grace-shutdown-test", interval_seconds=60.0)
+    assert check_availability("sales_and_traffic_report", stale_after_seconds=45.0).available is True
+
+    await handle.stop()
+
+    assert check_availability("sales_and_traffic_report", stale_after_seconds=45.0).available is False
+    with session_scope() as session:
+        assert session.get(AmazonWorkerHeartbeat, "sales_and_traffic_report") is None

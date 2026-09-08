@@ -38,10 +38,20 @@ temp/
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
+# Ignoring `.vscode/` itself (rather than `.vscode/*`) would make git
+# skip the directory entirely and never evaluate the negation below —
+# a real bug caught while committing this branch. Ignore its contents
+# individually instead so the shared task config can be un-ignored.
+.vscode/*
+!.vscode/tasks.json
 *.swp
 *.swo
 
 # Logs
 *.log
 npm-debug.log*
+
+# fix/supervise-ingestion-runtime — scripts/supervisor.py's own child
+# logs and PID file. Never committed: purely local runtime state.
+logs/
+

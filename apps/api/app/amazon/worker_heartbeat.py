@@ -78,14 +78,38 @@ def check_availability(
         return WorkerHeartbeatRepository(session).check_availability(worker_type, stale_after_seconds=threshold)
 
 
+def invalidate_heartbeat(worker_type: str, *, instance_id: str) -> None:
+    """fix/supervise-ingestion-runtime — deletes this exact instance's
+    heartbeat row (a no-op if a newer instance has already taken it
+    over — see `WorkerHeartbeatRepository.invalidate`'s own docstring
+    for why that check matters). A failure here is logged and swallowed,
+    never raised: shutdown must always complete even if this one best-
+    effort step cannot reach the database — the row will still expire
+    on its own via `worker_heartbeat_stale_after_seconds` either way,
+    this call only makes the common, clean-shutdown case immediate."""
+    try:
+        with session_scope() as session:
+            WorkerHeartbeatRepository(session).invalidate(worker_type, instance_id=instance_id)
+    except Exception:
+        logger.warning(
+            "worker heartbeat invalidation failed for worker_type=%s (non-fatal, row will expire "
+            "naturally instead)",
+            worker_type,
+        )
+        logger.debug("worker heartbeat invalidation failure detail", exc_info=True)
+
+
 @dataclass(frozen=True)
 class HeartbeatLoopHandle:
     """Returned by `start_heartbeat_loop()`. Callers must `await stop()`
     during their own graceful shutdown so the background task is
     cancelled cleanly rather than left dangling when the event loop is
-    torn down."""
+    torn down, and so availability drops immediately rather than only
+    once the row goes stale (fix/supervise-ingestion-runtime)."""
 
     task: asyncio.Task[None]
+    worker_type: str
+    instance_id: str
 
     async def stop(self) -> None:
         self.task.cancel()
@@ -93,6 +117,7 @@ class HeartbeatLoopHandle:
             await self.task
         except asyncio.CancelledError:
             pass
+        invalidate_heartbeat(self.worker_type, instance_id=self.instance_id)
 
 
 async def _heartbeat_loop(worker_type: str, *, instance_id: str, interval_seconds: float) -> None:
@@ -139,4 +164,4 @@ def start_heartbeat_loop(
     task = asyncio.create_task(
         _heartbeat_loop(worker_type, instance_id=instance_id, interval_seconds=effective_interval)
     )
-    return HeartbeatLoopHandle(task=task)
+    return HeartbeatLoopHandle(task=task, worker_type=worker_type, instance_id=instance_id)
