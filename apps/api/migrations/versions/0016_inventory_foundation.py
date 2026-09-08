@@ -2,13 +2,22 @@
 on the shared ingestion ledger, canonical current-state inventory, and
 immutable per-run inventory observations. No ingest.
 
-Revision ID: 0015_inventory_foundation
-Revises: 0014_sales_traffic_foundation
+Revision ID: 0016_inventory_foundation
+Revises: 0015_worker_heartbeats
 Create Date: 2026-09-07
 
 12B.6B — schema only, additive. No SP-API FBA Inventory client, ingestion
 service, read API, worker, or UI code is authorized by this migration. No
 live Amazon call, no Supabase mutation, no data backfill, no seed rows.
+
+Renumbered from the originally-authored `0015_inventory_foundation` to
+`0016_inventory_foundation` (`down_revision` updated from
+`0014_sales_traffic_foundation` to `0015_worker_heartbeats`) after
+`fix/ingestion-worker-runtime-availability` — an unrelated, independently
+developed cross-cutting fix for the already-shipped Listings/Orders/
+Sales-and-Traffic workers — merged first and claimed revision `0015` for
+its own `amazon_worker_heartbeats` migration. This migration's own
+content is otherwise unchanged from its original authoring.
 
 See `docs/AI_HANDOVER/12B6B_FBA_INVENTORY_INGESTION.md` for the full
 contract pin (Amazon model file + SHA-256 checksum), scope decision, and
@@ -67,18 +76,19 @@ New tables, in dependency order:
    this migration.
 
 `downgrade()` refuses (raises) if any row exists in either new table, or
-any `amazon_ingestion_runs` row has `run_type='inventory'` — `0014`'s
-schema has no way to represent inventory data, and downgrading in that
-state would either violate a restored constraint or silently discard
-real ingestion evidence.
+any `amazon_ingestion_runs` row has `run_type='inventory'` — `0015`'s
+schema (the runtime-availability fix this migration now sits on top of)
+has no way to represent inventory data, and downgrading in that state
+would either violate a restored constraint or silently discard real
+ingestion evidence.
 """
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 
-revision = "0015_inventory_foundation"
-down_revision = "0014_sales_traffic_foundation"
+revision = "0016_inventory_foundation"
+down_revision = "0015_worker_heartbeats"
 branch_labels = None
 depends_on = None
 
@@ -271,7 +281,7 @@ def downgrade() -> None:
     populated = {name: n for name, n in unsafe.items() if n}
     if populated:
         raise RuntimeError(
-            "Refusing to downgrade 0015: the pre-12B.6B schema (0014) has no way to "
+            "Refusing to downgrade 0016: the pre-12B.6B schema (0015) has no way to "
             "represent FBA inventory data, and downgrading now would either violate a "
             f"restored constraint or silently discard it. Non-empty: {populated}. "
             "Remove or migrate this data out-of-band before downgrading, or accept that "

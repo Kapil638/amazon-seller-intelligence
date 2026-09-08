@@ -1,15 +1,15 @@
-"""12B.6B — Disposable PostgreSQL validation for migration 0015 (FBA
+"""12B.6B — Disposable PostgreSQL validation for migration 0016 (FBA
 Inventory schema foundation).
 
 Opt-in only. See `_guard.py` for the two conditions that must both hold
 before anything here runs. Mirrors `test_disposable_postgres_sales_traffic_
 migration.py`'s own conventions exactly, including its migration-boundary
 rule: a test intentionally pinned below `head` must never instantiate or
-query the *current* ORM model for a table 0015 changed (`AmazonIngestionRun`
+query the *current* ORM model for a table 0016 changed (`AmazonIngestionRun`
 gained the `'inventory'` run_type plus two new constraints) — use raw SQL
 restricted to the columns that genuinely existed at the pinned revision
 instead, and only use the current ORM once the database has actually
-upgraded past 0015.
+upgraded past 0016.
 
 No SP-API client, worker, read API, or UI code is exercised here — schema-
 level proof only, plus the repository write paths that only real PostgreSQL
@@ -144,20 +144,20 @@ def _observation(*, seller_sku="SYN-SKU-1", condition="NewItem", total_quantity=
     )
 
 
-# 1: existing pre-0015 database upgrades to 0015 preserving data, with the
+# 1: existing pre-0016 database upgrades to 0016 preserving data, with the
 # widened run_type CHECK now accepting 'inventory' for new rows while a
 # pre-existing non-inventory row is untouched.
-def test_existing_0014_database_upgrades_to_0015_preserving_data(disposable_engine) -> None:
+def test_existing_0015_database_upgrades_to_0016_preserving_data(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0014_sales_traffic_foundation")
+        command.upgrade(cfg, "0015_worker_heartbeats")
 
     org_id, seller_account_id, connection_id, participation_id = _seed_org_seller_connection_and_participation(
         disposable_engine
     )
     run_id = uuid4()
-    # Raw SQL restricted to columns that genuinely exist at 0014 — NOT the
+    # Raw SQL restricted to columns that genuinely exist at 0015 — NOT the
     # current AmazonIngestionRun ORM. See this file's own module docstring.
     with disposable_engine.begin() as conn:
         conn.execute(
@@ -177,11 +177,11 @@ def test_existing_0014_database_upgrades_to_0015_preserving_data(disposable_engi
         )
 
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
 
     with disposable_engine.connect() as conn:
         current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert current == "0015_inventory_foundation"
+    assert current == "0016_inventory_foundation"
 
     with disposable_engine.connect() as conn:
         row = conn.execute(
@@ -209,7 +209,7 @@ def test_existing_0014_database_upgrades_to_0015_preserving_data(disposable_engi
             },
         )
 
-    # Now — and only now, after the upgrade to 0015 — the current ORM is
+    # Now — and only now, after the upgrade to 0016 — the current ORM is
     # safe to use.
     with Session(disposable_engine) as session:
         run = session.get(AmazonIngestionRun, run_id)
@@ -217,12 +217,12 @@ def test_existing_0014_database_upgrades_to_0015_preserving_data(disposable_engi
         assert run.run_type == "listings"
 
 
-# 2: expected new tables/columns/constraints/indexes exist after 0015.
+# 2: expected new tables/columns/constraints/indexes exist after 0016.
 def test_empty_postgres_upgrade_produces_expected_inventory_schema(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
 
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
@@ -253,12 +253,12 @@ def test_empty_postgres_upgrade_produces_expected_inventory_schema(disposable_en
 
 
 # 3: downgrade is clean when no Inventory data exists at all.
-def test_downgrade_0015_to_0014_is_clean_when_no_inventory_data_exists(disposable_engine) -> None:
+def test_downgrade_0016_to_0015_is_clean_when_no_inventory_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
-        command.downgrade(cfg, "0014_sales_traffic_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
+        command.downgrade(cfg, "0015_worker_heartbeats")
 
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
@@ -269,13 +269,13 @@ def test_downgrade_0015_to_0014_is_clean_when_no_inventory_data_exists(disposabl
     assert "ck_amazon_ingestion_runs_inventory_scope_required" not in run_checks
 
 
-# 4: downgrade refuses when an inventory run exists — 0014's schema has no
+# 4: downgrade refuses when an inventory run exists — 0015's schema has no
 # way to represent it.
-def test_downgrade_0015_to_0014_refuses_when_inventory_run_data_exists(disposable_engine) -> None:
+def test_downgrade_0016_to_0015_refuses_when_inventory_run_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
 
     org_id, seller_account_id, connection_id, participation_id = _seed_org_seller_connection_and_participation(
         disposable_engine
@@ -298,7 +298,7 @@ def test_downgrade_0015_to_0014_refuses_when_inventory_run_data_exists(disposabl
 
     with _alembic_environment(url):
         with pytest.raises(Exception):
-            command.downgrade(cfg, "0014_sales_traffic_foundation")
+            command.downgrade(cfg, "0015_worker_heartbeats")
 
     inspector = inspect(disposable_engine)
     assert "amazon_seller_inventory" in set(inspector.get_table_names())
@@ -312,11 +312,11 @@ def test_downgrade_0015_to_0014_refuses_when_inventory_run_data_exists(disposabl
 
 # 5: downgrade also refuses when only current-state inventory rows exist
 # (no covering run row survives, e.g. a pruned/archived run).
-def test_downgrade_0015_to_0014_refuses_when_current_state_inventory_data_exists(disposable_engine) -> None:
+def test_downgrade_0016_to_0015_refuses_when_current_state_inventory_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
 
     _org_id, _seller_account_id, _connection_id, participation_id = _seed_org_seller_connection_and_participation(
         disposable_engine
@@ -333,18 +333,18 @@ def test_downgrade_0015_to_0014_refuses_when_current_state_inventory_data_exists
 
     with _alembic_environment(url):
         with pytest.raises(Exception):
-            command.downgrade(cfg, "0014_sales_traffic_foundation")
+            command.downgrade(cfg, "0015_worker_heartbeats")
 
     inspector = inspect(disposable_engine)
     assert "amazon_seller_inventory" in set(inspector.get_table_names())
 
 
 # 6: downgrade also refuses when only immutable observation rows exist.
-def test_downgrade_0015_to_0014_refuses_when_observation_data_exists(disposable_engine) -> None:
+def test_downgrade_0016_to_0015_refuses_when_observation_data_exists(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
-        command.upgrade(cfg, "0015_inventory_foundation")
+        command.upgrade(cfg, "0016_inventory_foundation")
 
     org_id, seller_account_id, connection_id, participation_id = _seed_org_seller_connection_and_participation(
         disposable_engine
@@ -375,7 +375,7 @@ def test_downgrade_0015_to_0014_refuses_when_observation_data_exists(disposable_
 
     with _alembic_environment(url):
         with pytest.raises(Exception):
-            command.downgrade(cfg, "0014_sales_traffic_foundation")
+            command.downgrade(cfg, "0015_worker_heartbeats")
 
     inspector = inspect(disposable_engine)
     assert "amazon_seller_inventory_observations" in set(inspector.get_table_names())

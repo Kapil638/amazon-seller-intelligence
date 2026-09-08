@@ -145,8 +145,14 @@ application layer with raw SQL specifically to exercise it.
 
 ## 4. Schema and migration (implemented)
 
-Migration `0015_inventory_foundation`, revises
-`0014_sales_traffic_foundation` — single Alembic head, additive only.
+Migration `0016_inventory_foundation`, revises
+`0015_worker_heartbeats` — single Alembic head, additive only. Originally
+authored as `0015_inventory_foundation` (revising
+`0014_sales_traffic_foundation`); renumbered after the independently
+developed `fix/ingestion-worker-runtime-availability` cross-cutting fix
+merged first and claimed revision `0015` for its own
+`amazon_worker_heartbeats` migration — see that migration file's own
+docstring, and `0016_inventory_foundation.py`'s own renumbering note.
 
 **Extends `amazon_ingestion_runs`**, exactly as 12B.3D/12B.6A did:
 
@@ -208,10 +214,10 @@ read-only `get_active_inventory_run`/`get_latest_inventory_run`/
 `count_queued_inventory_runs_for_organization`)
 (`app/persistence/repositories.py`).
 
-Verified: `tests/test_migration_chain_matches_orm_metadata.py` (35-table
+Verified: `tests/test_migration_chain_matches_orm_metadata.py` (36-table
 drift parity, offline `--sql` compilation against a real PostgreSQL
 dialect with no live database), `tests/test_amazon_seller_identity_
-schema.py` (single-head assertion updated to `0015`), `tests/test_amazon_
+schema.py` (single-head assertion updated to `0016`), `tests/test_amazon_
 ingestion_run_inventory_claim.py` (15 tests — enqueue/claim/lease/
 heartbeat/completion, stale-lease reclaim via enqueue, claim-time sweep
 with nothing to hand out, lease-theft compare-and-set, global and
@@ -225,9 +231,9 @@ the corrected same-day-multiple-observations grain under a real unique
 constraint; skip locally — no Docker/PostgreSQL binary available in this
 authoring environment — exercised by CI's `postgres-identity-
 concurrency` job on the next push). CI: new
-`existing-database-upgrade-0015` job added to `backend-database-ci.yml`;
+`existing-database-upgrade-0016` job added to `backend-database-ci.yml`;
 the fresh-install job's expected-head assertion updated to
-`0015_inventory_foundation`.
+`0016_inventory_foundation`.
 
 ## 5. Full-sweep-only deactivation and pagination timing — required
 corrections
@@ -451,7 +457,7 @@ No migration was applied to Supabase or any shared database. No live
 Amazon call, seller reconnection, role change, or backfill was
 performed or authorized by this pass. `ASI_INVENTORY_WORKER_ENABLED` was
 never set; no worker process was started. The new
-`existing-database-upgrade-0015` CI job and the Postgres-guarded
+`existing-database-upgrade-0016` CI job and the Postgres-guarded
 migration/concurrency test file are both written and reasoned through,
 but — like every prior milestone's own Postgres-guarded tests — have not
 been executed against a real disposable PostgreSQL instance in this
