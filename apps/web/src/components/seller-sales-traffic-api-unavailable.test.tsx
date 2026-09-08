@@ -110,7 +110,7 @@ describe("Sales & Traffic — API unavailable", () => {
   });
 
   it("shows the connection's own sanitized error message when it is a typed AmazonConnectionError", async () => {
-    vi.mocked(fetchAmazonConnection).mockRejectedValue(new AmazonConnectionError("Connection not found.", "not_found"));
+    vi.mocked(fetchAmazonConnection).mockRejectedValue(new AmazonConnectionError("Connection not found.", "unknown"));
 
     render(<SellerSalesTraffic />);
 
