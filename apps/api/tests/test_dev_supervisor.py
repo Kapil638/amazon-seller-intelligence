@@ -493,6 +493,7 @@ def test_build_child_specs_starts_enabled_workers_only(monkeypatch) -> None:
     assert "worker" in names
     assert "orders-worker" not in names
     assert "sales-traffic-worker" not in names
+    assert "inventory-worker" not in names
 
 
 def test_build_child_specs_skips_a_worker_type_already_running(monkeypatch) -> None:
@@ -500,3 +501,36 @@ def test_build_child_specs_skips_a_worker_type_already_running(monkeypatch) -> N
     monkeypatch.setattr(supervisor, "_pgrep_running", lambda _pattern: True)
     specs = supervisor.build_child_specs(backend_port=18999, frontend_port=19999)
     assert "worker" not in {s.name for s in specs}
+
+
+# --- Inventory (PR #22 rebase): fourth worker, identical shape -------------
+
+
+def test_build_child_specs_starts_inventory_worker_with_heartbeat_readiness(monkeypatch) -> None:
+    for definition in supervisor.WORKER_DEFINITIONS.values():
+        monkeypatch.delenv(definition["env_var"], raising=False)
+    monkeypatch.setenv("ASI_INVENTORY_WORKER_ENABLED", "true")
+    monkeypatch.setattr(supervisor, "_pgrep_running", lambda _pattern: False)
+    specs = supervisor.build_child_specs(backend_port=18999, frontend_port=19999)
+    by_name = {s.name: s for s in specs}
+    assert "inventory-worker" in by_name
+    assert "worker" not in by_name
+    assert "orders-worker" not in by_name
+    assert "sales-traffic-worker" not in by_name
+
+    inventory_spec = by_name["inventory-worker"]
+    assert inventory_spec.critical is False
+    assert isinstance(inventory_spec.readiness, supervisor.WorkerHeartbeatReadiness)
+    assert inventory_spec.readiness.worker_type == "inventory"
+
+
+def test_with_workers_flag_enables_inventory_alongside_the_original_three() -> None:
+    argv_env: dict[str, str] = {}
+    for definition in supervisor.WORKER_DEFINITIONS.values():
+        argv_env[definition["env_var"]] = "unset-before-flag"
+    # `main()`'s own --with-workers handling sets every WORKER_DEFINITIONS
+    # env_var directly on os.environ — assert the definitions dict itself
+    # already includes "inventory", which is what makes that loop cover
+    # it automatically without --with-workers needing its own update.
+    assert "inventory" in supervisor.WORKER_DEFINITIONS
+    assert supervisor.WORKER_DEFINITIONS["inventory"]["env_var"] == "ASI_INVENTORY_WORKER_ENABLED"

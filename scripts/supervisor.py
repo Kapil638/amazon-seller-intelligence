@@ -124,15 +124,12 @@ WORKER_DEFINITIONS: dict[str, dict[str, str]] = {
         "display_name": "sales-traffic-worker",
         "cmd_override_env": "DEV_SH_SALES_TRAFFIC_WORKER_CMD",
     },
-    # 12B.6B (PR #22, unmerged as of this fix) adds a fourth "inventory"
-    # worker following this exact same shape — see that PR's own
-    # scripts/dev.sh changes for the entry it will need to add here
-    # (env_var=ASI_INVENTORY_WORKER_ENABLED, module=app.amazon.
-    # inventory_worker, display_name=inventory-worker, cmd_override_env=
-    # DEV_SH_INVENTORY_WORKER_CMD) once it rebases onto this branch —
-    # deliberately not added here, since app.amazon.inventory_worker
-    # does not exist on this branch and WORKER_DEFINITIONS drives both
-    # --with-workers and unconditional worker startup.
+    "inventory": {
+        "env_var": "ASI_INVENTORY_WORKER_ENABLED",
+        "module": "app.amazon.inventory_worker",
+        "display_name": "inventory-worker",
+        "cmd_override_env": "DEV_SH_INVENTORY_WORKER_CMD",
+    },
 }
 
 _ENABLED_TRUE_VALUES = {"1", "true"}
@@ -715,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
         if arg == "--with-workers":
             # The one opt-in flag for connected-seller local development
             # — sets every ASI_*_WORKER_ENABLED flag so nobody has to
-            # remember or type three separate environment variables. The
+            # remember or type four separate environment variables. The
             # safe default (no flag, no env vars) is unchanged: this
             # branch is only reached if the flag was explicitly passed.
             for definition in WORKER_DEFINITIONS.values():

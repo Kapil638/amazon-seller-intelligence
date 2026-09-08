@@ -5969,7 +5969,17 @@ class AmazonSalesTrafficProductFactRepository:
         )
 
 
-_KNOWN_WORKER_TYPES = frozenset({"listings", "orders", "sales_and_traffic_report", "inventory"})
+# fix/supervise-ingestion-runtime (PR #22 rebase): the single canonical
+# list of valid worker types, in publication order. Previously PR #21's
+# `app.amazon.worker_heartbeat.KNOWN_WORKER_TYPES` and this module each
+# maintained their own copy independently — this one already included
+# "inventory" (PR #22) while the other did not, so `/health/workers`
+# silently never reported Inventory even after PR #22 merged.
+# `worker_heartbeat.py` now imports this one instead of declaring its
+# own, so there is exactly one list to keep in sync with a new worker
+# type from here on.
+KNOWN_WORKER_TYPES = ("listings", "orders", "sales_and_traffic_report", "inventory")
+_KNOWN_WORKER_TYPES = frozenset(KNOWN_WORKER_TYPES)
 
 
 @dataclass(frozen=True)

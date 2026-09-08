@@ -256,3 +256,21 @@ async def test_heartbeat_loop_stop_invalidates_availability_immediately() -> Non
     assert check_availability("sales_and_traffic_report", stale_after_seconds=45.0).available is False
     with session_scope() as session:
         assert session.get(AmazonWorkerHeartbeat, "sales_and_traffic_report") is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_stop_invalidates_inventory_availability_immediately() -> None:
+    """fix/supervise-ingestion-runtime (PR #22 rebase): "inventory" is a
+    known worker type as of this rebase (see `app.persistence.
+    repositories.KNOWN_WORKER_TYPES`, now the single canonical list this
+    module re-exports) — graceful-shutdown invalidation must work for it
+    exactly like every other worker type, not only the three that
+    existed before Inventory."""
+    handle = start_heartbeat_loop("inventory", instance_id="inventory-grace-shutdown-test", interval_seconds=60.0)
+    assert check_availability("inventory", stale_after_seconds=45.0).available is True
+
+    await handle.stop()
+
+    assert check_availability("inventory", stale_after_seconds=45.0).available is False
+    with session_scope() as session:
+        assert session.get(AmazonWorkerHeartbeat, "inventory") is None

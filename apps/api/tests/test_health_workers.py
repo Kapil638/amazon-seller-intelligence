@@ -52,3 +52,21 @@ def test_health_workers_never_carries_an_organization_seller_or_connection_ident
     # The only keys this route may ever expose per worker type.
     for worker_type, payload in body["workers"].items():
         assert set(payload.keys()) == {"available", "last_heartbeat_at"}
+
+
+def test_health_workers_includes_inventory(client: TestClient) -> None:
+    """fix/supervise-ingestion-runtime (PR #22 rebase): "inventory" must
+    appear here automatically once it is a known worker type — this
+    route iterates `KNOWN_WORKER_TYPES` rather than a hardcoded list, so
+    this test is really asserting that `KNOWN_WORKER_TYPES` itself
+    includes it (it previously did not, even after PR #22 first merged
+    Inventory — see `app.persistence.repositories.KNOWN_WORKER_TYPES`'s
+    own docstring for that history)."""
+    assert "inventory" in KNOWN_WORKER_TYPES
+    with session_scope() as session:
+        WorkerHeartbeatRepository(session).record_heartbeat("inventory", instance_id="test-instance", pid=1)
+        session.commit()
+
+    response = client.get("/health/workers")
+    workers = response.json()["workers"]
+    assert workers["inventory"]["available"] is True

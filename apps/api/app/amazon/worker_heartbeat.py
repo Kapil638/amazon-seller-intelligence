@@ -33,8 +33,12 @@ an *already-queued or already-claimed* job. See
 `AmazonWorkerHeartbeat`'s own docstring in `app/persistence/models.py`.
 
 Worker type identifiers reuse `amazon_ingestion_runs.run_type`'s own
-vocabulary (`"listings"`, `"orders"`, `"sales_and_traffic_report"`)
-rather than inventing a second one.
+vocabulary rather than inventing a second one. The canonical list of
+valid worker types (`"listings"`, `"orders"`, `"sales_and_traffic_report"`,
+`"inventory"`) lives in `app.persistence.repositories.KNOWN_WORKER_TYPES`
+and is re-exported here — see that module for why (fix/supervise-
+ingestion-runtime's PR #22 rebase: this used to be a second, independently
+maintained copy that silently drifted out of sync with the DB-level one).
 """
 
 from __future__ import annotations
@@ -48,11 +52,13 @@ from datetime import datetime
 
 from app.core.config import Settings, get_settings
 from app.persistence.database import session_scope
-from app.persistence.repositories import WorkerAvailability, WorkerHeartbeatRepository
+from app.persistence.repositories import (
+    KNOWN_WORKER_TYPES,
+    WorkerAvailability,
+    WorkerHeartbeatRepository,
+)
 
 logger = logging.getLogger(__name__)
-
-KNOWN_WORKER_TYPES = ("listings", "orders", "sales_and_traffic_report")
 
 
 def new_instance_id() -> str:
