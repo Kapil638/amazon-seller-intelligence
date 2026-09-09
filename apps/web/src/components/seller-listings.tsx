@@ -15,6 +15,7 @@ import {
   triggerListingsSync,
 } from "@/lib/api";
 import { CANONICAL_MARKETPLACE_ID, NONTERMINAL_SYNC_STATUSES, formatDateTime } from "@/lib/seller-listings-view";
+import { useWorkerAvailability } from "@/lib/use-worker-availability";
 import type {
   AmazonSellerMarketplace,
   ListingCollectionResponse,
@@ -135,6 +136,16 @@ export function SellerListings() {
   // below) is what actually drives the button's disabled/spinner state.
   const [triggering, setTriggering] = useState(false);
   const [syncMessage, setSyncMessage] = useState<SyncActionMessage | null>(null);
+
+  // Current worker availability — entirely independent of `summary.sync`
+  // (the *latest run's* result); a historical failed/timed_out run must
+  // never be read as "the worker is unhealthy".
+  const workerAvailability = useWorkerAvailability("listings");
+  // The stale-banner defect this fix closes: a `worker_unavailable`
+  // trigger response must not linger once the worker actually recovers.
+  useEffect(() => {
+    if (workerAvailability.state === "available") setSyncMessage(null);
+  }, [workerAvailability.state]);
   // True once a `queued` job has been sitting unclaimed past the
   // stale-queue threshold — see `LISTINGS_SYNC_STALE_QUEUE_THRESHOLD_MS`.
   // Automatic polling stops; only `handleRefreshStatus` fetches after this.
@@ -662,11 +673,12 @@ export function SellerListings() {
                 sync={summary.sync}
                 onSync={handleSync}
                 triggering={triggering}
-                disabled={triggering || syncBusy}
+                disabled={triggering || syncBusy || workerAvailability.state !== "available"}
                 canSync={Boolean(participationId) && !resolvingDefault}
                 syncMessage={syncMessage}
                 queuePollingSuspended={queuePollingSuspended}
                 onRefreshStatus={handleRefreshStatus}
+                workerAvailability={workerAvailability.state}
               />
               <SellerListingsSummaryMetrics summary={summary} />
             </>
