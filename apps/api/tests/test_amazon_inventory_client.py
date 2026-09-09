@@ -415,6 +415,67 @@ async def test_nineteen_structurally_valid_summaries_survive_full_production_par
 
 
 @pytest.mark.asyncio
+async def test_empty_string_last_updated_time_no_longer_fails_the_page() -> None:
+    """Live production traffic (2026-09-09) showed a real, structurally
+    valid `GetInventorySummaries` response failing every attempt with
+    `datetime_from_date_parsing` on `lastUpdatedTime` for a subset of
+    entries — the whole page (all entries) was rejected even though only
+    a few had the problem. Reproducing Pydantic's own datetime coercion
+    directly narrowed the cause to an empty string (a bare date parses
+    fine; an explicit null raises a different error type entirely). This
+    proves the fix: an empty string is now treated the same as an absent
+    key, and the entries that do carry a real timestamp are unaffected."""
+    summaries = [_valid_summary_dict(f"SKU-{i}") for i in range(10)]
+    summaries.append({"sellerSku": "SKU-NO-TIMESTAMP", "condition": "NewItem", "totalQuantity": 5, "lastUpdatedTime": ""})
+    summaries.append(
+        {
+            "sellerSku": "SKU-WITH-TIMESTAMP",
+            "condition": "NewItem",
+            "totalQuantity": 5,
+            "lastUpdatedTime": "2026-09-01T12:00:00Z",
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=summaries)
+
+    client = _client(handler)
+    page = await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+    assert len(page.summaries) == 12
+    no_timestamp = next(s for s in page.summaries if s.seller_sku == "SKU-NO-TIMESTAMP")
+    assert no_timestamp.last_updated_time is None
+    with_timestamp = next(s for s in page.summaries if s.seller_sku == "SKU-WITH-TIMESTAMP")
+    assert with_timestamp.last_updated_time is not None
+
+
+@pytest.mark.asyncio
+async def test_genuinely_unparseable_last_updated_time_still_fails_loudly(caplog) -> None:
+    """The empty-string tolerance above must not become a blanket
+    "swallow any parsing error" — a value that is neither a valid
+    timestamp nor an empty string (a genuinely corrupt response) must
+    still fail the page, exactly like any other malformed field."""
+    summaries = [_valid_summary_dict(f"SKU-{i}") for i in range(5)]
+    summaries.append({"sellerSku": "SKU-BAD", "condition": "NewItem", "totalQuantity": 5, "lastUpdatedTime": "not-a-timestamp"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth/o2/token" in str(request.url):
+            return _lwa_token_response()
+        return _summaries_response(summaries=summaries)
+
+    client = _client(handler)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SpApiParseFailedError):
+            await client.fetch_page(InventoryPageRequest(marketplace_id=MARKETPLACE))
+
+    all_log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "shape=payload_present_nested_validation_failed" in all_log_text
+    assert "lastUpdatedTime" in all_log_text
+    assert "not-a-timestamp" not in all_log_text
+
+
+@pytest.mark.asyncio
 async def test_response_body_can_be_read_only_once_per_attempt() -> None:
     """`response.json()` decodes from `response.content`, which httpx
     buffers on a non-streamed response — safe to call more than once on

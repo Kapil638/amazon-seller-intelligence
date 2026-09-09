@@ -46,8 +46,9 @@ enums it does not control.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from app.amazon.listings_models import optional_not_null
 
@@ -73,6 +74,43 @@ __all__ = [
 RESEARCHING_QUANTITY_SHORT_TERM = "researchingQuantityInShortTerm"
 RESEARCHING_QUANTITY_MID_TERM = "researchingQuantityInMidTerm"
 RESEARCHING_QUANTITY_LONG_TERM = "researchingQuantityInLongTerm"
+
+
+def _last_updated_time_before_validate(value: object) -> object:
+    """`lastUpdatedTime` is documented optional (see module docstring) — an
+    absent key means this is never called at all. When the key IS present:
+    the pinned Swagger has no `nullable` keyword anywhere in this file, so
+    an explicit JSON `null` is rejected here, exactly like every other
+    `optional_not_null` field elsewhere in this module.
+
+    Live production traffic (2026-09-09, this seller's real FBA inventory)
+    showed `GetInventorySummaries` succeeding with HTTP 200 but 3 of 11
+    summary entries failing schema validation with Pydantic's
+    `datetime_from_date_parsing` error, deterministically and on every
+    retry. Reproducing Pydantic's own datetime coercion directly rules out
+    the two most obvious explanations: a bare `date`-only string (e.g.
+    `"2026-09-01"`) parses to midnight without error, and an explicit
+    `null` raises a *different* error type (`datetime_type`). The
+    remaining, most plausible cause for a string Pydantic cannot parse as
+    any date/time shape at all is an empty string — a sentinel some Amazon
+    report-style APIs use for "not recorded" on entries with no fulfillment
+    activity yet, rather than omitting the key. The raw value itself is
+    never available here to confirm directly (only the sanitized field
+    path/error type are ever logged — see `inventory_client.py`).
+
+    An empty/whitespace-only string is treated the same as an absent key
+    (`None`) so one missing timestamp no longer fails the entire page. Any
+    other non-empty, non-null value is left untouched for Pydantic's own
+    parser, so a genuinely malformed timestamp still fails loudly instead
+    of being silently swallowed."""
+    if value is None:
+        raise ValueError(
+            "the official schema documents this field as omittable, not nullable — "
+            "an explicit JSON null is not a documented value"
+        )
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
 
 
 class ReservedQuantity(BaseModel):
@@ -150,7 +188,9 @@ class InventorySummary(BaseModel):
     seller_sku: optional_not_null(str) = Field(default=None, alias="sellerSku")
     condition: optional_not_null(str) = None
     inventory_details: optional_not_null(InventoryDetails) = Field(default=None, alias="inventoryDetails")
-    last_updated_time: optional_not_null(datetime) = Field(default=None, alias="lastUpdatedTime")
+    last_updated_time: Annotated[datetime | None, BeforeValidator(_last_updated_time_before_validate)] = Field(
+        default=None, alias="lastUpdatedTime"
+    )
     product_name: optional_not_null(str) = Field(default=None, alias="productName")
     total_quantity: optional_not_null(int) = Field(default=None, alias="totalQuantity")
     stores: optional_not_null(list[str]) = None
