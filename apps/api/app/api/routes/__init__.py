@@ -19,6 +19,7 @@ from app.api.routes.amazon_sales_traffic import router as amazon_sales_traffic_r
 from app.api.routes.amazon_sales_traffic_sync import router as amazon_sales_traffic_sync_router
 from app.api.routes.amazon_inventory import router as amazon_inventory_router
 from app.api.routes.amazon_inventory_sync import router as amazon_inventory_sync_router
+from app.api.routes.amazon_inventory_health import router as amazon_inventory_health_router
 
 api_router = APIRouter()
 api_router.include_router(products_router)
@@ -40,3 +41,4 @@ api_router.include_router(amazon_sales_traffic_router)
 api_router.include_router(amazon_sales_traffic_sync_router)
 api_router.include_router(amazon_inventory_router)
 api_router.include_router(amazon_inventory_sync_router)
+api_router.include_router(amazon_inventory_health_router)
