@@ -432,6 +432,45 @@ class Settings(BaseSettings):
         description="Hard cap on the Inventory worker's own poll-error backoff delay — see inventory_worker_poll_error_base_backoff_seconds.",
     )
 
+    # 12B.6C — Inventory Health thresholds. ASI/EWise product policy, not
+    # Amazon guidance — reviewed and approved as the V1 defaults. Kept as
+    # typed backend configuration (not an organization-mutable database
+    # table) for this milestone; every API evidence response returns the
+    # exact values used alongside formula_version, so a future change here
+    # is always visible/auditable rather than silently altering history.
+    inventory_health_low_coverage_days_threshold: float = Field(
+        default=14.0, gt=0,
+        description="Below this many fulfillable days of cover, a SKU is classified low_coverage. Exactly this value is healthy_coverage.",
+    )
+    inventory_health_high_coverage_days_threshold: float = Field(
+        default=90.0, gt=0,
+        description="Above this many fulfillable days of cover, a SKU is classified high_coverage. Exactly this value is healthy_coverage.",
+    )
+    inventory_health_min_eligible_window_days: int = Field(
+        default=7, ge=1, le=365,
+        description="A selected Sales & Traffic product fact covering fewer inclusive days than this is insufficient_window, not eligible.",
+    )
+    inventory_health_preferred_window_days: int = Field(
+        default=30, ge=1, le=365,
+        description="The canonical product-fact window length preferred when selecting one fact per SKU among several sharing the same latest end date.",
+    )
+    inventory_health_max_inventory_age_seconds: float = Field(
+        default=48 * 3600, gt=0,
+        description="Inventory observation age beyond which freshness_state reports stale_inventory. Inventory sync is on-demand, not scheduled, in this milestone — generous by design.",
+    )
+    inventory_health_max_sales_age_seconds: float = Field(
+        default=48 * 3600, gt=0,
+        description="Sales & Traffic ingestion age beyond which freshness_state reports stale_sales.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_inventory_health_coverage_thresholds(self) -> "Settings":
+        if self.inventory_health_low_coverage_days_threshold > self.inventory_health_high_coverage_days_threshold:
+            raise ValueError(
+                "inventory_health_low_coverage_days_threshold must not exceed inventory_health_high_coverage_days_threshold"
+            )
+        return self
+
     @model_validator(mode="after")
     def _validate_inventory_worker_poll_error_backoff_bounds(self) -> "Settings":
         if self.inventory_worker_poll_error_base_backoff_seconds > self.inventory_worker_poll_error_max_backoff_seconds:

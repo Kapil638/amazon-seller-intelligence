@@ -1776,6 +1776,24 @@ class AmazonIngestionRunRepository:
             )
         ).first()
 
+    def get_by_ids(self, organization_id: UUID, run_ids: set[UUID]) -> dict[UUID, AmazonIngestionRun]:
+        """12B.6C — one batched lookup for a whole page of rows'
+        `last_ingestion_run_id`s, instead of one query per row (the
+        N+1 this milestone's read service must avoid). Silently omits
+        an id belonging to another organization from the result rather
+        than raising — callers treat a missing key as "provenance
+        unavailable," the same posture every other freshness fallback
+        in this codebase already takes."""
+        if not run_ids:
+            return {}
+        rows = self.session.scalars(
+            select(AmazonIngestionRun).where(
+                AmazonIngestionRun.organization_id == organization_id,
+                AmazonIngestionRun.id.in_(run_ids),
+            )
+        ).all()
+        return {row.id: row for row in rows}
+
     def list_for_org(self, organization_id: UUID) -> list[AmazonIngestionRun]:
         statement: Select[tuple[AmazonIngestionRun]] = (
             select(AmazonIngestionRun)
@@ -5967,6 +5985,56 @@ class AmazonSalesTrafficProductFactRepository:
                 )
             ).all()
         )
+
+    def get_eligible_sku_facts(
+        self,
+        organization_id: UUID,
+        marketplace_participation_id: UUID,
+        *,
+        seller_skus: set[str],
+    ) -> dict[str, list[AmazonSalesAndTrafficProductFact]] | None:
+        """12B.6C — Inventory Health read path. Returns every
+        `SKU`-granularity product fact whose originating ingestion run
+        `status == 'succeeded'`, grouped by `seller_sku`, restricted to
+        exactly the given set of SKUs. Never returns a `PARENT`/`CHILD`
+        row (`seller_sku == ''`, no SKU identity at all — excluded by
+        the equality filter itself, not a separate check) and never a
+        row whose run did not fully succeed (an inner join to a
+        `status == 'succeeded'` run excludes a `NULL`
+        `last_ingestion_run_id` automatically, along with any row from a
+        `partial`/`failed`/`timed_out` run).
+
+        This returns every eligible *candidate* per SKU — deciding
+        which single window to actually use (the deterministic
+        selection/tie-break) is
+        `inventory_health_formulas.select_canonical_product_fact`'s job
+        alone, kept a pure function independent of this query. Returns
+        `None` for a foreign/nonexistent participation, matching every
+        other Sales and Traffic read method's convention."""
+        participation = AmazonMarketplaceParticipationRepository(self.session).get_by_id(
+            organization_id, marketplace_participation_id
+        )
+        if participation is None:
+            return None
+        result: dict[str, list[AmazonSalesAndTrafficProductFact]] = {sku: [] for sku in seller_skus}
+        if not seller_skus:
+            return result
+        rows = self.session.scalars(
+            select(AmazonSalesAndTrafficProductFact)
+            .join(
+                AmazonIngestionRun,
+                AmazonIngestionRun.id == AmazonSalesAndTrafficProductFact.last_ingestion_run_id,
+            )
+            .where(
+                AmazonSalesAndTrafficProductFact.marketplace_participation_id == marketplace_participation_id,
+                AmazonSalesAndTrafficProductFact.asin_granularity == "SKU",
+                AmazonSalesAndTrafficProductFact.seller_sku.in_(seller_skus),
+                AmazonIngestionRun.status == "succeeded",
+            )
+        ).all()
+        for row in rows:
+            result[row.seller_sku].append(row)
+        return result
 
 
 # fix/supervise-ingestion-runtime (PR #22 rebase): the single canonical
