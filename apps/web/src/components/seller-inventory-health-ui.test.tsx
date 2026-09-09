@@ -58,6 +58,7 @@ function row(overrides: Partial<InventoryHealthRow> = {}): InventoryHealthRow {
     sales_covered_days: 30,
     fulfillable_days_of_cover: 14,
     potential_units: 140,
+    potential_days_of_cover: 14,
     potential_units_incomplete_inputs: false,
     inventory_state: "healthy_coverage",
     freshness_state: "fresh",
@@ -201,12 +202,29 @@ describe("SellerInventoryHealth", () => {
     await waitFor(() => expect(screen.getByText("Inventory Health could not be loaded.")).toBeInTheDocument());
   });
 
-  it("shows an incomplete-input warning when potential units used a partial sum", async () => {
+  it("shows potential units and its days-of-cover pairing when every input is known", async () => {
     vi.mocked(fetchInventoryHealthSummary).mockResolvedValue(summary());
     vi.mocked(fetchInventoryHealth).mockResolvedValue(
-      collection([row({ potential_units: 100, potential_units_incomplete_inputs: true })]),
+      collection([row({ potential_units: 165, potential_days_of_cover: 16.5, potential_units_incomplete_inputs: false })]),
     );
     render(<SellerInventoryHealth participationId="p1" />);
-    await waitFor(() => expect(screen.getByText(/\(partial\)/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("inventory-health-row-inv-1")).toBeInTheDocument());
+    const rowEl = screen.getByTestId("inventory-health-row-inv-1");
+    expect(rowEl).toHaveTextContent("165");
+    expect(rowEl).toHaveTextContent("16.5d");
+  });
+
+  it("shows an explicit unknown warning — never a partial number — when an inbound quantity is unreported", async () => {
+    vi.mocked(fetchInventoryHealthSummary).mockResolvedValue(summary());
+    vi.mocked(fetchInventoryHealth).mockResolvedValue(
+      collection([row({ potential_units: null, potential_days_of_cover: null, potential_units_incomplete_inputs: true })]),
+    );
+    render(<SellerInventoryHealth participationId="p1" />);
+    await waitFor(() => expect(screen.getByText(/unknown — missing Amazon data/i)).toBeInTheDocument());
+    // The strict null policy means there is never a number shown
+    // alongside the warning — the potential-units cell itself must
+    // render the same dash as any other unavailable value.
+    const rowEl = screen.getByTestId("inventory-health-row-inv-1");
+    expect(within(rowEl).getAllByText("—").length).toBeGreaterThanOrEqual(1);
   });
 });

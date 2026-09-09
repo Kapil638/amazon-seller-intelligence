@@ -97,7 +97,7 @@ export function SellerInventoryHealth({ participationId }: { participationId: st
   }, [participationId, search, offset, stateFilter]);
 
   useEffect(() => {
-    load();
+    void Promise.resolve().then(() => load());
   }, [load]);
 
   const openEvidence = useCallback(
@@ -236,9 +236,15 @@ export function SellerInventoryHealth({ participationId }: { participationId: st
                     <td className="px-3 py-2">{formatInventoryHealthDays(row.fulfillable_days_of_cover)}</td>
                     <td className="px-3 py-2">
                       {formatInventoryHealthQuantity(row.potential_units)}
+                      {row.potential_units !== null && (
+                        <span className="ml-1 text-xs text-muted-foreground">({formatInventoryHealthDays(row.potential_days_of_cover)})</span>
+                      )}
                       {row.potential_units_incomplete_inputs && (
-                        <span className="ml-1 text-xs text-amber-700" title="Some inbound quantities were not reported by Amazon">
-                          (partial)
+                        <span
+                          className="ml-1 text-xs text-amber-700"
+                          title="An inbound quantity was not reported by Amazon — potential coverage cannot be confirmed, never shown as a partial estimate"
+                        >
+                          (unknown — missing Amazon data)
                         </span>
                       )}
                     </td>

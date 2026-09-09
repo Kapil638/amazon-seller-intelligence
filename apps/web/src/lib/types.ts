@@ -2313,10 +2313,14 @@ export type InventoryHealthRow = {
   fulfillable_days_of_cover: number | null;
 
   // Inbound-adjusted estimate, always separately labeled — never
-  // "available stock." `potential_units_incomplete_inputs` is true
-  // whenever an Amazon quantity was null and therefore excluded from
-  // the sum rather than silently treated as a confirmed zero.
+  // "available stock." Strictly all-or-nothing: both fields are null
+  // whenever any one of fulfillable/inbound_working/inbound_shipped/
+  // inbound_receiving is itself null — never a partial sum from only
+  // the components that happened to be present.
+  // `potential_units_incomplete_inputs` is the evidence reason for
+  // that whenever it happened.
   potential_units: number | null;
+  potential_days_of_cover: number | null;
   potential_units_incomplete_inputs: boolean;
 
   inventory_state: InventoryHealthInventoryState;
