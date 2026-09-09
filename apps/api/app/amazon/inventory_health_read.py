@@ -35,6 +35,7 @@ from app.amazon.inventory_health_formulas import (
     fulfillable_days_of_cover,
     inventory_state,
     overlays_for,
+    potential_days_of_cover,
     potential_units,
 )
 from app.core.config import Settings, get_settings
@@ -176,7 +177,14 @@ class InventoryHealthRow(BaseModel):
     fulfillable_days_of_cover: float | None
 
     # Inbound-adjusted, separately labeled — never "available stock."
+    # Both are strictly all-or-nothing: null whenever any one of
+    # fulfillable/inbound_working/inbound_shipped/inbound_receiving is
+    # itself null — never a partial sum from only the components that
+    # happened to be present. `potential_units_incomplete_inputs=True`
+    # is the evidence reason (equivalent to
+    # incomplete_inbound_quantity_inputs) whenever that happened.
     potential_units: int | None
+    potential_days_of_cover: float | None
     potential_units_incomplete_inputs: bool
 
     # Classification.
@@ -236,19 +244,47 @@ def _ensure_aware(value: datetime | None) -> datetime | None:
 def _inventory_observed_at(row: AmazonSellerInventory, runs_by_id: dict[UUID, AmazonIngestionRun]) -> datetime | None:
     """ASI provenance, never Amazon's own (optional, sometimes-empty)
     `amazon_last_updated_time` — the correction this milestone's review
-    required. Prefers the successful run's own `completed_at`; falls
-    back to the row's own `last_seen_at` only when `last_ingestion_run_id`
-    is unset or the referenced run could not be found (both edge cases,
-    since `reconcile_snapshot` sets both fields together on every
-    successful reconcile — see `AmazonSellerInventoryRepository._upsert`).
-    Both this run's `completed_at` and `last_seen_at` are set within the
-    same successful reconcile, so this fallback is provably equivalent
-    in the normal case, never a materially different clock."""
-    if row.last_ingestion_run_id is not None:
-        run = runs_by_id.get(row.last_ingestion_run_id)
-        if run is not None and run.completed_at is not None:
-            return _ensure_aware(run.completed_at)
-    return _ensure_aware(row.last_seen_at)
+    required. The **only** source is the row's own `last_ingestion_
+    run_id` joined to that run's `completed_at`, gated on the run
+    actually being recorded `status == "succeeded"`.
+
+    No `last_seen_at` fallback — proven unnecessary, not merely
+    dropped for caution. `AmazonSellerInventoryRepository._upsert` sets
+    `last_ingestion_run_id` and `last_seen_at` together, unconditionally,
+    on every call; the *only* caller of `_upsert` is `reconcile_snapshot`,
+    called from exactly one place — `AmazonInventoryIngestionService.
+    _reconcile` (`inventory_ingestion.py`) — where `AmazonIngestionRun
+    Repository.complete_inventory_run(status="succeeded", ...)` (which
+    sets `completed_at=func.now()` in the same call) and `reconcile_
+    snapshot(...)` both execute inside the **same** `with session_
+    scope() as session:` block. `session_scope` (`database.py`) commits
+    exactly once at the end of that block and rolls back everything in
+    it on any exception — verified directly, not assumed. So whenever
+    `last_seen_at` is updated, the very same atomic transaction already
+    guarantees `last_ingestion_run_id` points at a run recorded
+    `status == "succeeded"` with a non-null `completed_at` in that same
+    commit — there is no code path where `last_seen_at` could be newer,
+    older, or otherwise divergent from that run's own `completed_at`,
+    so a separate fallback read of `last_seen_at` could never add real
+    information, only a false sense of a second source.
+
+    A row failing every one of these checks — `last_ingestion_run_id`
+    unset, the referenced run not found (wrong organization, or simply
+    absent from the batched `runs_by_id` lookup), the run not recorded
+    `succeeded`, or `completed_at` still `None` — has provably never
+    been reconciled through this path. Its freshness is unknown, not
+    silently assumed fresh from any other timestamp on the row; `None`
+    here folds into `freshness_state`'s existing `stale_inventory`
+    handling for a `None` timestamp, and the response's own
+    `inventory_observed_at: null` remains the explicit, visible
+    evidence of that — never hidden behind a coarse label alone."""
+    run_id = row.last_ingestion_run_id
+    if run_id is None:
+        return None
+    run = runs_by_id.get(run_id)
+    if run is None or run.status != "succeeded" or run.completed_at is None:
+        return None
+    return _ensure_aware(run.completed_at)
 
 
 def _row_evidence(
@@ -302,6 +338,7 @@ def _row_evidence(
         inbound_shipped_quantity=row.inbound_shipped_quantity,
         inbound_receiving_quantity=row.inbound_receiving_quantity,
     )
+    potential_cover = potential_days_of_cover(potential.potential_units, velocity)
     overlays = overlays_for(
         fulfillable_quantity=row.fulfillable_quantity,
         demand_eligibility=demand_eligibility,
@@ -350,6 +387,7 @@ def _row_evidence(
         sales_covered_days=covered,
         fulfillable_days_of_cover=cover,
         potential_units=potential.potential_units,
+        potential_days_of_cover=potential_cover,
         potential_units_incomplete_inputs=potential.incomplete_inputs,
         inventory_state=state,
         freshness_state=freshness,

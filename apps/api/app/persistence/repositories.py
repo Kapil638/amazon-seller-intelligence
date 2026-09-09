@@ -6004,6 +6004,15 @@ class AmazonSalesTrafficProductFactRepository:
         `last_ingestion_run_id` automatically, along with any row from a
         `partial`/`failed`/`timed_out` run).
 
+        The join to `AmazonIngestionRun` also requires the run's own
+        `marketplace_participation_id` to match the fact's — explicit,
+        not merely relying on the composite foreign key that already
+        enforces this pairing on PostgreSQL (SQLite, this test suite's
+        engine, never enables `PRAGMA foreign_keys=ON`, so that
+        constraint is unverified there; this condition is what actually
+        guarantees "a fact's run belongs to the same participation" on
+        every backend this code runs against).
+
         This returns every eligible *candidate* per SKU — deciding
         which single window to actually use (the deterministic
         selection/tie-break) is
@@ -6023,7 +6032,17 @@ class AmazonSalesTrafficProductFactRepository:
             select(AmazonSalesAndTrafficProductFact)
             .join(
                 AmazonIngestionRun,
-                AmazonIngestionRun.id == AmazonSalesAndTrafficProductFact.last_ingestion_run_id,
+                (AmazonIngestionRun.id == AmazonSalesAndTrafficProductFact.last_ingestion_run_id)
+                # Defense-in-depth, not redundant: this pairing is also
+                # enforced by the composite foreign key
+                # fk_amazon_sales_traffic_product_facts_last_run_participation
+                # on PostgreSQL, but SQLite (this test suite's engine)
+                # never enables `PRAGMA foreign_keys=ON`, so that
+                # constraint is declared but not actually verified here
+                # — this explicit join condition is what makes "a fact's
+                # run belongs to the same marketplace participation"
+                # true regardless of which database is running.
+                & (AmazonIngestionRun.marketplace_participation_id == AmazonSalesAndTrafficProductFact.marketplace_participation_id),
             )
             .where(
                 AmazonSalesAndTrafficProductFact.marketplace_participation_id == marketplace_participation_id,

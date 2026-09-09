@@ -222,6 +222,75 @@ def test_fact_from_a_non_succeeded_run_never_attaches() -> None:
     assert result.items[0].demand_eligibility == "no_eligible_sales_traffic_fact"
 
 
+def test_fact_referencing_a_run_from_a_different_participation_never_attaches() -> None:
+    """Defense-in-depth proof for `get_eligible_sku_facts`'s explicit
+    join condition (repositories.py): even when a fact's
+    last_ingestion_run_id is made to point at a *different*
+    participation's succeeded run — a pairing PostgreSQL's own
+    composite foreign key would reject, but this test suite's SQLite
+    engine never enforces (`PRAGMA foreign_keys` is not turned on
+    here) — the read service still correctly excludes it. Constructed
+    via a raw table UPDATE specifically because the repository's own
+    `upsert()` would never produce this state through its normal API."""
+    scope_a = _seed_scope()
+    # A second, independent participation sharing scope_a's own
+    # connection (AmazonConnection is unique per (org, provider,
+    # environment) — a second full _seed_scope() would collide on
+    # that).
+    with session_scope() as session:
+        seller_account_b = AmazonSellerAccountRepository(session).create_or_reconcile(
+            organization_id=scope_a["org_id"], selling_partner_id=f"A{uuid4().hex[:14].upper()}"
+        )
+        participation_b = AmazonMarketplaceParticipationRepository(session).create_or_reconcile(
+            organization_id=scope_a["org_id"], seller_account_id=seller_account_b.id,
+            marketplace_id="A1PA6795UKMFR9", region="eu", connection_id=scope_a["connection_id"],
+        )
+        session.flush()
+        scope_b = {
+            "org_id": scope_a["org_id"], "seller_account_id": seller_account_b.id,
+            "participation_id": participation_b.id, "connection_id": scope_a["connection_id"],
+        }
+    _seed_inventory(scope_a, [_observation("SKU-1", fulfillable_quantity=100)])
+    other_run_id = _seed_succeeded_sales_traffic_run(scope_b, day=date(2026, 8, 30))
+    # Seed the fact honestly under scope_a's own succeeded run first...
+    real_run_id = _seed_succeeded_sales_traffic_run(scope_a, day=date(2026, 8, 30))
+    _seed_product_fact(scope_a, real_run_id, sku="SKU-1", units=300, start=date(2026, 8, 1), end=date(2026, 8, 30))
+    # ...then corrupt its last_ingestion_run_id to point at scope_b's
+    # run instead, bypassing the repository entirely.
+    with session_scope() as session:
+        from app.persistence.models import AmazonSalesAndTrafficProductFact
+
+        session.execute(
+            AmazonSalesAndTrafficProductFact.__table__.update()
+            .where(
+                AmazonSalesAndTrafficProductFact.marketplace_participation_id == scope_a["participation_id"],
+                AmazonSalesAndTrafficProductFact.seller_sku == "SKU-1",
+            )
+            .values(last_ingestion_run_id=other_run_id)
+        )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope_a["participation_id"]).items[0]
+    assert row.demand_eligibility == "no_eligible_sales_traffic_fact"
+
+
+def test_read_service_enforces_the_minimum_eligible_window_end_to_end() -> None:
+    """A real, succeeded fact whose own inclusive window is shorter
+    than the configured minimum (7 days) must not drive velocity —
+    proven through the full read-service stack, not just the pure
+    formula function."""
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1", fulfillable_quantity=100)])
+    run_id = _seed_succeeded_sales_traffic_run(scope, day=date(2026, 8, 30))
+    _seed_product_fact(scope, run_id, sku="SKU-1", units=30, start=date(2026, 8, 28), end=date(2026, 8, 30))  # 3 days
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.demand_eligibility == "insufficient_window"
+    assert row.sales_covered_days == 3
+    assert row.units_per_covered_day is None
+
+
 def test_multiple_skus_for_one_asin_do_not_collide() -> None:
     scope = _seed_scope()
     _seed_inventory(
@@ -370,6 +439,150 @@ def test_service_never_sums_overlapping_7_30_90_day_facts() -> None:
     assert row.sales_covered_days == 30
 
 
+# --- PR corrections: strict potential_units null policy --------------------
+
+
+def test_potential_units_null_when_an_inbound_quantity_is_unreported() -> None:
+    """The default observation fixture already leaves every inbound
+    quantity null (matching what a real, non-`details=true` or
+    partially-populated Amazon response looks like) — proves the
+    service-layer wiring surfaces the formula's strict null policy
+    end-to-end, not just at the pure-function level."""
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1", fulfillable_quantity=100)])
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.potential_units is None
+    assert row.potential_days_of_cover is None
+    assert row.potential_units_incomplete_inputs is True
+
+
+def test_potential_units_real_number_when_every_component_is_known() -> None:
+    scope = _seed_scope()
+    _seed_inventory(
+        scope,
+        [
+            _observation(
+                "SKU-1",
+                fulfillable_quantity=100,
+                inbound_working_quantity=10,
+                inbound_shipped_quantity=20,
+                inbound_receiving_quantity=5,
+            )
+        ],
+    )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.potential_units == 135
+    assert row.potential_units_incomplete_inputs is False
+
+
+def test_potential_units_all_zero_known_inputs_is_a_real_zero_not_null() -> None:
+    scope = _seed_scope()
+    _seed_inventory(
+        scope,
+        [
+            _observation(
+                "SKU-1",
+                fulfillable_quantity=0,
+                inbound_working_quantity=0,
+                inbound_shipped_quantity=0,
+                inbound_receiving_quantity=0,
+            )
+        ],
+    )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.potential_units == 0
+    assert row.potential_units_incomplete_inputs is False
+
+
+# --- PR corrections: inventory freshness provenance -------------------------
+
+
+def test_freshness_unknown_when_last_ingestion_run_id_is_missing() -> None:
+    """A row with no run provenance at all must never be treated as
+    fresh from any other timestamp on the row."""
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1")])
+    with session_scope() as session:
+        from app.persistence.models import AmazonSellerInventory
+
+        row_obj = session.execute(
+            AmazonSellerInventory.__table__.select().where(AmazonSellerInventory.seller_sku == "SKU-1")
+        ).first()
+        session.execute(
+            AmazonSellerInventory.__table__.update()
+            .where(AmazonSellerInventory.id == row_obj.id)
+            .values(last_ingestion_run_id=None)
+        )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.inventory_observed_at is None
+    assert row.freshness_state in ("stale_inventory", "stale_both")
+
+
+def test_freshness_unknown_when_referenced_run_is_not_succeeded() -> None:
+    """A row whose last_ingestion_run_id points at a run that is not
+    (or no longer) recorded 'succeeded' must not be treated as fresh —
+    proves the read service checks run.status, not merely the run's
+    existence."""
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1")])
+    with session_scope() as session:
+        from app.persistence.models import AmazonIngestionRun, AmazonSellerInventory
+
+        row_obj = session.execute(
+            AmazonSellerInventory.__table__.select().where(AmazonSellerInventory.seller_sku == "SKU-1")
+        ).first()
+        session.execute(
+            AmazonIngestionRun.__table__.update()
+            .where(AmazonIngestionRun.id == row_obj.last_ingestion_run_id)
+            .values(status="failed", failure_class="unexpected_error")
+        )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.inventory_observed_at is None
+    assert row.freshness_state in ("stale_inventory", "stale_both")
+
+
+def test_freshness_unknown_when_referenced_run_has_no_completed_at() -> None:
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1")])
+    with session_scope() as session:
+        from app.persistence.models import AmazonIngestionRun, AmazonSellerInventory
+
+        row_obj = session.execute(
+            AmazonSellerInventory.__table__.select().where(AmazonSellerInventory.seller_sku == "SKU-1")
+        ).first()
+        session.execute(
+            AmazonIngestionRun.__table__.update()
+            .where(AmazonIngestionRun.id == row_obj.last_ingestion_run_id)
+            .values(completed_at=None)
+        )
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.inventory_observed_at is None
+
+
+def test_freshness_uses_the_provably_succeeded_run_completed_at() -> None:
+    """The positive case: a genuinely successful reconcile's own
+    run.completed_at is used, matching the invariant this correction
+    relies on rather than assumes."""
+    scope = _seed_scope()
+    _seed_inventory(scope, [_observation("SKU-1")])
+    service = AmazonInventoryHealthReadService()
+
+    row = service.list_inventory_health(scope["participation_id"]).items[0]
+    assert row.inventory_observed_at is not None
+
+
 # --- summary counts -------------------------------------------------------
 
 
@@ -440,29 +653,92 @@ def test_no_network_call_is_made_during_calculation(monkeypatch) -> None:
 # --- query-count / N+1 regression guard -------------------------------------
 
 
-def test_list_inventory_health_query_count_does_not_scale_with_row_count() -> None:
-    """A bounded, small number of queries regardless of how many
-    Inventory rows are on the page — the read service must never issue
-    one query per row for facts/runs."""
-    scope = _seed_scope()
-    observations = [_observation(f"SKU-{i}", fulfillable_quantity=10 + i) for i in range(25)]
-    _seed_inventory(scope, observations)
-    run_id = _seed_succeeded_sales_traffic_run(scope, day=date(2026, 8, 30))
-    for i in range(25):
-        _seed_product_fact(scope, run_id, sku=f"SKU-{i}", units=30 * (i + 1), start=date(2026, 8, 1), end=date(2026, 8, 30))
-
-    service = AmazonInventoryHealthReadService()
+def _count_queries(fn):
     counter = _QueryCounter()
-
     with session_scope() as session:
         engine = session.get_bind()
         event.listen(engine, "before_cursor_execute", counter)
         try:
-            result = service.list_inventory_health(scope["participation_id"], limit=25)
+            result = fn()
         finally:
             event.remove(engine, "before_cursor_execute", counter)
+    return result, counter.count
 
-    assert result.total == 25
-    # A small constant bound, generous but proving no per-row scaling
-    # (25 rows must not produce anywhere near 25x the query count).
-    assert counter.count < 15, f"expected a bounded query count, got {counter.count}"
+
+def test_list_inventory_health_query_count_bounded_across_materially_different_page_sizes() -> None:
+    """Seeds 100 rows once, then compares a 1-row page against a
+    100-row page against the *same* dataset — proves query count is
+    bounded by page size (pagination applied before evidence assembly
+    fetches facts/runs), not by total row count, and does not scale
+    materially between the two, not merely that one arbitrary page
+    size (25) stays under one arbitrary ceiling."""
+    scope = _seed_scope()
+    observations = [_observation(f"SKU-{i:03d}", fulfillable_quantity=10 + i) for i in range(100)]
+    _seed_inventory(scope, observations)
+    run_id = _seed_succeeded_sales_traffic_run(scope, day=date(2026, 8, 30))
+    for i in range(100):
+        _seed_product_fact(scope, run_id, sku=f"SKU-{i:03d}", units=30 * (i + 1), start=date(2026, 8, 1), end=date(2026, 8, 30))
+
+    service = AmazonInventoryHealthReadService()
+
+    result_1, count_1 = _count_queries(lambda: service.list_inventory_health(scope["participation_id"], limit=1))
+    result_100, count_100 = _count_queries(lambda: service.list_inventory_health(scope["participation_id"], limit=100))
+
+    assert result_1.total == 100
+    assert len(result_1.items) == 1, "pagination must be applied before evidence assembly, not after"
+    assert result_100.total == 100
+    assert len(result_100.items) == 100
+
+    assert count_1 < 15, f"expected a bounded query count for limit=1, got {count_1}"
+    assert count_100 < 15, f"expected a bounded query count for limit=100, got {count_100}"
+    assert count_100 <= count_1 + 2, (
+        f"query count grew materially between limit=1 ({count_1}) and limit=100 ({count_100}) — "
+        "pagination does not appear to be applied before evidence assembly"
+    )
+
+
+def test_summary_query_count_is_bounded_not_one_per_row() -> None:
+    """Summary aggregation intentionally materializes every row for
+    this participation (classification requires the Python-side
+    formula layer — join/tie-break selection cannot be pushed into SQL
+    without reimplementing the whole formula layer there, which is out
+    of this milestone's approved scope). What must still hold, and is
+    proven here, is that this costs a small constant number of
+    *queries* regardless of row count — never one query per row for
+    facts/runs, which is the actual, unbounded-scaling failure mode
+    this test guards against."""
+    scope = _seed_scope()
+    observations = [_observation(f"SKU-{i:03d}", fulfillable_quantity=10 + i) for i in range(100)]
+    _seed_inventory(scope, observations)
+    run_id = _seed_succeeded_sales_traffic_run(scope, day=date(2026, 8, 30))
+    for i in range(100):
+        _seed_product_fact(scope, run_id, sku=f"SKU-{i:03d}", units=30 * (i + 1), start=date(2026, 8, 1), end=date(2026, 8, 30))
+
+    service = AmazonInventoryHealthReadService()
+    result, count = _count_queries(lambda: service.get_summary(scope["participation_id"]))
+
+    assert result.total == 100
+    assert count < 15, f"expected a bounded query count for summary, got {count}"
+
+
+def test_pagination_ordering_is_deterministic_when_sort_values_tie() -> None:
+    """Every row shares the same fulfillable_quantity (the default
+    sort field) — proves the secondary `id` tie-breaker
+    (`AmazonSellerInventoryRepository.list_page`) makes pagination
+    stable: two consecutive pages together cover every row exactly
+    once, with zero overlap and zero gap, never a row silently
+    reshuffled between them."""
+    scope = _seed_scope()
+    observations = [_observation(f"SKU-{i:03d}", fulfillable_quantity=50) for i in range(10)]
+    _seed_inventory(scope, observations)
+    service = AmazonInventoryHealthReadService()
+
+    page_1 = service.list_inventory_health(scope["participation_id"], offset=0, limit=5)
+    page_2 = service.list_inventory_health(scope["participation_id"], offset=5, limit=5)
+
+    skus_1 = {item.seller_sku for item in page_1.items}
+    skus_2 = {item.seller_sku for item in page_2.items}
+    assert len(skus_1) == 5
+    assert len(skus_2) == 5
+    assert skus_1.isdisjoint(skus_2)
+    assert skus_1 | skus_2 == {f"SKU-{i:03d}" for i in range(10)}

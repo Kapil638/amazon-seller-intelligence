@@ -194,6 +194,45 @@ def test_list_endpoint_missing_evidence_serializes_as_null_not_zero(client) -> N
     assert item["demand_eligibility"] == "no_eligible_sales_traffic_fact"
 
 
+def test_list_endpoint_potential_units_null_when_an_inbound_component_is_unreported(client) -> None:
+    """PR correction: a missing individual inbound quantity makes the
+    whole potential_units/potential_days_of_cover pair null, never a
+    partial sum — proven at the HTTP/JSON boundary, not just the
+    formula layer."""
+    scope = _seed_participation()
+    _reconcile(
+        scope,
+        [
+            _observation(
+                "SKU-1", fulfillable_quantity=100, inbound_working_quantity=10,
+                inbound_shipped_quantity=20, inbound_receiving_quantity=None,
+            )
+        ],
+    )
+    response = client.get(_url(scope["participation_id"]))
+    item = response.json()["items"][0]
+    assert item["potential_units"] is None
+    assert item["potential_days_of_cover"] is None
+    assert item["potential_units_incomplete_inputs"] is True
+
+
+def test_list_endpoint_potential_units_real_number_when_every_component_is_known(client) -> None:
+    scope = _seed_participation()
+    _reconcile(
+        scope,
+        [
+            _observation(
+                "SKU-1", fulfillable_quantity=100, inbound_working_quantity=10,
+                inbound_shipped_quantity=20, inbound_receiving_quantity=5,
+            )
+        ],
+    )
+    response = client.get(_url(scope["participation_id"]))
+    item = response.json()["items"][0]
+    assert item["potential_units"] == 135
+    assert item["potential_units_incomplete_inputs"] is False
+
+
 def test_list_endpoint_search_filters_by_sku(client) -> None:
     scope = _seed_participation()
     _reconcile(scope, [_observation("SKU-ALPHA"), _observation("SKU-BETA")])

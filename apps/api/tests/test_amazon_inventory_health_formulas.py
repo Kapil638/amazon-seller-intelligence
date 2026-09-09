@@ -21,6 +21,7 @@ from app.amazon.inventory_health_formulas import (
     fulfillable_days_of_cover,
     inventory_state,
     overlays_for,
+    potential_days_of_cover,
     potential_units,
     select_canonical_product_fact,
     units_per_covered_day,
@@ -304,24 +305,76 @@ def test_potential_units_null_fulfillable_yields_null_result_and_incomplete_flag
     assert result.incomplete_inputs is True
 
 
-def test_potential_units_missing_inbound_component_is_never_treated_as_confirmed_zero() -> None:
-    """A null inbound_receiving_quantity is excluded from the sum (not
-    padded with 0), and the result is flagged incomplete so the caller
-    must warn — the returned number alone must never be presented as a
-    confirmed total."""
+def test_potential_units_missing_inbound_working_yields_null_not_a_partial_sum() -> None:
+    """Strict all-or-nothing policy: a single missing component makes
+    the whole result null — never a partial sum computed from only the
+    components that happened to be present (the corrected policy;
+    130 = 100+0+20+10 would have been the old, rejected partial sum)."""
+    result = potential_units(
+        fulfillable_quantity=100, inbound_working_quantity=None, inbound_shipped_quantity=20, inbound_receiving_quantity=10
+    )
+    assert result.potential_units is None
+    assert result.incomplete_inputs is True
+
+
+def test_potential_units_missing_inbound_shipped_yields_null_not_a_partial_sum() -> None:
+    result = potential_units(
+        fulfillable_quantity=100, inbound_working_quantity=10, inbound_shipped_quantity=None, inbound_receiving_quantity=20
+    )
+    assert result.potential_units is None
+    assert result.incomplete_inputs is True
+
+
+def test_potential_units_missing_inbound_receiving_yields_null_not_a_partial_sum() -> None:
     result = potential_units(
         fulfillable_quantity=100, inbound_working_quantity=10, inbound_shipped_quantity=20, inbound_receiving_quantity=None
     )
-    assert result.potential_units == 130
+    assert result.potential_units is None
     assert result.incomplete_inputs is True
 
 
-def test_potential_units_all_inbound_null_still_excludes_not_zero_pads() -> None:
+def test_potential_units_all_inbound_null_yields_null_not_fulfillable_alone() -> None:
     result = potential_units(
         fulfillable_quantity=100, inbound_working_quantity=None, inbound_shipped_quantity=None, inbound_receiving_quantity=None
     )
-    assert result.potential_units == 100
+    assert result.potential_units is None
     assert result.incomplete_inputs is True
+
+
+def test_potential_units_all_four_known_and_zero_is_a_real_confirmed_zero() -> None:
+    """A known zero is not "missing" — when every input is known
+    (even if every one of them is exactly 0), the result is a real,
+    confirmed 0, not null."""
+    result = potential_units(
+        fulfillable_quantity=0, inbound_working_quantity=0, inbound_shipped_quantity=0, inbound_receiving_quantity=0
+    )
+    assert result == PotentialUnitsResult(potential_units=0, incomplete_inputs=False)
+
+
+# --- potential_days_of_cover -------------------------------------------------
+
+
+def test_potential_days_of_cover_basic() -> None:
+    assert potential_days_of_cover(150, 10.0) == 15.0
+
+
+def test_potential_days_of_cover_null_when_potential_units_is_null() -> None:
+    """Propagates potential_units' own strict null policy — an
+    incomplete inbound-quantity input makes both potential_units and
+    potential_days_of_cover null, never just one of the two."""
+    incomplete = potential_units(
+        fulfillable_quantity=100, inbound_working_quantity=None, inbound_shipped_quantity=20, inbound_receiving_quantity=5
+    )
+    assert incomplete.potential_units is None
+    assert potential_days_of_cover(incomplete.potential_units, 10.0) is None
+
+
+def test_potential_days_of_cover_null_when_velocity_is_null() -> None:
+    assert potential_days_of_cover(150, None) is None
+
+
+def test_potential_days_of_cover_zero_velocity_is_null_never_infinite() -> None:
+    assert potential_days_of_cover(150, 0.0) is None
 
 
 # --- freshness_state ----------------------------------------------------------

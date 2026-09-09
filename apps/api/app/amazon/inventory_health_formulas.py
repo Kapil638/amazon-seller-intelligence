@@ -285,21 +285,42 @@ def potential_units(
     cover, never labeled "available stock" (inbound units are not yet
     fulfillable and may be delayed or rejected by Amazon).
 
-    Null policy: a missing Amazon quantity is never silently treated as
-    a confirmed zero. `fulfillable_quantity is None` makes the whole
-    result `None` (the metric's anchor value is unknown). A missing
-    individual inbound component is excluded from the sum (matching
-    `inventory_read.py`'s own existing `_inbound_total` precedent for
-    the *display* total) but always sets `incomplete_inputs=True`, so
-    the caller must attach an incomplete-input warning even though a
-    numeric value is still returned from the components that were
-    present."""
-    if fulfillable_quantity is None:
+    Strict all-or-nothing null policy, per review: the pinned FBA
+    Inventory contract gives no guarantee that an absent quantity means
+    zero — every one of `InventoryDetails`'s sub-fields (including the
+    three inbound ones) is independently optional with no documented
+    default (`inventory_models.py`'s own module docstring: no field in
+    this schema documents a minimum/maximum, and `InventoryDetails`
+    itself is absent entirely unless `details=true` was requested — an
+    absent sub-field is "Amazon did not say," never "Amazon said
+    zero"). `potential_units` is therefore `None` whenever **any** of
+    the four required inputs is `None` — never a partial sum computed
+    from only the components that happen to be present. Only when all
+    four are known does this return a real, confirmed total; a real
+    known `0` still contributes as `0` (a known zero is not "missing").
+    `incomplete_inputs=True` is the caller's evidence reason for an
+    incomplete-input warning (e.g. `incomplete_inbound_quantity_inputs`)
+    whenever the result is `None` for this cause."""
+    parts = [fulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity, inbound_receiving_quantity]
+    if any(p is None for p in parts):
         return PotentialUnitsResult(potential_units=None, incomplete_inputs=True)
-    inbound_parts = [inbound_working_quantity, inbound_shipped_quantity, inbound_receiving_quantity]
-    incomplete = any(p is None for p in inbound_parts)
-    total = fulfillable_quantity + sum(p for p in inbound_parts if p is not None)
-    return PotentialUnitsResult(potential_units=total, incomplete_inputs=incomplete)
+    return PotentialUnitsResult(potential_units=sum(parts), incomplete_inputs=False)
+
+
+def potential_days_of_cover(potential_units_value: int | None, units_per_day: float | None) -> float | None:
+    """Exactly `fulfillable_days_of_cover`'s own null/zero policy,
+    applied to the inbound-adjusted `potential_units` total instead of
+    fulfillable alone — `None` when either input is unavailable
+    (including when `potential_units` is itself `None` because an
+    inbound component was unknown, per `potential_units`'s own strict
+    all-or-nothing policy) or when `units_per_day == 0` (never rendered
+    as infinite). Still never "available stock" — see `potential_units`'s
+    own docstring for why inbound units are not yet fulfillable."""
+    if potential_units_value is None or units_per_day is None:
+        return None
+    if units_per_day == 0:
+        return None
+    return potential_units_value / units_per_day
 
 
 def freshness_state(

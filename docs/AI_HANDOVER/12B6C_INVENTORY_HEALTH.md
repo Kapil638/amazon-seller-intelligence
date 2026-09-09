@@ -34,14 +34,79 @@ with three material corrections, applied before any code was written:
    demand.
 3. **Inventory freshness source.** `amazon_seller_inventory.
    amazon_last_updated_time` is Amazon's own, optional, sometimes-empty
-   field — it must never be the primary freshness clock. Freshness now
-   comes from ASI's own provenance: the row's `last_ingestion_run_id`
-   joined to that run's `completed_at` (falling back to the row's own
-   `last_seen_at`, which is set in the identical successful-reconcile
-   transaction as `last_ingestion_run_id` — see
-   `AmazonSellerInventoryRepository._upsert`). `amazon_last_updated_time`
-   is still exposed in every response, separately labeled, but never
-   drives `freshness_state`.
+   field — it must never be the primary freshness clock. Freshness
+   comes exclusively from ASI's own provenance: the row's
+   `last_ingestion_run_id` joined to that run's `completed_at`, gated
+   on the run being recorded `status == "succeeded"`.
+   `amazon_last_updated_time` is still exposed in every response,
+   separately labeled, but never drives `freshness_state`. See §0b for
+   the second review pass that removed an earlier `last_seen_at`
+   fallback here.
+
+## 0b. Second review pass (post-implementation, pre-push)
+
+A conditional-approval review of the first implementation required
+three further corrections, applied before push:
+
+1. **`potential_units` null policy tightened to strict all-or-nothing.**
+   The first implementation excluded a missing individual inbound
+   component from the sum (matching `inventory_read.py`'s own
+   `_inbound_total` *display* precedent) while still returning a
+   partial numeric total alongside an `incomplete_inputs` flag. This
+   was **rejected**: the pinned FBA Inventory contract gives no
+   guarantee that an absent quantity means zero (every `InventoryDetails`
+   sub-field, including all three inbound ones, is independently
+   optional with no documented default —
+   `inventory_models.py`'s own module docstring). `potential_units` is
+   now `None` whenever **any** of the four required inputs
+   (`fulfillable_quantity`, `inbound_working_quantity`,
+   `inbound_shipped_quantity`, `inbound_receiving_quantity`) is `None`
+   — never a partial sum. Only when all four are known does it return
+   a real, confirmed total; four known zeros still sum to a real,
+   confirmed `0`, not `None` — a known zero is not "missing". A new
+   paired metric, `potential_days_of_cover = potential_units /
+   units_per_covered_day`, carries the identical null/zero-is-never-
+   infinite policy `fulfillable_days_of_cover` already has.
+2. **Inventory freshness `last_seen_at` fallback removed, not merely
+   documented.** The first implementation fell back to the row's own
+   `last_seen_at` when `last_ingestion_run_id` was unset or its run
+   could not be found. Proven by direct code inspection (not assumed):
+   `AmazonSellerInventoryRepository._upsert` sets `last_ingestion_
+   run_id` and `last_seen_at` together, unconditionally, on every
+   call; its only caller is `reconcile_snapshot`, called from exactly
+   one place — `AmazonInventoryIngestionService._reconcile`
+   (`inventory_ingestion.py`) — where `AmazonIngestionRunRepository.
+   complete_inventory_run(status="succeeded", ...)` (which sets
+   `completed_at=func.now()`) and `reconcile_snapshot(...)` both
+   execute inside the **same** `with session_scope() as session:`
+   block, which (`database.py`) commits exactly once at the end of
+   that block and rolls back everything in it on any exception. So
+   whenever `last_seen_at` changes, that same atomic commit already
+   guarantees `last_ingestion_run_id` points at a run recorded
+   `status == "succeeded"` with a non-null `completed_at` — a separate
+   fallback read of `last_seen_at` could never add real information,
+   only a false sense of a second source. The fallback was removed
+   entirely: a row whose `last_ingestion_run_id` is unset, whose
+   referenced run cannot be found, is not recorded `succeeded`, or has
+   no `completed_at` now reports `inventory_observed_at: null`
+   (folding into the existing `stale_inventory` handling for a `None`
+   timestamp — no fifth freshness state was introduced).
+3. **Cross-participation fact/run join guard made explicit, not
+   assumed.** `AmazonSalesAndTrafficProductFact`'s composite foreign
+   key already ties `(last_ingestion_run_id, marketplace_participation_
+   id)` to a matching `amazon_ingestion_runs` row on PostgreSQL — but
+   this test suite's SQLite engine never enables `PRAGMA
+   foreign_keys=ON`, so that constraint was declared but unverified in
+   every test run to that point.
+   `AmazonSalesTrafficProductFactRepository.get_eligible_sku_facts`'s
+   join now also explicitly requires
+   `AmazonIngestionRun.marketplace_participation_id ==
+   AmazonSalesAndTrafficProductFact.marketplace_participation_id` —
+   correct on every backend this code runs against, not only the one
+   where the database happens to enforce it. A dedicated test
+   constructs the mismatched pairing directly (bypassing the
+   repository's own `upsert()`, which would never produce it through
+   its normal API) and proves the read service still excludes it.
 
 ## 1. User story
 
@@ -113,10 +178,17 @@ fulfillable_days_of_cover =
 
 potential_units =
     fulfillable_quantity + inbound_working + inbound_shipped + inbound_receiving
-    (None if fulfillable_quantity is None; a missing individual inbound
-     component is excluded from the sum, never treated as a confirmed
-     zero — incomplete_inputs=True flags this even when a numeric value
-     is still returned)
+    (strict all-or-nothing: None whenever ANY of the four required
+     inputs is None — never a partial sum from only the components
+     that happened to be present; four known zeros still sum to a
+     real, confirmed 0. incomplete_inputs=True is the evidence reason
+     whenever the result is None for this cause.)
+
+potential_days_of_cover =
+    potential_units / units_per_covered_day
+    (identical null/zero-is-never-infinite policy as
+     fulfillable_days_of_cover — also None whenever potential_units
+     itself is None)
 ```
 
 `fulfillable_days_of_cover` never includes reserved, inbound,
