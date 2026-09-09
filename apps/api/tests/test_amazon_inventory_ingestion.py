@@ -598,6 +598,55 @@ async def test_retry_budget_exhausted_on_transient_request_failed_preserves_its_
     assert run.failure_class == "transient_request_retry_exhausted"
 
 
+# --- PR #26 gate: deterministic failures get a tighter retry budget ---------
+# than transient/throttling failures — retrying identical unparseable data
+# cannot succeed differently, so it should not consume the same 5-attempt
+# budget a genuine 429 or dropped connection legitimately needs.
+
+
+@pytest.mark.asyncio
+async def test_malformed_page_exhausts_before_the_general_retry_budget() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    with session_scope() as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        run.retry_count = 1  # this call is attempt_number 2
+    settings = _test_settings(inventory_sync_max_attempts=5, inventory_sync_deterministic_failure_max_attempts=2)
+    client = _FakeInventoryClient(pages=[SpApiParseFailedError("bad json")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_page_retry_exhausted"
+    run = _get_run(run_id)
+    assert run.status == "failed"
+    assert run.failure_class == "malformed_page_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_throttled_failure_keeps_the_full_retry_budget_unlike_malformed_page() -> None:
+    """Same attempt number, same settings as the test above — proves the
+    tighter cap applies only to a deterministic failure class, never to a
+    genuinely transient one that deserves the full budget."""
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    with session_scope() as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        run.retry_count = 1  # this call is attempt_number 2
+    settings = _test_settings(inventory_sync_max_attempts=5, inventory_sync_deterministic_failure_max_attempts=2)
+    client = _FakeInventoryClient(pages=[SpApiRateLimitedError("slow down")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "waiting_to_retry"
+    run = _get_run(run_id)
+    assert run.status == "waiting_to_retry"
+    assert run.failure_class == "throttled"
+
+
 @pytest.mark.asyncio
 async def test_error_envelope_with_known_authorization_code_is_terminal_not_retried() -> None:
     scope = _seed_scope()

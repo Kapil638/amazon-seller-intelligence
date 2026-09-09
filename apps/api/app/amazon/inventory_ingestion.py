@@ -112,6 +112,19 @@ from app.persistence.repositories import (
 # attempt fixes on its own.
 RETRYABLE_INVENTORY_FAILURE_CLASSES = frozenset({"throttled", "transient_request_failed", "malformed_page"})
 
+# PR #26 gate — "deterministic schema-validation failures do not consume
+# the full retry budget": a real page that failed Pydantic validation
+# will fail identically on every retry against the same unparseable
+# response (proven directly this session — 5 attempts against
+# `malformed_page` all failed on the exact same three summary indices,
+# because Amazon returned the exact same response each time). Retrying it
+# to the same ceiling as a genuine 429 (throttled) or a dropped connection
+# (transient_request_failed) — both of which really can succeed on a
+# later attempt — wastes the run's full retry budget and delays a
+# terminal, actionable result for no benefit. `throttled` and
+# `transient_request_failed` are deliberately absent from this set.
+DETERMINISTIC_INVENTORY_FAILURE_CLASSES = frozenset({"malformed_page"})
+
 # fix/inventory-empty-response-and-failure-classification — a run that
 # exhausts its retry budget while its most recent attempt's own
 # `failure_class` was one of these keys is terminalized with the mapped,
@@ -468,6 +481,8 @@ class AmazonInventoryIngestionService:
             (datetime.now(UTC) - ensure_utc(first_started_at)).total_seconds() if first_started_at is not None else 0.0
         )
         max_attempts = cfg.inventory_sync_max_attempts
+        if traversal.failure_class in DETERMINISTIC_INVENTORY_FAILURE_CLASSES:
+            max_attempts = min(max_attempts, cfg.inventory_sync_deterministic_failure_max_attempts)
         max_total_retry_seconds = cfg.inventory_sync_max_total_retry_seconds
         budget_exhausted = attempt_number >= max_attempts or elapsed_seconds >= max_total_retry_seconds
         if budget_exhausted:
