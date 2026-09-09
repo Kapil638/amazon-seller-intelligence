@@ -59,6 +59,22 @@ vi.mock("@/lib/api", () => ({
   fetchWorkerHealth: vi.fn().mockResolvedValue({
     workers: { inventory: { available: true, last_heartbeat_at: "2026-08-29T00:00:00.000Z" } },
   }),
+  // 12B.6C — SellerInventoryHealth is mounted as a child section of
+  // SellerInventory whenever a participation is selected; every test in
+  // this file gets a default empty-but-successful response unless it
+  // overrides these explicitly.
+  fetchInventoryHealthSummary: vi.fn().mockResolvedValue({
+    marketplace_participation_id: "p1",
+    total: 0,
+    counts_by_inventory_state: {},
+    counts_by_demand_eligibility: {},
+    formula_version: "test",
+    thresholds: { low_coverage_days_threshold: 14, high_coverage_days_threshold: 90, min_eligible_window_days: 7, preferred_window_days: 30 },
+    inventory_sync: { status: "never_synchronized", last_successful_synchronized_at: null },
+    sales_traffic_sync: { status: "never_synchronized", last_successful_synchronized_at: null },
+  }),
+  fetchInventoryHealth: vi.fn().mockResolvedValue({ items: [], total: 0, offset: 0, limit: 25, formula_version: "test", thresholds: { low_coverage_days_threshold: 14, high_coverage_days_threshold: 90, min_eligible_window_days: 7, preferred_window_days: 30 } }),
+  fetchInventoryHealthEvidence: vi.fn(),
 }));
 
 import { SellerInventory } from "@/components/seller-inventory";

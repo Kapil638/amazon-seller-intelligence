@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Loader2, RefreshCw } from "lucide-react";
 
+import { SellerInventoryHealth } from "@/components/seller-inventory-health";
 import { SellerListingsMarketplaceSelector } from "@/components/seller-listings-marketplace-selector";
 import {
   AmazonConnectionError,
@@ -465,6 +466,7 @@ export function SellerInventory() {
           </div>
         )}
       </section>
+      {participationId && <SellerInventoryHealth participationId={participationId} />}
     </div>
   );
 }
