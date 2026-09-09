@@ -67,6 +67,12 @@ vi.mock("@/lib/api", () => ({
   fetchSalesTrafficProducts: vi.fn(),
   fetchSalesTrafficSummary: vi.fn(),
   triggerSalesTrafficSync: vi.fn(),
+  // fix/inventory-empty-response-and-failure-classification — this
+  // component now also polls worker health unconditionally (hooks run
+  // regardless of this file's own early-return connection-error path).
+  fetchWorkerHealth: vi.fn().mockResolvedValue({
+    workers: { sales_and_traffic_report: { available: true, last_heartbeat_at: "2026-08-29T00:00:00.000Z" } },
+  }),
 }));
 
 import { SellerSalesTraffic } from "@/components/seller-sales-traffic";

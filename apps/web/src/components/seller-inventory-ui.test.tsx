@@ -1,5 +1,5 @@
 import * as React from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("next/link", () => ({
@@ -52,6 +52,13 @@ vi.mock("@/lib/api", () => ({
   fetchInventorySummary: vi.fn(),
   fetchInventory: vi.fn(),
   triggerInventorySync: vi.fn(),
+  // fix/inventory-empty-response-and-failure-classification — every UI
+  // test in this file assumes an already-healthy worker unless a test
+  // explicitly overrides this default, matching every test's own
+  // pre-existing expectation that the Sync button starts out enabled.
+  fetchWorkerHealth: vi.fn().mockResolvedValue({
+    workers: { inventory: { available: true, last_heartbeat_at: "2026-08-29T00:00:00.000Z" } },
+  }),
 }));
 
 import { SellerInventory } from "@/components/seller-inventory";
@@ -59,6 +66,7 @@ import {
   fetchAmazonConnection,
   fetchInventory,
   fetchInventorySummary,
+  fetchWorkerHealth,
   triggerInventorySync,
 } from "@/lib/api";
 import type {
@@ -315,5 +323,141 @@ describe("SellerInventory", () => {
     await waitFor(() =>
       expect(screen.getByText(/No Amazon marketplace is connected yet/i)).toBeInTheDocument(),
     );
+  });
+});
+
+describe("SellerInventory — worker readiness (fix/inventory-empty-response-and-failure-classification)", () => {
+  // The live defect this closes: Sync was clickable (and rejected with
+  // worker_unavailable) during the brief window before a freshly-
+  // started worker publishes its first heartbeat, and the resulting
+  // error banner never cleared itself once the worker became healthy —
+  // nothing on the page was polling worker health at all.
+  //
+  // Fake timers are engaged for the *entire* test (not switched on
+  // mid-test): the worker-health hook schedules its own `setTimeout`
+  // poll loop from the moment the component mounts, and a `setTimeout`
+  // already scheduled under real timers is never reachable by a later
+  // `vi.advanceTimersByTimeAsync` call. `@testing-library/react`'s own
+  // `waitFor` polls with real timers, so it cannot be used here either
+  // — `flush()` below drives fake-timer/microtask settling directly.
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function flush() {
+    // Several small fake-timer advances (rather than one large one)
+    // give every pending microtask/effect chain — connection load ->
+    // participation resolution -> summary load -> worker-health's own
+    // first check — a chance to settle in order, exactly as they would
+    // in real use, without depending on real wall-clock time at all.
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+  }
+
+  it("disables Sync and shows 'Starting worker…' before the first heartbeat appears", async () => {
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: false, last_heartbeat_at: null } },
+    });
+    render(<SellerInventory />);
+    await flush();
+
+    expect(screen.getByText("Not yet synchronized")).toBeInTheDocument();
+    expect(screen.getByText(/Starting worker…/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Sync FBA Inventory/i })).toBeDisabled();
+  });
+
+  it("automatically enables Sync as soon as a fresh heartbeat appears — no page refresh required", async () => {
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: false, last_heartbeat_at: null } },
+    });
+    render(<SellerInventory />);
+    await flush();
+    expect(screen.getByRole("button", { name: /Sync FBA Inventory/i })).toBeDisabled();
+
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: true, last_heartbeat_at: "2026-09-09T00:00:05.000Z" } },
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000); // the hook's own default poll interval
+    });
+
+    expect(screen.getByRole("button", { name: /Sync FBA Inventory/i })).not.toBeDisabled();
+    expect(screen.queryByText(/Starting worker…/i)).not.toBeInTheDocument();
+  });
+
+  it("shows 'Worker unavailable' once the startup-grace window expires with no heartbeat", async () => {
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: false, last_heartbeat_at: null } },
+    });
+    render(<SellerInventory />);
+    await flush();
+    expect(screen.getByText(/Starting worker…/i)).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60000); // the hook's own default grace window
+    });
+
+    expect(screen.getByText(/^Worker unavailable$/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Sync FBA Inventory/i })).toBeDisabled();
+  });
+
+  it("clears a stale worker_unavailable banner automatically once the worker recovers, without a manual refresh", async () => {
+    // The exact real-world race this defends: the health poll's own
+    // last answer was "available" (button briefly enabled), a click
+    // landed and the backend rejected it as worker_unavailable (the
+    // backend's own check ran a moment later, catching a state the
+    // frontend hadn't observed yet) — the stale error must not survive
+    // the worker's very next recovery.
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: true, last_heartbeat_at: "2026-09-09T00:00:00.000Z" } },
+    });
+    vi.mocked(triggerInventorySync).mockResolvedValue({
+      reason: "worker_unavailable",
+      message: "The Inventory sync worker is not running, so this job would never be picked up.",
+      job: null,
+    });
+    render(<SellerInventory />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Sync FBA Inventory/i }));
+    });
+    await flush();
+    expect(screen.getByText(/worker is not running/i)).toBeInTheDocument();
+
+    // Next poll tick still confirms availability (no state change) —
+    // the banner must not clear on its own without the hook ever having
+    // observed a transition; this proves the effect is keyed on the
+    // hook's own state, not merely on the passage of time.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText(/worker is not running/i)).toBeInTheDocument();
+  });
+
+  it("a historical failed run is displayed independently from current worker health — a healthy worker still shows the prior failure", async () => {
+    vi.mocked(fetchWorkerHealth).mockResolvedValue({
+      workers: { inventory: { available: true, last_heartbeat_at: "2026-09-09T00:00:00.000Z" } },
+    });
+    vi.mocked(fetchInventorySummary).mockResolvedValue(
+      summary({ sync: sync({ status: "failed", failure_class: "malformed_page_retry_exhausted" }) }),
+    );
+    vi.mocked(fetchInventory).mockResolvedValue(collection());
+    render(<SellerInventory />);
+    await flush();
+
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
+    // The worker itself is healthy — Sync must remain available despite
+    // the historical failure being shown truthfully above it.
+    expect(screen.getByRole("button", { name: /Sync FBA Inventory/i })).not.toBeDisabled();
+    expect(screen.queryByText(/^Worker unavailable$/i)).not.toBeInTheDocument();
   });
 });

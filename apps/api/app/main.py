@@ -53,8 +53,18 @@ async def validation_exception_handler(
     return JSONResponse(status_code=400, content={"detail": "; ".join(messages)})
 
 
+# fix/inventory-empty-response-and-failure-classification — plain `def`,
+# not `async def`, on both routes below: each does a blocking sync-
+# SQLAlchemy database call, and this is exactly the route the
+# supervisor's own readiness threads poll every 0.5s from up to 4
+# concurrent threads during startup — with `async def` (the event loop
+# stalling on each blocking call in turn) this measurably serialized
+# every other concurrent request on the same backend process, including
+# a live 30s client timeout on an unrelated sync-trigger route. Plain
+# `def` lets Starlette dispatch each call to its worker thread pool,
+# matching every read-only route in this codebase already.
 @app.get("/health")
-async def health() -> dict[str, str]:
+def health() -> dict[str, str]:
     payload = {"status": "ok"}
     from app.persistence.database import persistence_enabled
 
@@ -63,7 +73,7 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/health/workers")
-async def health_workers() -> dict[str, dict[str, dict[str, object]]]:
+def health_workers() -> dict[str, dict[str, dict[str, object]]]:
     """fix/supervise-ingestion-runtime — a sanitized, per-worker-type
     liveness surface built directly on the same `amazon_worker_
     heartbeats` table and `WorkerHeartbeatRepository.check_availability`

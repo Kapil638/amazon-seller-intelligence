@@ -32,6 +32,7 @@ import type {
   SalesTrafficProductRow,
   SalesTrafficSummary,
 } from "@/lib/types";
+import { useWorkerAvailability } from "@/lib/use-worker-availability";
 import { cn } from "@/lib/utils";
 
 type AddressableMarketplace = AmazonSellerMarketplace & { id: string };
@@ -114,6 +115,16 @@ export function SellerSalesTraffic() {
   const [triggering, setTriggering] = useState(false);
   const [triggerMessage, setTriggerMessage] = useState<string | null>(null);
   const [queuedPollGaveUp, setQueuedPollGaveUp] = useState(false);
+
+  // Current worker availability — entirely independent of `summary.sync`
+  // (the *latest run's* result). A historical failed run must never be
+  // read as "the worker is unhealthy".
+  const workerAvailability = useWorkerAvailability("sales_and_traffic_report");
+  // The stale-banner defect this fix closes: a `worker_unavailable`
+  // trigger response must not linger once the worker actually recovers.
+  useEffect(() => {
+    if (workerAvailability.state === "available") setTriggerMessage(null);
+  }, [workerAvailability.state]);
 
   // Guards against a rapid marketplace switch racing an in-flight fetch
   // for the *previous* selection — a response for a since-abandoned
@@ -372,19 +383,32 @@ export function SellerSalesTraffic() {
             </div>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={handleSync}
-          disabled={triggering || salesTrafficSyncShowsActiveSpinner(syncStatus)}
-          className="inline-flex h-10 items-center gap-2 rounded-md border border-input bg-surface px-4 text-sm font-medium transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {salesTrafficSyncShowsActiveSpinner(syncStatus) || triggering ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3.5 w-3.5" />
+        <div className="flex flex-col items-end gap-1">
+          <button
+            type="button"
+            onClick={handleSync}
+            disabled={
+              triggering || salesTrafficSyncShowsActiveSpinner(syncStatus) || workerAvailability.state !== "available"
+            }
+            className="inline-flex h-10 items-center gap-2 rounded-md border border-input bg-surface px-4 text-sm font-medium transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {salesTrafficSyncShowsActiveSpinner(syncStatus) || triggering ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Sync Sales & Traffic
+          </button>
+          {workerAvailability.state === "starting" && (
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Starting worker…
+            </span>
           )}
-          Sync Sales & Traffic
-        </button>
+          {workerAvailability.state === "unavailable" && (
+            <span className="text-xs text-destructive">Worker unavailable</span>
+          )}
+        </div>
       </div>
 
       {/* Truthful progress strip. A "queued" job never shows the spinner

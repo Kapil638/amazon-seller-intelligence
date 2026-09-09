@@ -90,6 +90,22 @@ RETRYABLE_LISTINGS_FAILURE_CLASSES = frozenset(
     {"throttled", "transient_request_failed", "malformed_page", "record_count_inconsistent"}
 )
 
+# fix/inventory-empty-response-and-failure-classification — same fix as
+# Inventory's own copy of this bug, applied here too: a run that
+# exhausts its retry budget while its most recent attempt's own
+# `failure_class` was one of these keys is terminalized with the mapped,
+# specific reason instead of a blanket "rate_limited" (previously true
+# of every one of `RETRYABLE_LISTINGS_FAILURE_CLASSES`, even the three
+# that were never an actual 429). `throttled` is deliberately absent —
+# exhausting the budget on genuine repeated throttling *is* correctly
+# `rate_limited`. Mirrors `orders_ingestion.py`'s own
+# `_EXHAUSTION_REASON_BY_FAILURE_CLASS` precedent exactly.
+_EXHAUSTION_REASON_BY_FAILURE_CLASS: dict[str, str] = {
+    "malformed_page": "malformed_page_retry_exhausted",
+    "transient_request_failed": "transient_request_retry_exhausted",
+    "record_count_inconsistent": "record_count_retry_exhausted",
+}
+
 logger = logging.getLogger(__name__)
 
 # Amazon's documented hard ceiling: at most 1000 items are retrievable
@@ -479,12 +495,15 @@ class AmazonListingsIngestionService:
         retries a non-retryable failure class (see
         `RETRYABLE_LISTINGS_FAILURE_CLASSES`). A retryable failure is
         rescheduled (`waiting_to_retry`) unless the attempt or elapsed-time
-        budget is exhausted, in which case it becomes the sanitized
-        terminal failure class `rate_limited` — deliberately that name
-        regardless of which retryable class triggered the *most recent*
-        attempt, since from the caller's perspective the meaningful fact
-        is "this job could not complete within its retry budget", not
-        which specific attempt happened to fail last.
+        budget is exhausted, in which case it becomes a terminal failure
+        whose reason preserves the *real* cause via
+        `_EXHAUSTION_REASON_BY_FAILURE_CLASS` (fix/inventory-empty-
+        response-and-failure-classification — previously always
+        `rate_limited` regardless of which retryable class actually
+        caused every attempt, which was actively misleading for anything
+        that was never really throttling). `throttled` is the one class
+        deliberately absent from that mapping: exhausting the budget on
+        genuine repeated throttling *is* correctly `rate_limited`.
         """
         if traversal.failure_class not in RETRYABLE_LISTINGS_FAILURE_CLASSES:
             self._fail_claimed_run(
@@ -519,10 +538,11 @@ class AmazonListingsIngestionService:
             or elapsed_seconds >= cfg.listings_sync_max_total_retry_seconds
         )
         if budget_exhausted:
+            exhaustion_reason = _EXHAUSTION_REASON_BY_FAILURE_CLASS.get(traversal.failure_class, "rate_limited")
             self._fail_claimed_run(
                 organization_id=organization_id,
                 run=claimed,
-                reason="rate_limited",
+                reason=exhaustion_reason,
                 pages_fetched=traversal.pages_fetched,
                 records_received=traversal.records_received,
                 reported_total_results=traversal.reported_total_results,
@@ -532,7 +552,7 @@ class AmazonListingsIngestionService:
                 succeeded=False,
                 seller_account_id=claimed.seller_account_id,
                 marketplace_participation_id=marketplace_participation_id,
-                reason="rate_limited",
+                reason=exhaustion_reason,
                 ingestion_run_id=claimed.run_id,
                 pages_fetched=traversal.pages_fetched,
                 records_received=traversal.records_received,

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("next/link", () => ({
@@ -73,6 +73,13 @@ vi.mock("@/lib/api", () => ({
   fetchListings: vi.fn(),
   fetchListingDetail: vi.fn(),
   triggerListingsSync: vi.fn(),
+  // fix/inventory-empty-response-and-failure-classification — every UI
+  // test in this file assumes an already-healthy worker unless a test
+  // explicitly overrides this default, matching every test's own
+  // pre-existing expectation that the Sync button starts out enabled.
+  fetchWorkerHealth: vi.fn().mockResolvedValue({
+    workers: { listings: { available: true, last_heartbeat_at: "2026-08-29T00:00:00.000Z" } },
+  }),
 }));
 
 import { LISTINGS_SYNC_STALE_QUEUE_THRESHOLD_MS, SellerListings } from "@/components/seller-listings";
@@ -81,6 +88,7 @@ import {
   fetchListingDetail,
   fetchListings,
   fetchListingsSummary,
+  fetchWorkerHealth,
   ListingsApiError,
   ListingsSyncError,
   triggerListingsSync,
@@ -1453,5 +1461,41 @@ describe("Sync listings action", () => {
     expect(screen.getByText("SYN-SKU-1")).toBeInTheDocument();
     // Never fabricated from browser state alone.
     expect(triggerListingsSync).not.toHaveBeenCalled();
+  });
+
+  // fix/inventory-empty-response-and-failure-classification — proves the
+  // shared `useWorkerAvailability` hook (already thoroughly tested on
+  // its own, and integration-tested for Inventory) wires up identically
+  // here despite Listings' different component structure (a dedicated
+  // `SellerListingsSyncStrip` child, not an inline button).
+  it("disables Sync before the Listings worker's first heartbeat, then enables it automatically once one appears", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchAmazonConnection).mockResolvedValue(baseOverview);
+      vi.mocked(fetchListingsSummary).mockResolvedValue(richSummary);
+      vi.mocked(fetchListings).mockResolvedValue(richCollection);
+      vi.mocked(fetchWorkerHealth).mockResolvedValue({
+        workers: { listings: { available: false, last_heartbeat_at: null } },
+      });
+      setup(`participation=${US_ID}`);
+      for (let i = 0; i < 6; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+      }
+
+      expect(screen.getByRole("button", { name: /^sync listings$/i })).toBeDisabled();
+
+      vi.mocked(fetchWorkerHealth).mockResolvedValue({
+        workers: { listings: { available: true, last_heartbeat_at: "2026-09-09T00:00:05.000Z" } },
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+
+      expect(screen.getByRole("button", { name: /^sync listings$/i })).not.toBeDisabled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

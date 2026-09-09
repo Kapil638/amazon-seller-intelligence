@@ -87,7 +87,20 @@ def _status_for_trigger_reason(reason: str) -> int:
     response_model=InventorySyncTriggerResponse,
     status_code=202,
 )
-async def sync_inventory(
+# fix/inventory-empty-response-and-failure-classification — plain `def`,
+# not `async def`, is deliberate: `service.trigger()` below is a
+# synchronous, blocking database call (this project's engine is sync
+# SQLAlchemy throughout). An `async def` route calling blocking code
+# directly runs it on the single shared event loop thread, stalling
+# every other concurrent request for however long that call takes —
+# the proven root cause of a live 30-second client timeout on this
+# exact route despite the server having already committed the job.
+# Starlette dispatches a plain `def` route to its bounded worker thread
+# pool automatically; every read-only route in this codebase already
+# relies on that (0 `async def` routes in amazon_inventory.py, etc.) —
+# this brings the one route in each sync domain that didn't follow it
+# into line with that existing, correct convention.
+def sync_inventory(
     marketplace_participation_id: UUID,
     service: AmazonInventorySyncTriggerService = Depends(get_amazon_inventory_sync_service),
 ) -> InventorySyncTriggerResponse:

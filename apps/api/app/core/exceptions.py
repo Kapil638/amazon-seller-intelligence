@@ -297,6 +297,21 @@ class SpApiParseFailedError(Exception):
         super().__init__(message)
 
 
+class SpApiErrorEnvelopeError(Exception):
+    """A syntactically well-formed, HTTP-successful response that carries
+    Amazon's own documented error envelope (`errors: [{code, message,
+    details}, ...]`) instead of (or alongside) `payload` — distinct from
+    `SpApiParseFailedError`, which is for a response that is genuinely
+    unparseable/undocumented. `code` is the first entry's Amazon-assigned
+    error code only — never `message`/`details`, which may echo
+    seller-identifying request parameters back and must never be logged
+    or surfaced."""
+
+    def __init__(self, code: str, message: str = "Amazon SP-API returned an error response.") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class AmazonListingsParticipationNotFoundError(Exception):
     """A marketplace participation could not be resolved for this request.
 

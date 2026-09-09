@@ -74,6 +74,7 @@ import type {
   InventorySortField,
   InventorySummary,
   InventorySyncTriggerResponse,
+  WorkerHealthResponse,
 } from "@/lib/types";
 
 export class ProductLookupError extends Error {
@@ -95,6 +96,24 @@ function apiBaseUrl(): string {
     );
   }
   return base.replace(/\/$/, "");
+}
+
+// fix/inventory-empty-response-and-failure-classification — bare
+// GET /health/workers (not under /api/v1/amazon: this is runtime
+// infrastructure health, not an Amazon domain route). Deliberately
+// returns `null` on any failure (network error, non-200, unparseable
+// body) rather than throwing — callers treat "could not determine
+// worker health" identically to "worker health unknown", never as a
+// fatal page-level error; this is a lightweight polling signal, not a
+// page dependency.
+export async function fetchWorkerHealth(): Promise<WorkerHealthResponse | null> {
+  try {
+    const response = await fetch(`${apiBaseUrl()}/health/workers`, { cache: "no-store" });
+    if (!response.ok) return null;
+    return (await response.json()) as WorkerHealthResponse;
+  } catch {
+    return null;
+  }
 }
 
 function formatDetail(body: ApiErrorBody | null): string {

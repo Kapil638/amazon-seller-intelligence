@@ -22,6 +22,7 @@ import {
   INVENTORY_SYNC_STATUS_LABEL,
 } from "@/lib/seller-inventory-view";
 import type { AmazonSellerMarketplace, InventoryCollectionItem, InventorySummary } from "@/lib/types";
+import { useWorkerAvailability } from "@/lib/use-worker-availability";
 import { cn } from "@/lib/utils";
 
 type AddressableMarketplace = AmazonSellerMarketplace & { id: string };
@@ -66,6 +67,19 @@ export function SellerInventory() {
   const [triggering, setTriggering] = useState(false);
   const [triggerMessage, setTriggerMessage] = useState<string | null>(null);
   const [queuedPollGaveUp, setQueuedPollGaveUp] = useState(false);
+
+  // Current worker availability — entirely independent of `summary.sync`
+  // (the *latest run's* result). A historical failed/timed_out run must
+  // never be read as "the worker is unhealthy"; this is the only source
+  // of truth for that.
+  const workerAvailability = useWorkerAvailability("inventory");
+
+  // The stale-banner defect this fix closes: a `worker_unavailable`
+  // trigger response must not linger once the worker actually recovers
+  // — no page refresh, no second manual click required.
+  useEffect(() => {
+    if (workerAvailability.state === "available") setTriggerMessage(null);
+  }, [workerAvailability.state]);
 
   // Guards against a rapid marketplace switch racing an in-flight fetch
   // for the *previous* selection — see SellerSalesTraffic's identical
@@ -260,19 +274,32 @@ export function SellerInventory() {
             })
           }
         />
-        <button
-          type="button"
-          onClick={handleSync}
-          disabled={triggering || inventorySyncShowsActiveSpinner(syncStatus)}
-          className="inline-flex h-10 items-center gap-2 rounded-md border border-input bg-surface px-4 text-sm font-medium transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {inventorySyncShowsActiveSpinner(syncStatus) || triggering ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3.5 w-3.5" />
+        <div className="flex flex-col items-end gap-1">
+          <button
+            type="button"
+            onClick={handleSync}
+            disabled={
+              triggering || inventorySyncShowsActiveSpinner(syncStatus) || workerAvailability.state !== "available"
+            }
+            className="inline-flex h-10 items-center gap-2 rounded-md border border-input bg-surface px-4 text-sm font-medium transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {inventorySyncShowsActiveSpinner(syncStatus) || triggering ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Sync FBA Inventory
+          </button>
+          {workerAvailability.state === "starting" && (
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Starting worker…
+            </span>
           )}
-          Sync FBA Inventory
-        </button>
+          {workerAvailability.state === "unavailable" && (
+            <span className="text-xs text-destructive">Worker unavailable</span>
+          )}
+        </div>
       </div>
 
       {/* Persistent, always-visible FBA-only disclosure — this is a

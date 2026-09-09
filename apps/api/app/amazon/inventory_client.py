@@ -69,6 +69,7 @@ from app.amazon.lwa import LwaClient
 from app.core.exceptions import (
     SpApiAuthenticationError,
     SpApiConfigurationError,
+    SpApiErrorEnvelopeError,
     SpApiInvalidRequestError,
     SpApiParseFailedError,
     SpApiRateLimitedError,
@@ -309,16 +310,61 @@ class AmazonSpApiInventoryClient:
         raise SpApiInvalidRequestError(f"Amazon SP-API inventory request was rejected (status={status}).")
 
     def _parse_response(self, response: httpx.Response) -> GetInventorySummariesResponse:
+        """Classifies a syntactically-successful (HTTP 200) response body
+        into one of several distinct, sanitized-loggable shapes — never
+        assumes a `payload`-absent response means empty inventory (the
+        pinned contract's own documented shape for zero inventory is
+        `payload` *present* with `inventorySummaries: []`, not `payload`
+        absent — see `GetInventorySummariesResult`'s docstring). Every
+        `logger.warning` below logs structural facts only (which key was
+        absent/null/wrong-typed, an error's `code`, a Pydantic error's
+        `loc`/`type`) — never response body content, seller identifiers,
+        SKUs, quantities, or a Pydantic error's own `msg`/`input` (both
+        can echo the actual invalid value back)."""
         try:
             body = response.json()
         except ValueError:
+            logger.warning("SP-API inventory response was not valid JSON")
             raise SpApiParseFailedError("Amazon SP-API inventory response was not JSON.") from None
+
         try:
             parsed = GetInventorySummariesResponse.model_validate(body)
-        except ValidationError:
+        except ValidationError as exc:
+            # fix/inventory-empty-response-and-failure-classification —
+            # `"payload" in body` alone cannot distinguish "payload is
+            # literally null/wrong-type" from "payload is a well-formed
+            # dict but some field *nested* inside it (one of N
+            # InventorySummary entries, Granularity, ...) failed
+            # validation" — both raise the identical ValidationError.
+            # `loc`/`type` from Pydantic's own structured error list
+            # gives the exact field path and failure kind, sanitized:
+            # never `msg`/`input`, either of which can echo the actual
+            # invalid value.
+            error_paths = [".".join(str(p) for p in err["loc"]) for err in exc.errors()]
+            error_types = [err["type"] for err in exc.errors()]
+            if not isinstance(body, dict):
+                shape = "wrong_top_level_type"
+            elif "payload" not in body:
+                shape = "unparseable"
+            elif len(error_paths) == 1 and error_paths[0] == "payload":
+                shape = "payload_null_or_wrong_type"
+            else:
+                shape = "payload_present_nested_validation_failed"
+            logger.warning(
+                "SP-API inventory response failed schema validation shape=%s error_paths=%s error_types=%s",
+                shape, error_paths, error_types,
+            )
             raise SpApiParseFailedError("Amazon SP-API inventory payload was malformed.") from None
+
+        if parsed.errors:
+            code = parsed.errors[0].code
+            logger.warning("SP-API inventory response carried an Amazon error envelope code=%s", code)
+            raise SpApiErrorEnvelopeError(code)
+
         if parsed.payload is None:
+            logger.warning("SP-API inventory response carried no payload and no error envelope")
             raise SpApiParseFailedError("Amazon SP-API inventory response carried no payload.")
+
         return parsed
 
     def _to_page(

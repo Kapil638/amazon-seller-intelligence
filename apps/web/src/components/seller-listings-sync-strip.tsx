@@ -11,6 +11,7 @@ import {
   syncShowsActiveSpinner,
 } from "@/lib/seller-listings-view";
 import type { ListingsSyncEvidence } from "@/lib/types";
+import type { WorkerAvailabilityState } from "@/lib/use-worker-availability";
 
 export type SyncActionMessage = { kind: "success" | "info" | "error"; text: string };
 
@@ -50,6 +51,7 @@ export function SellerListingsSyncStrip({
   syncMessage,
   queuePollingSuspended,
   onRefreshStatus,
+  workerAvailability,
 }: {
   sync: ListingsSyncEvidence;
   onSync: () => void;
@@ -70,6 +72,11 @@ export function SellerListingsSyncStrip({
   // replaces automatic polling with a manual refresh action.
   queuePollingSuspended: boolean;
   onRefreshStatus: () => void;
+  // Current Listings worker availability, entirely independent of
+  // `sync` (the *latest run's* own historical result) — see
+  // `useWorkerAvailability`'s own docstring for why those must stay
+  // distinct concepts.
+  workerAvailability: WorkerAvailabilityState;
 }) {
   const latestFailed = sync.status === "failed" || sync.status === "timed_out" || sync.status === "partial";
   const hasLastKnownGood = Boolean(sync.last_successful_synchronized_at);
@@ -98,16 +105,27 @@ export function SellerListingsSyncStrip({
           <p className="text-xs text-muted-foreground">
             Last successful sync: {formatDateTime(sync.last_successful_synchronized_at)}
           </p>
-          <Button
-            type="button"
-            size="sm"
-            disabled={!canSync || disabled}
-            aria-busy={triggering}
-            onClick={onSync}
-          >
-            {showSpinner ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-            {buttonLabel}
-          </Button>
+          <div className="flex flex-col items-end gap-1">
+            <Button
+              type="button"
+              size="sm"
+              disabled={!canSync || disabled}
+              aria-busy={triggering}
+              onClick={onSync}
+            >
+              {showSpinner ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+              {buttonLabel}
+            </Button>
+            {workerAvailability === "starting" ? (
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Starting worker…
+              </span>
+            ) : null}
+            {workerAvailability === "unavailable" ? (
+              <span className="text-xs text-destructive">Worker unavailable</span>
+            ) : null}
+          </div>
         </div>
       </div>
       {isQueued && !queuePollingSuspended ? (

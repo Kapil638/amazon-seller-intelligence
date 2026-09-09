@@ -46,8 +46,9 @@ enums it does not control.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from app.amazon.listings_models import optional_not_null
 
@@ -61,6 +62,7 @@ __all__ = [
     "InventorySummary",
     "Granularity",
     "InventoryPagination",
+    "SpApiErrorEntry",
     "GetInventorySummariesResult",
     "InventoryPage",
     "InventoryPageProvenance",
@@ -72,6 +74,43 @@ __all__ = [
 RESEARCHING_QUANTITY_SHORT_TERM = "researchingQuantityInShortTerm"
 RESEARCHING_QUANTITY_MID_TERM = "researchingQuantityInMidTerm"
 RESEARCHING_QUANTITY_LONG_TERM = "researchingQuantityInLongTerm"
+
+
+def _last_updated_time_before_validate(value: object) -> object:
+    """`lastUpdatedTime` is documented optional (see module docstring) — an
+    absent key means this is never called at all. When the key IS present:
+    the pinned Swagger has no `nullable` keyword anywhere in this file, so
+    an explicit JSON `null` is rejected here, exactly like every other
+    `optional_not_null` field elsewhere in this module.
+
+    Live production traffic (2026-09-09, this seller's real FBA inventory)
+    showed `GetInventorySummaries` succeeding with HTTP 200 but 3 of 11
+    summary entries failing schema validation with Pydantic's
+    `datetime_from_date_parsing` error, deterministically and on every
+    retry. Reproducing Pydantic's own datetime coercion directly rules out
+    the two most obvious explanations: a bare `date`-only string (e.g.
+    `"2026-09-01"`) parses to midnight without error, and an explicit
+    `null` raises a *different* error type (`datetime_type`). The
+    remaining, most plausible cause for a string Pydantic cannot parse as
+    any date/time shape at all is an empty string — a sentinel some Amazon
+    report-style APIs use for "not recorded" on entries with no fulfillment
+    activity yet, rather than omitting the key. The raw value itself is
+    never available here to confirm directly (only the sanitized field
+    path/error type are ever logged — see `inventory_client.py`).
+
+    An empty/whitespace-only string is treated the same as an absent key
+    (`None`) so one missing timestamp no longer fails the entire page. Any
+    other non-empty, non-null value is left untouched for Pydantic's own
+    parser, so a genuinely malformed timestamp still fails loudly instead
+    of being silently swallowed."""
+    if value is None:
+        raise ValueError(
+            "the official schema documents this field as omittable, not nullable — "
+            "an explicit JSON null is not a documented value"
+        )
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
 
 
 class ReservedQuantity(BaseModel):
@@ -149,7 +188,9 @@ class InventorySummary(BaseModel):
     seller_sku: optional_not_null(str) = Field(default=None, alias="sellerSku")
     condition: optional_not_null(str) = None
     inventory_details: optional_not_null(InventoryDetails) = Field(default=None, alias="inventoryDetails")
-    last_updated_time: optional_not_null(datetime) = Field(default=None, alias="lastUpdatedTime")
+    last_updated_time: Annotated[datetime | None, BeforeValidator(_last_updated_time_before_validate)] = Field(
+        default=None, alias="lastUpdatedTime"
+    )
     product_name: optional_not_null(str) = Field(default=None, alias="productName")
     total_quantity: optional_not_null(int) = Field(default=None, alias="totalQuantity")
     stores: optional_not_null(list[str]) = None
@@ -173,6 +214,22 @@ class InventoryPagination(BaseModel):
     next_token: optional_not_null(str) = Field(default=None, alias="nextToken")
 
 
+class SpApiErrorEntry(BaseModel):
+    """One entry of the pinned schema's `Error` object — `code` is the
+    only required field; `message`/`details` are independently optional.
+    Structural only: this model exists so `inventory_client.py` can tell
+    whether Amazon explained an absent `payload` with its own error
+    object, never to surface `message`/`details` text anywhere (both may
+    describe the request in terms that echo seller-identifying
+    parameters) — callers of this model must only ever read `code`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    message: optional_not_null(str) = None
+    details: optional_not_null(str) = None
+
+
 class GetInventorySummariesResult(BaseModel):
     """Both fields are genuinely required by the pinned schema —
     `inventorySummaries` may still be an empty list (a seller with no
@@ -187,14 +244,23 @@ class GetInventorySummariesResult(BaseModel):
 
 class GetInventorySummariesResponse(BaseModel):
     """Top-level response envelope. `payload` is documented optional (an
-    error-only response omits it); `errors` likewise. This client treats a
-    response with no `payload` as a parse failure — see
-    `inventory_client.py`."""
+    error-only response omits it); `errors` likewise — both were
+    previously unparsed here (`errors` silently dropped by `extra=
+    "ignore"`), which meant a `payload`-absent response could never be
+    distinguished from an Amazon-explained error from a genuinely
+    undocumented empty state. `errors` is now parsed structurally (see
+    `SpApiErrorEntry`) so `inventory_client.py` can tell them apart. This
+    client still treats a response with no `payload` and no `errors` as
+    a parse failure, never as an empty result — the pinned contract's
+    own documented shape for a seller with zero FBA inventory is
+    `payload` *present* with `inventorySummaries: []`, not `payload`
+    absent (see `GetInventorySummariesResult`'s own docstring)."""
 
     model_config = ConfigDict(extra="ignore")
 
     payload: optional_not_null(GetInventorySummariesResult) = None
     pagination: optional_not_null(InventoryPagination) = None
+    errors: optional_not_null(list[SpApiErrorEntry]) = None
 
 
 class InventoryPageProvenance(BaseModel):

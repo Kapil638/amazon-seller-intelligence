@@ -30,6 +30,7 @@ from app.amazon.secrets import SecretNotFoundError
 from app.core.config import Settings
 from app.core.exceptions import (
     SpApiAuthenticationError,
+    SpApiErrorEnvelopeError,
     SpApiInvalidRequestError,
     SpApiParseFailedError,
     SpApiRateLimitedError,
@@ -556,6 +557,184 @@ async def test_retry_budget_exhausted_terminalizes() -> None:
     run = _get_run(run_id)
     assert run.status == "failed"
     assert run.failure_class == "rate_limited"
+
+
+# --- fix/inventory-empty-response-and-failure-classification: retry ---------
+# exhaustion must preserve the real cause, not relabel everything
+# "rate_limited" (the live defect: 5 attempts that were never an actual
+# 429 were recorded as if they had been).
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_malformed_page_preserves_its_own_reason() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    settings = _test_settings(inventory_sync_max_attempts=1)
+    client = _FakeInventoryClient(pages=[SpApiParseFailedError("no payload")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_page_retry_exhausted"
+    run = _get_run(run_id)
+    assert run.status == "failed"
+    assert run.failure_class == "malformed_page_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_transient_request_failed_preserves_its_own_reason() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    settings = _test_settings(inventory_sync_max_attempts=1)
+    client = _FakeInventoryClient(pages=[SpApiRequestFailedError("connection reset")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "transient_request_retry_exhausted"
+    run = _get_run(run_id)
+    assert run.failure_class == "transient_request_retry_exhausted"
+
+
+# --- PR #26 gate: deterministic failures get a tighter retry budget ---------
+# than transient/throttling failures — retrying identical unparseable data
+# cannot succeed differently, so it should not consume the same 5-attempt
+# budget a genuine 429 or dropped connection legitimately needs.
+
+
+@pytest.mark.asyncio
+async def test_malformed_page_exhausts_before_the_general_retry_budget() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    with session_scope() as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        run.retry_count = 1  # this call is attempt_number 2
+    settings = _test_settings(inventory_sync_max_attempts=5, inventory_sync_deterministic_failure_max_attempts=2)
+    client = _FakeInventoryClient(pages=[SpApiParseFailedError("bad json")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_page_retry_exhausted"
+    run = _get_run(run_id)
+    assert run.status == "failed"
+    assert run.failure_class == "malformed_page_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_throttled_failure_keeps_the_full_retry_budget_unlike_malformed_page() -> None:
+    """Same attempt number, same settings as the test above — proves the
+    tighter cap applies only to a deterministic failure class, never to a
+    genuinely transient one that deserves the full budget."""
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    with session_scope() as session:
+        run = session.get(AmazonIngestionRun, run_id)
+        run.retry_count = 1  # this call is attempt_number 2
+    settings = _test_settings(inventory_sync_max_attempts=5, inventory_sync_deterministic_failure_max_attempts=2)
+    client = _FakeInventoryClient(pages=[SpApiRateLimitedError("slow down")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "waiting_to_retry"
+    run = _get_run(run_id)
+    assert run.status == "waiting_to_retry"
+    assert run.failure_class == "throttled"
+
+
+@pytest.mark.asyncio
+async def test_error_envelope_with_known_authorization_code_is_terminal_not_retried() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    client = _FakeInventoryClient(pages=[SpApiErrorEnvelopeError("Unauthorized")])
+    service = _service(client)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "authentication_failed"
+    assert len(client.fetch_page_calls) == 1  # never retried — terminal on the first attempt
+    run = _get_run(run_id)
+    assert run.status == "failed"
+    assert run.failure_class == "authentication_failed"
+
+
+@pytest.mark.asyncio
+async def test_error_envelope_with_unrecognized_code_maps_to_generic_error_envelope() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    client = _FakeInventoryClient(pages=[SpApiErrorEnvelopeError("SomeFutureAmazonCode")])
+    service = _service(client)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.reason == "error_envelope"
+    run = _get_run(run_id)
+    assert run.failure_class == "error_envelope"
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_releases_its_lease_on_success() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    empty_page = InventoryPage(
+        granularity=Granularity(granularityType="Marketplace", granularityId=MARKETPLACE),
+        summaries=[],
+        next_token=None,
+        marketplace_id=MARKETPLACE,
+        page_token_used=None,
+        provenance=_provenance(),
+    )
+    client = _FakeInventoryClient(pages=[empty_page])
+    service = _service(client)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is True
+    run = _get_run(run_id)
+    assert run.lease_owner is None
+    assert run.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_releases_its_lease_on_exhausted_failure() -> None:
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    settings = _test_settings(inventory_sync_max_attempts=1)
+    client = _FakeInventoryClient(pages=[SpApiParseFailedError("no payload")])
+    service = _service(client, settings=settings)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    run = _get_run(run_id)
+    assert run.status == "failed"
+    assert run.lease_owner is None
+    assert run.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_error_envelope_quota_exceeded_is_retryable_as_throttled() -> None:
+    """`QuotaExceeded` maps to the same retryable `throttled` class a
+    real 429 does (see `test_429_...` at the client layer) — proven here
+    the same way `test_malformed_page_reschedules` etc. prove their own
+    class is retryable: one attempt reschedules rather than terminalizes."""
+    scope = _seed_scope()
+    run_id = _enqueue_and_claim(scope)
+    client = _FakeInventoryClient(pages=[SpApiErrorEnvelopeError("QuotaExceeded")])
+    service = _service(client)
+
+    outcome = await service.process_claimed_job(run_id)
+
+    assert outcome.succeeded is False
+    run = _get_run(run_id)
+    assert run.status == "waiting_to_retry"
+    assert run.failure_class == "throttled"
 
 
 # --- proactive inter-page throttle is invoked, never the sole mechanism ----

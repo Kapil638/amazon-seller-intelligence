@@ -359,6 +359,15 @@ class Settings(BaseSettings):
         default=5, ge=1, le=20,
         description="Maximum claim attempts for one Inventory job before it terminalizes as failed rather than retrying again.",
     )
+    inventory_sync_deterministic_failure_max_attempts: int = Field(
+        default=2, ge=1, le=20,
+        description=(
+            "Maximum claim attempts for an Inventory job whose failure is deterministic (a schema-validation "
+            "failure that will reject the identical Amazon response on every retry, e.g. malformed_page) — "
+            "applied as an independent cap on top of inventory_sync_max_attempts, never a higher one, since "
+            "retrying against unchanged unparseable data cannot succeed differently."
+        ),
+    )
     inventory_sync_base_backoff_seconds: float = Field(
         default=30.0, gt=0,
         description="Base delay for an Inventory job's own retry backoff (used when Amazon's Retry-After is absent).",

@@ -529,6 +529,99 @@ async def test_malformed_page_from_client_is_recorded_as_malformed_page() -> Non
     assert outcome.reason == "malformed_page"
 
 
+# --- fix/inventory-empty-response-and-failure-classification: retry ---------
+# exhaustion must preserve the real cause, not relabel everything
+# "rate_limited" — the same live defect proven for Inventory, confirmed
+# to also affect Listings via direct code inspection (an identical
+# `reason="rate_limited"` literal at its own budget-exhaustion site).
+# Only `process_claimed_job` (the durable worker's own reclaim path) can
+# reach that site at all — `sync()`'s own failure path never retries —
+# so these seed a genuinely claimed run directly via the same
+# `enqueue_listings_run` + `claim_next_listings_job` pair
+# `test_claim_next_listings_job_...`-style tests elsewhere in this file
+# already use, rather than going through `sync()`.
+
+
+def _claim_run(scope: dict) -> None:
+    with session_scope() as session:
+        enqueued = AmazonIngestionRunRepository(session).enqueue_listings_run(
+            organization_id=scope["organization_id"],
+            seller_account_id=scope["seller_account_id"],
+            marketplace_participation_id=scope["marketplace_participation_id"],
+            region="na",
+            environment="PRODUCTION",
+            connection_id=scope["connection_id"],
+        )
+        session.commit()
+        run_id = enqueued.run_id
+    with session_scope() as session:
+        claimed = AmazonIngestionRunRepository(session).claim_next_listings_job(
+            lease_owner="test-worker", lease_duration_seconds=300,
+            max_global_active=10, max_active_per_organization=10,
+        )
+        assert claimed is not None
+        assert claimed.id == run_id
+        session.commit()
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_malformed_page_preserves_its_own_reason() -> None:
+    scope = _seed_scope()
+    run_id = _claim_run(scope)
+    service, client = _service(
+        [SpApiParseFailedError("bad json")], settings=_test_settings(listings_sync_max_attempts=1)
+    )
+    outcome = await service.process_claimed_job(run_id)
+    assert outcome.succeeded is False
+    assert outcome.reason == "malformed_page_retry_exhausted"
+    run = _get_run(scope["organization_id"], run_id)
+    assert run.status == "failed"
+    assert run.failure_class == "malformed_page_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_transient_request_failed_preserves_its_own_reason() -> None:
+    scope = _seed_scope()
+    run_id = _claim_run(scope)
+    service, client = _service(
+        [SpApiRequestFailedError("exhausted")], settings=_test_settings(listings_sync_max_attempts=1)
+    )
+    outcome = await service.process_claimed_job(run_id)
+    assert outcome.succeeded is False
+    assert outcome.reason == "transient_request_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_record_count_inconsistent_preserves_its_own_reason() -> None:
+    scope = _seed_scope()
+    run_id = _claim_run(scope)
+    service, client = _service(
+        [_page([_item("SKU-1", summaries=[_summary()])], number_of_results=2, next_token=None)],
+        settings=_test_settings(listings_sync_max_attempts=1),
+    )
+    outcome = await service.process_claimed_job(run_id)
+    assert outcome.succeeded is False
+    assert outcome.reason == "record_count_retry_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_on_genuine_throttling_still_maps_to_rate_limited() -> None:
+    """The one case the old blanket label was actually right for — a
+    regression guard so the fix above never accidentally stops a real,
+    repeated 429 from terminalizing as `rate_limited`."""
+    from app.core.exceptions import SpApiRateLimitedError
+
+    scope = _seed_scope()
+    run_id = _claim_run(scope)
+    service, client = _service(
+        [SpApiRateLimitedError("slow down")], settings=_test_settings(listings_sync_max_attempts=1)
+    )
+    outcome = await service.process_claimed_job(run_id)
+    assert outcome.succeeded is False
+    assert outcome.reason == "rate_limited"
+
+
 @pytest.mark.asyncio
 async def test_no_page_token_appears_in_logs(caplog) -> None:
     scope = _seed_scope()

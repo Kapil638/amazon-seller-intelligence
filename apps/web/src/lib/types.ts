@@ -2211,3 +2211,17 @@ export type InventorySyncTriggerResponse = {
   retry_allowed_at?: string | null;
 };
 
+// fix/inventory-empty-response-and-failure-classification — mirrors the
+// API's own sanitized GET /health/workers shape exactly (never a second
+// notion of "available"). `worker_type` is this codebase's existing
+// run_type vocabulary: "listings" | "orders" | "sales_and_traffic_report"
+// | "inventory".
+export type WorkerHealthEntry = {
+  available: boolean;
+  last_heartbeat_at: string | null;
+};
+
+export type WorkerHealthResponse = {
+  workers: Record<string, WorkerHealthEntry>;
+};
+

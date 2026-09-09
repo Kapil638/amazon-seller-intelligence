@@ -198,3 +198,48 @@ def test_job_status_never_exposes_forbidden_fields(client) -> None:
 def test_job_status_malformed_run_id_rejected(client) -> None:
     response = client.get(_status_url(run_id="not-a-uuid"))
     assert response.status_code == 400
+
+
+# --- fix/inventory-empty-response-and-failure-classification ---------------
+# Investigation 3: a live 30s client timeout was traced to `async def`
+# route handlers calling blocking sync-database code directly, stalling
+# the single shared event loop for every other concurrent request. The
+# fix (this route, and `/health`/`/health/workers`, are now plain `def`
+# — Starlette dispatches those to its own worker thread pool) is proven
+# here directly: a slow concurrent request never delays a fast one.
+
+
+def test_enqueue_route_does_not_block_a_concurrent_request(client) -> None:
+    import threading
+    import time
+
+    class _SlowTriggerService(_FakeTriggerService):
+        def trigger(self, marketplace_participation_id):
+            time.sleep(1.0)  # simulates a slow blocking database call
+            return super().trigger(marketplace_participation_id)
+
+    slow_fake = _SlowTriggerService(outcome=InventorySyncTriggerOutcome(reason="queued", job=_job()))
+    _use(slow_fake)
+
+    slow_done = threading.Event()
+
+    def _run_slow_request() -> None:
+        client.post(_url())
+        slow_done.set()
+
+    slow_thread = threading.Thread(target=_run_slow_request)
+    slow_thread.start()
+    time.sleep(0.1)  # let the slow request actually start first
+
+    fast_start = time.monotonic()
+    fast_response = client.get("/health")
+    fast_elapsed = time.monotonic() - fast_start
+
+    slow_thread.join(timeout=5)
+    assert fast_response.status_code == 200
+    # The whole point: the fast request must not have waited behind the
+    # slow one's own ~1s sleep — a blocking `async def` route would have
+    # made this take close to 1s too (event-loop-serialized); a plain
+    # `def` route lets Starlette's thread pool run them concurrently.
+    assert fast_elapsed < 0.5, f"fast request took {fast_elapsed:.2f}s — appears serialized behind the slow one"
+    assert slow_done.is_set()
