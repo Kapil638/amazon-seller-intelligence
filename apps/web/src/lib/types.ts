@@ -2225,3 +2225,122 @@ export type WorkerHealthResponse = {
   workers: Record<string, WorkerHealthEntry>;
 };
 
+// 12B.6C — Inventory Health. Mirrors the API's own sanitized shape
+// exactly (apps/api/app/amazon/inventory_health_read.py). Every numeric
+// field distinguishes a real `0` from `null` (unavailable/ineligible) —
+// never one collapsed into the other; the UI must render them
+// differently, never treat `null` as `0`.
+export type InventoryHealthThresholds = {
+  low_coverage_days_threshold: number;
+  high_coverage_days_threshold: number;
+  min_eligible_window_days: number;
+  preferred_window_days: number;
+};
+
+export type InventoryHealthInventoryState =
+  | "inactive"
+  | "out_of_stock"
+  | "low_coverage"
+  | "healthy_coverage"
+  | "high_coverage"
+  | "unclassified";
+
+export type InventoryHealthDemandEligibility =
+  | "eligible"
+  | "no_eligible_sales_traffic_fact"
+  | "insufficient_window"
+  | "unsupported_condition"
+  | "missing_identity";
+
+export type InventoryHealthFreshnessState = "fresh" | "stale_inventory" | "stale_sales" | "stale_both";
+
+export type InventoryHealthOverlay =
+  | "demand_with_no_fulfillable_stock"
+  | "inbound_present"
+  | "unfulfillable_present"
+  | "researching_present"
+  | "no_recent_demand";
+
+export type InventoryHealthSyncStatus =
+  | "never_synchronized"
+  | "queued"
+  | "running"
+  | "waiting_to_retry"
+  | "succeeded"
+  | "failed"
+  | "partial"
+  | "timed_out";
+
+export type InventoryHealthSyncEvidence = {
+  status: InventoryHealthSyncStatus;
+  last_successful_synchronized_at: string | null;
+};
+
+export type InventoryHealthSummary = {
+  marketplace_participation_id: string;
+  total: number;
+  counts_by_inventory_state: Record<string, number>;
+  counts_by_demand_eligibility: Record<string, number>;
+  formula_version: string;
+  thresholds: InventoryHealthThresholds;
+  inventory_sync: InventoryHealthSyncEvidence;
+  sales_traffic_sync: InventoryHealthSyncEvidence;
+};
+
+export type InventoryHealthRow = {
+  inventory_id: string;
+  seller_sku: string;
+  condition: string;
+  asin: string | null;
+  fnsku: string | null;
+  product_name: string | null;
+  is_active: boolean;
+
+  fulfillable_quantity: number | null;
+  reserved_total_quantity: number | null;
+  inbound_working_quantity: number | null;
+  inbound_shipped_quantity: number | null;
+  inbound_receiving_quantity: number | null;
+  unfulfillable_total_quantity: number | null;
+  researching_total_quantity: number | null;
+  total_quantity: number | null;
+
+  demand_eligibility: InventoryHealthDemandEligibility;
+  units_per_covered_day: number | null;
+  sales_window_start: string | null;
+  sales_window_end: string | null;
+  sales_covered_days: number | null;
+  fulfillable_days_of_cover: number | null;
+
+  // Inbound-adjusted estimate, always separately labeled — never
+  // "available stock." `potential_units_incomplete_inputs` is true
+  // whenever an Amazon quantity was null and therefore excluded from
+  // the sum rather than silently treated as a confirmed zero.
+  potential_units: number | null;
+  potential_units_incomplete_inputs: boolean;
+
+  inventory_state: InventoryHealthInventoryState;
+  freshness_state: InventoryHealthFreshnessState;
+  overlays: InventoryHealthOverlay[];
+
+  inventory_observed_at: string | null;
+  amazon_last_updated_time: string | null;
+  sales_traffic_ingestion_completed_at: string | null;
+};
+
+export type InventoryHealthCollectionResponse = {
+  items: InventoryHealthRow[];
+  total: number;
+  offset: number;
+  limit: number;
+  formula_version: string;
+  thresholds: InventoryHealthThresholds;
+};
+
+export type InventoryHealthEvidence = InventoryHealthRow & {
+  inventory_ingestion_run_id: string | null;
+  sales_traffic_ingestion_run_id: string | null;
+  formula_version: string;
+  thresholds: InventoryHealthThresholds;
+};
+

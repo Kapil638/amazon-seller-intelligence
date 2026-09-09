@@ -71,6 +71,9 @@ import type {
   SalesTrafficSyncTriggerResponse,
   InventoryCollectionResponse,
   InventoryDetail,
+  InventoryHealthCollectionResponse,
+  InventoryHealthEvidence,
+  InventoryHealthSummary,
   InventorySortField,
   InventorySummary,
   InventorySyncTriggerResponse,
@@ -1515,6 +1518,49 @@ export async function fetchInventory(
 export async function fetchInventoryDetail(participationId: string, inventoryId: string): Promise<InventoryDetail> {
   return inventoryRequest<InventoryDetail>(
     `/marketplace-participations/${encodeURIComponent(participationId)}/inventory/${encodeURIComponent(inventoryId)}`,
+  );
+}
+
+// 12B.6C — Inventory Health. Strictly read-only, computed on read by
+// the API — reuses `inventoryRequest`/`InventoryApiError` exactly, no
+// second error-handling contract invented for this domain.
+export async function fetchInventoryHealthSummary(participationId: string): Promise<InventoryHealthSummary> {
+  return inventoryRequest<InventoryHealthSummary>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory-health/summary`,
+  );
+}
+
+export type InventoryHealthQuery = {
+  q?: string;
+  isActive?: boolean;
+  sortBy?: InventorySortField;
+  sortDir?: SortDirection;
+  offset?: number;
+  limit?: number;
+};
+
+export async function fetchInventoryHealth(
+  participationId: string,
+  query: InventoryHealthQuery = {},
+): Promise<InventoryHealthCollectionResponse> {
+  const params = new URLSearchParams();
+  if (query.q) params.set("q", query.q);
+  if (query.isActive !== undefined) params.set("is_active", String(query.isActive));
+  params.set("sort_by", query.sortBy ?? "last_seen_at");
+  params.set("sort_dir", query.sortDir ?? "desc");
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 25));
+  return inventoryRequest<InventoryHealthCollectionResponse>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory-health?${params.toString()}`,
+  );
+}
+
+export async function fetchInventoryHealthEvidence(
+  participationId: string,
+  inventoryId: string,
+): Promise<InventoryHealthEvidence> {
+  return inventoryRequest<InventoryHealthEvidence>(
+    `/marketplace-participations/${encodeURIComponent(participationId)}/inventory-health/${encodeURIComponent(inventoryId)}/evidence`,
   );
 }
 
