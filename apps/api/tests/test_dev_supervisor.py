@@ -106,6 +106,7 @@ class _FakeHealthHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_health_server():
+    original_payload = dict(_FakeHealthHandler.workers_payload)
     server = HTTPServer(("127.0.0.1", 0), _FakeHealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -114,6 +115,17 @@ def fake_health_server():
     finally:
         server.shutdown()
         thread.join(timeout=2)
+        _FakeHealthHandler.workers_payload = original_payload
+
+
+def _set_worker_available(worker_type: str, available: bool) -> None:
+    """Mutates the shared fake `/health/workers` payload the running
+    `fake_health_server` serves — the hang-detection tests use this to
+    flip a worker from healthy to stale (heartbeat stopped advancing)
+    without stopping/restarting the fake server itself."""
+    _FakeHealthHandler.workers_payload = {
+        "workers": {worker_type: {"available": available, "last_heartbeat_at": "2026-01-01T00:00:00Z"}}
+    }
 
 
 def test_http_readiness_true_when_endpoint_responds_200(fake_health_server) -> None:
@@ -228,10 +240,37 @@ def _stop_every_supervisor_after_the_test():
         sup.request_stop()
 
 
-def _make_supervisor(specs, *, factory=None, sleeps=None, logs=None, restart_policy=None, _created=None):
+class _FakeMonotonic:
+    """Controllable stand-in for `time.monotonic` — heartbeat-liveness
+    tests advance it explicitly rather than depending on real wall-clock
+    time passing during the test."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+def _make_supervisor(
+    specs,
+    *,
+    factory=None,
+    sleeps=None,
+    logs=None,
+    restart_policy=None,
+    monotonic=None,
+    heartbeat_liveness_poll_interval=1.0,
+    heartbeat_liveness_stale_ceiling=3,
+    _created=None,
+):
     factory = factory or FakePopenFactory()
     sleeps = sleeps if sleeps is not None else []
     logs = logs if logs is not None else []
+    monotonic = monotonic or _FakeMonotonic()
 
     def _fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
@@ -248,6 +287,9 @@ def _make_supervisor(specs, *, factory=None, sleeps=None, logs=None, restart_pol
         sleep=_fake_sleep,
         log_fn=lambda m: logs.append(m),
         monitor_poll_interval=0.001,
+        monotonic=monotonic,
+        heartbeat_liveness_poll_interval=heartbeat_liveness_poll_interval,
+        heartbeat_liveness_stale_ceiling=heartbeat_liveness_stale_ceiling,
     )
     if _created is not None:
         _created.append(sup)
@@ -358,6 +400,238 @@ def test_restart_ceiling_on_a_critical_child_stops_the_whole_stack(tmp_path, _st
     assert sup._critical_failure.is_set() is True
     assert sup._stop_event.is_set() is True
     assert any("stopping the entire supervised stack" in line for line in logs)
+
+
+# --- fix/pr26-hung-worker-detection: alive-but-stalled-heartbeat -----------
+
+
+def _worker_spec(name: str, *, base_url: str, worker_type: str, tmp_path: Path) -> "supervisor.ChildSpec":
+    return supervisor.ChildSpec(
+        name=name,
+        cwd=tmp_path,
+        cmd=["fake", name],
+        env={},
+        critical=False,
+        readiness=supervisor.WorkerHeartbeatReadiness(base_url, worker_type),
+        readiness_timeout_seconds=1.0,
+    )
+
+
+def test_heartbeat_liveness_ignores_a_worker_that_has_never_been_ready(
+    tmp_path, fake_health_server, _stop_every_supervisor_after_the_test
+) -> None:
+    """Bounded-startup guard: a worker still inside its own legitimate
+    startup grace window must never be flagged as hung — that is
+    `_wait_ready`'s job, not the liveness check's."""
+    _set_worker_available("inventory", False)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, logs = _make_supervisor(specs, monotonic=monotonic, _created=_stop_every_supervisor_after_the_test)
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)  # never call _wait_ready — has_been_ready stays False
+
+    monotonic.advance(10.0)
+    sup._check_worker_heartbeat_liveness(child)
+
+    assert child.consecutive_stale_heartbeat_checks == 0
+    assert len(factory.processes) == 1, "must never restart a worker that has not yet become ready once"
+
+
+def test_heartbeat_liveness_debounces_a_single_stale_check(
+    tmp_path, fake_health_server, _stop_every_supervisor_after_the_test
+) -> None:
+    """Transient-latency guard: one stale check alone must never restart
+    an actually-healthy worker — a real hang requires several
+    consecutive misses."""
+    _set_worker_available("inventory", True)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, _logs = _make_supervisor(
+        specs, monotonic=monotonic, heartbeat_liveness_poll_interval=1.0, heartbeat_liveness_stale_ceiling=3,
+        _created=_stop_every_supervisor_after_the_test,
+    )
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+    assert child.has_been_ready is True
+
+    _set_worker_available("inventory", False)
+    monotonic.advance(2.0)
+    sup._check_worker_heartbeat_liveness(child)
+
+    assert child.consecutive_stale_heartbeat_checks == 1
+    assert len(factory.processes) == 1, "a single stale check must not trigger a restart"
+
+
+def test_heartbeat_liveness_restarts_a_hung_worker_after_consecutive_stale_checks(
+    tmp_path, fake_health_server, monkeypatch, _stop_every_supervisor_after_the_test
+) -> None:
+    """The core PR #26 requirement: a process that never exits
+    (`process.poll()` stays None throughout) but whose heartbeat has
+    gone stale for the configured number of consecutive checks is
+    force-terminated and restarted — using the existing bounded
+    restart/backoff ceiling (`RestartPolicy`), the same one an
+    unexpected exit uses."""
+    _set_worker_available("inventory", True)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, sleeps, logs = _make_supervisor(
+        specs, monotonic=monotonic, heartbeat_liveness_poll_interval=1.0, heartbeat_liveness_stale_ceiling=3,
+        _created=_stop_every_supervisor_after_the_test,
+    )
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+    first_process = factory.processes[0]
+
+    killed_pgids: list[tuple[int, int]] = []
+    monkeypatch.setattr(supervisor.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(supervisor.os, "killpg", lambda pgid, sig: killed_pgids.append((pgid, sig)))
+
+    _set_worker_available("inventory", False)
+    for _ in range(3):
+        monotonic.advance(1.0)
+        sup._check_worker_heartbeat_liveness(child)
+
+    # The process never exited on its own (FakeProcess.poll() would
+    # still report None) — proves this path does not depend on
+    # process-exit monitoring at all.
+    assert first_process.poll() is None
+    assert (first_process.pid, supervisor.signal.SIGTERM) in killed_pgids
+    assert child.attempt == 1
+    assert len(factory.processes) == 2, "a replacement process must have been spawned"
+    assert child.consecutive_stale_heartbeat_checks == 0, "counter must reset after acting"
+    assert any("treating it as hung" in line for line in logs)
+    assert 0.01 in sleeps  # the same RestartPolicy backoff an unexpected exit uses
+
+
+def test_heartbeat_liveness_resets_counter_on_a_fresh_heartbeat(
+    tmp_path, fake_health_server, _stop_every_supervisor_after_the_test
+) -> None:
+    _set_worker_available("inventory", True)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, _logs = _make_supervisor(
+        specs, monotonic=monotonic, heartbeat_liveness_poll_interval=1.0, heartbeat_liveness_stale_ceiling=3,
+        _created=_stop_every_supervisor_after_the_test,
+    )
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+
+    _set_worker_available("inventory", False)
+    monotonic.advance(1.0)
+    sup._check_worker_heartbeat_liveness(child)
+    monotonic.advance(1.0)
+    sup._check_worker_heartbeat_liveness(child)
+    assert child.consecutive_stale_heartbeat_checks == 2
+
+    _set_worker_available("inventory", True)
+    monotonic.advance(1.0)
+    sup._check_worker_heartbeat_liveness(child)
+
+    assert child.consecutive_stale_heartbeat_checks == 0
+    assert len(factory.processes) == 1, "a recovered heartbeat must never trigger a restart"
+
+
+def test_heartbeat_liveness_debounce_respects_its_own_poll_interval(
+    tmp_path, fake_health_server, _stop_every_supervisor_after_the_test
+) -> None:
+    """Checks are spaced by `heartbeat_liveness_poll_interval`, not
+    performed on every monitor tick — repeated calls before that
+    interval elapses must not double-count."""
+    _set_worker_available("inventory", False)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, _logs = _make_supervisor(
+        specs, monotonic=monotonic, heartbeat_liveness_poll_interval=5.0, heartbeat_liveness_stale_ceiling=3,
+        _created=_stop_every_supervisor_after_the_test,
+    )
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+
+    monotonic.advance(1.0)  # well under the 5s interval
+    sup._check_worker_heartbeat_liveness(child)
+    sup._check_worker_heartbeat_liveness(child)
+    sup._check_worker_heartbeat_liveness(child)
+
+    assert child.consecutive_stale_heartbeat_checks == 0
+    assert len(factory.processes) == 1
+
+
+def test_heartbeat_liveness_never_touches_a_backend_or_frontend_child(
+    tmp_path, _stop_every_supervisor_after_the_test
+) -> None:
+    """`spec.readiness` for backend/frontend is never a
+    `WorkerHeartbeatReadiness` — this must be a complete no-op for them,
+    never restarting a critical process over this check."""
+    specs = [_spec("backend", critical=True, tmp_path=tmp_path)]
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, _logs = _make_supervisor(specs, monotonic=monotonic, _created=_stop_every_supervisor_after_the_test)
+    child = sup._children["backend"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+
+    monotonic.advance(100.0)
+    for _ in range(5):
+        sup._check_worker_heartbeat_liveness(child)
+
+    assert child.consecutive_stale_heartbeat_checks == 0
+    assert len(factory.processes) == 1
+
+
+def test_heartbeat_liveness_hang_restart_uses_the_bounded_restart_ceiling(
+    tmp_path, fake_health_server, monkeypatch, _stop_every_supervisor_after_the_test
+) -> None:
+    """Repeated hangs (e.g. a worker that keeps stalling right after
+    each restart) must still hit `RestartPolicy`'s own ceiling and
+    terminalize as `FAILED_PERMANENT`, exactly like repeated unexpected
+    exits already do — no separate, unbounded restart loop is invented
+    for this failure mode."""
+    _set_worker_available("inventory", True)
+    specs = [_worker_spec("inventory-worker", base_url=fake_health_server, worker_type="inventory", tmp_path=tmp_path)]
+    policy = supervisor.RestartPolicy(base_delay_seconds=0.001, max_delay_seconds=0.001, max_restarts=1)
+    monotonic = _FakeMonotonic()
+    sup, factory, _sleeps, logs = _make_supervisor(
+        specs, monotonic=monotonic, restart_policy=policy,
+        heartbeat_liveness_poll_interval=1.0, heartbeat_liveness_stale_ceiling=2,
+        _created=_stop_every_supervisor_after_the_test,
+    )
+    monkeypatch.setattr(supervisor.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(supervisor.os, "killpg", lambda pgid, sig: None)
+    child = sup._children["inventory-worker"]
+    sup._spawn(child)
+    sup._wait_ready(child)
+    assert child.has_been_ready is True
+    _set_worker_available("inventory", False)  # now simulate the hang
+
+    # First hang: 2 consecutive stale checks reaches the ceiling of 2 —
+    # triggers a restart (attempt 1, within max_restarts=1).
+    for _ in range(2):
+        monotonic.advance(1.0)
+        sup._check_worker_heartbeat_liveness(child)
+    # The replacement's own readiness wait runs on a background thread
+    # (mirrors `test_unexpected_exit_triggers_bounded_backoff_restart`'s
+    # identical race) — status may be observed as STARTING, RESTARTING,
+    # or already READY depending on scheduling; only `attempt` is
+    # deterministic here.
+    assert child.status in (
+        supervisor.ChildStatus.STARTING,
+        supervisor.ChildStatus.RESTARTING,
+        supervisor.ChildStatus.READY,
+    )
+    assert child.attempt == 1
+
+    # Second hang after the restart: attempt becomes 2, exceeding
+    # max_restarts=1 — must terminalize, never restart a third time.
+    child.has_been_ready = True  # simulate the replacement having proven ready again
+    for _ in range(2):
+        monotonic.advance(1.0)
+        sup._check_worker_heartbeat_liveness(child)
+
+    assert child.status == supervisor.ChildStatus.FAILED_PERMANENT
+    assert any("exceeded its restart ceiling" in line for line in logs)
 
 
 def test_stop_terminates_every_still_alive_child(tmp_path, monkeypatch, _stop_every_supervisor_after_the_test) -> None:

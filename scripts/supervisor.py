@@ -270,6 +270,16 @@ class ManagedChild:
     attempt: int = 0
     status: str = ChildStatus.STARTING
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # fix/pr26-hung-worker-detection — a worker process can remain alive
+    # (same PID) while its own internal heartbeat-renewal loop has
+    # stalled (observed directly: a machine sleep/wake cycle pausing the
+    # worker's async heartbeat task without killing the process). These
+    # three fields back `Supervisor._check_worker_heartbeat_liveness`,
+    # entirely separate from `attempt`/exit-code tracking above, which
+    # only ever sees a process that has actually exited.
+    has_been_ready: bool = False
+    consecutive_stale_heartbeat_checks: int = 0
+    last_heartbeat_poll_at: float = 0.0
 
 
 # --- the supervisor itself ------------------------------------------------
@@ -291,12 +301,27 @@ class Supervisor:
         sleep: Callable[[float], None] = time.sleep,
         log_fn: Callable[[str], None] | None = None,
         monitor_poll_interval: float = 1.0,
+        monotonic: Callable[[], float] = time.monotonic,
+        heartbeat_liveness_poll_interval: float = 5.0,
+        heartbeat_liveness_stale_ceiling: int = 3,
     ) -> None:
         self._restart_policy = restart_policy or RestartPolicy()
         self._popen_factory = popen_factory
         self._sleep = sleep
         self._log_fn = log_fn or _default_log
         self._monitor_poll_interval = monitor_poll_interval
+        self._monotonic = monotonic
+        # fix/pr26-hung-worker-detection — debounced (this many
+        # *consecutive* stale checks, not one) so a single slow or
+        # dropped `/health/workers` request never restarts an actually-
+        # healthy worker; polled on its own cadence (default 5s, slower
+        # than the 1s process-exit poll) so a hang is caught within
+        # roughly `heartbeat_liveness_poll_interval *
+        # heartbeat_liveness_stale_ceiling` seconds of the worker's own
+        # `worker_heartbeat_stale_after_seconds` threshold being crossed,
+        # without hammering the API with a health check every tick.
+        self._heartbeat_liveness_poll_interval = heartbeat_liveness_poll_interval
+        self._heartbeat_liveness_stale_ceiling = heartbeat_liveness_stale_ceiling
         self._children: dict[str, ManagedChild] = {
             spec.name: ManagedChild(spec=spec, log_path=LOG_DIR / f"{spec.name}.log") for spec in specs
         }
@@ -360,6 +385,7 @@ class Supervisor:
                 return False
             if spec.readiness.check():
                 child.status = ChildStatus.READY
+                child.has_been_ready = True
                 self._log(f"{spec.name} ready ({spec.readiness.describe()})")
                 return True
             self._sleep(poll_interval)
@@ -428,9 +454,16 @@ class Supervisor:
                     if child.status in (ChildStatus.FAILED_PERMANENT, ChildStatus.STOPPED):
                         continue
                     process = child.process
-                    if process is None or process.poll() is None:
-                        continue  # still alive, or not started yet
-                    self._handle_unexpected_exit(child)
+                    if process is None:
+                        continue  # not started yet
+                    if process.poll() is not None:
+                        self._handle_unexpected_exit(child)
+                        continue
+                    # Process is alive — process-exit monitoring alone
+                    # cannot see a worker whose own heartbeat-renewal
+                    # loop has stalled without the process itself ever
+                    # exiting (fix/pr26-hung-worker-detection).
+                    self._check_worker_heartbeat_liveness(child)
             self._sleep(self._monitor_poll_interval)
 
     def _handle_unexpected_exit(self, child: ManagedChild) -> None:
@@ -441,6 +474,93 @@ class Supervisor:
             f"{spec.name} exited unexpectedly (exit code {exit_code}, attempt {child.attempt}) "
             f"— see {child.log_path}"
         )
+        self._restart_after_problem(child)
+
+    def _check_worker_heartbeat_liveness(self, child: ManagedChild) -> None:
+        """A worker process can remain alive (same PID) while its own
+        internal heartbeat-renewal loop has stalled — proven directly in
+        a live session: a host machine sleep/wake cycle paused the
+        worker's async heartbeat task for hours without the process
+        itself ever exiting, so `/health/workers` kept reporting a
+        stale, un-advancing heartbeat while `process.poll()` kept
+        reporting the process as perfectly alive. Restart-on-exit alone
+        can never detect this.
+
+        Reuses `spec.readiness` directly rather than a second check
+        object — for a worker child it is already a
+        `WorkerHeartbeatReadiness`, which already asks the exact right
+        question (a *fresh* heartbeat, using the API's own database-
+        time-based staleness computation —
+        `WorkerHeartbeatRepository.check_availability`; this module
+        never computes staleness itself). A backend/frontend child's
+        `readiness` is never this type, so this is a no-op for them —
+        the isinstance check alone keeps critical-process handling
+        completely untouched by this method.
+
+        Two guards against a false positive:
+        - `has_been_ready` — never armed during a worker's own
+          legitimate startup grace window (bounded startup latency is
+          `_wait_ready`'s job, not this one's).
+        - `heartbeat_liveness_stale_ceiling` consecutive misses, not
+          one — never restarts a healthy worker over a single slow or
+          dropped health-check request (bounded transient-latency
+          tolerance).
+        """
+        spec = child.spec
+        if not isinstance(spec.readiness, WorkerHeartbeatReadiness) or not child.has_been_ready:
+            return
+        if child.status == ChildStatus.RESTARTING:
+            return
+        now = self._monotonic()
+        if now - child.last_heartbeat_poll_at < self._heartbeat_liveness_poll_interval:
+            return
+        child.last_heartbeat_poll_at = now
+        if spec.readiness.check():
+            child.consecutive_stale_heartbeat_checks = 0
+            return
+        child.consecutive_stale_heartbeat_checks += 1
+        if child.consecutive_stale_heartbeat_checks < self._heartbeat_liveness_stale_ceiling:
+            self._log(
+                f"{spec.name} heartbeat check stale "
+                f"({child.consecutive_stale_heartbeat_checks}/{self._heartbeat_liveness_stale_ceiling}) "
+                "— process still alive, not yet acting"
+            )
+            return
+        child.consecutive_stale_heartbeat_checks = 0
+        self._handle_hung_worker(child)
+
+    def _handle_hung_worker(self, child: ManagedChild) -> None:
+        spec = child.spec
+        pid = child.process.pid if child.process is not None else None
+        self._log(
+            f"{spec.name} (pid {pid}) is alive but its heartbeat has been stale for "
+            f"{self._heartbeat_liveness_stale_ceiling} consecutive checks — treating it as hung "
+            "and force-restarting it."
+        )
+        # Invalidate the old, stuck instance safely before spawning a
+        # replacement — the exact same graceful-then-forceful sequence
+        # `stop()` already uses for a normal shutdown (SIGTERM to the
+        # whole process group, a bounded grace wait, SIGKILL only if it
+        # is still alive after that), never a bare `kill -9` first.
+        self._terminate(child)
+        elapsed = 0.0
+        grace_seconds = 5.0
+        poll_interval = 0.2
+        while elapsed < grace_seconds and not self._is_dead(child):
+            self._sleep(poll_interval)
+            elapsed += poll_interval
+        self._force_kill_if_alive(child)
+        child.attempt += 1
+        self._restart_after_problem(child)
+
+    def _restart_after_problem(self, child: ManagedChild) -> None:
+        """Shared restart bookkeeping — the existing bounded backoff
+        plus hard restart ceiling (`RestartPolicy`) — for both an
+        unexpected process exit and a detected hang. The caller is
+        responsible for the old process already being gone: an exited
+        process already is; `_handle_hung_worker` force-terminates a
+        hung one first."""
+        spec = child.spec
         if self._restart_policy.ceiling_exceeded(child.attempt):
             child.status = ChildStatus.FAILED_PERMANENT
             self._log(
@@ -463,6 +583,8 @@ class Supervisor:
             return
         delay = self._restart_policy.delay_for(child.attempt)
         child.status = ChildStatus.RESTARTING
+        child.has_been_ready = False
+        child.consecutive_stale_heartbeat_checks = 0
         self._log(f"restarting {spec.name} in {delay:.1f}s (attempt {child.attempt})")
         self._sleep(delay)
         if self._stop_event.is_set():
