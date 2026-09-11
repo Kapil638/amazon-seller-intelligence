@@ -18,6 +18,29 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
+    # pilot-deployment-ewise — Starlette's TrustedHostMiddleware allowlist.
+    # Local dev never sets this (uvicorn is reached directly on loopback,
+    # never through a proxy that could forge Host), so the default keeps
+    # existing dev/test behavior unchanged. A deployed environment behind
+    # Railway's edge + Cloudflare must set this explicitly (e.g.
+    # ["api.ewiseintelligence.com"]) — an unset/empty list here means "no
+    # TrustedHostMiddleware is registered at all" (see main.py), never
+    # "allow every host silently."
+    allowed_hosts: list[str] = []
+    # pilot-deployment-ewise — per-process SQLAlchemy pool bounds. Left
+    # unset (None) by default, which keeps SQLAlchemy's own built-in
+    # defaults (pool_size=5, max_overflow=10) for local development and
+    # every existing test — those tests already pass against SQLite,
+    # which ignores these settings entirely (see get_engine()). A
+    # deployed environment sharing one remote Postgres pooler across
+    # several separate processes (API + 4 workers) MUST set these
+    # explicitly — the shared Supabase session-mode pooler used by this
+    # project has been observed directly, this session, refusing new
+    # connections (EMAXCONNSESSION) at its own hard pool_size=15 ceiling
+    # under far less concurrent load than 5 unbounded per-process pools
+    # would produce.
+    db_pool_size: int | None = Field(default=None, ge=1, le=50)
+    db_max_overflow: int | None = Field(default=None, ge=0, le=50)
     product_provider: str = "rainforest"
     rainforest_api_key: SecretStr | None = None
     rainforest_base_url: str = "https://api.rainforestapi.com/request"
@@ -338,6 +361,37 @@ class Settings(BaseSettings):
         ),
     )
 
+    # pilot-deployment-ewise — a last-resort, same-process self-watchdog,
+    # separate from worker_heartbeat_stale_after_seconds above.
+    # `scripts/supervisor.py`'s own hung-worker detection (heartbeat
+    # polled *externally*, the stalled process force-restarted) has no
+    # equivalent on Railway, where each worker is its own isolated
+    # service with nothing else watching it. A genuinely frozen asyncio
+    # event loop can never detect itself via another task on that same
+    # loop — this must run on a separate OS thread. Deliberately a much
+    # larger threshold than worker_heartbeat_stale_after_seconds: that
+    # setting only ever gates *new* job acceptance (an operator/Sync
+    # button signal) and should stay sensitive; this one's only action
+    # is a hard, unrecoverable process exit, so it must never fire on an
+    # isolated slow tick or brief GC pause that would already have
+    # self-healed well before this threshold — see the cross-field
+    # validator below.
+    worker_watchdog_stale_after_seconds: float = Field(
+        default=600.0, gt=0, le=86400,
+        description=(
+            "How long a worker's own background heartbeat-write task may go without a single "
+            "successful write, checked from a separate OS thread (not the worker's own asyncio "
+            "event loop, which a genuinely stuck worker could never use to notice itself), before "
+            "that thread calls os._exit(1) — a deliberate, hard process death so a real process "
+            "supervisor (Railway's restart-on-exit policy in production) restarts this worker "
+            "cleanly, rather than leaving it alive-but-unusable indefinitely."
+        ),
+    )
+    worker_watchdog_check_interval_seconds: float = Field(
+        default=30.0, gt=0, le=3600,
+        description="How often the watchdog thread wakes up to check elapsed time since the last successful heartbeat write.",
+    )
+
     @model_validator(mode="after")
     def _validate_worker_heartbeat_bounds(self) -> "Settings":
         if self.worker_heartbeat_stale_after_seconds <= self.worker_heartbeat_interval_seconds:
@@ -345,6 +399,12 @@ class Settings(BaseSettings):
                 "worker_heartbeat_stale_after_seconds must exceed worker_heartbeat_interval_seconds "
                 "(it must tolerate at least one missed heartbeat, or every worker would appear "
                 "unavailable between writes)"
+            )
+        if self.worker_watchdog_stale_after_seconds <= self.worker_heartbeat_stale_after_seconds:
+            raise ValueError(
+                "worker_watchdog_stale_after_seconds must exceed worker_heartbeat_stale_after_seconds "
+                "(the external-availability signal must always go stale, and have time to be acted "
+                "on, well before this process would ever kill itself)"
             )
         return self
 
