@@ -19,13 +19,29 @@ deployment design, not a modification of an existing one.
   self-watchdog, public/private domain routing, draft legal pages. Two
   gaps flagged as unresolved (§0a, §0c below, original text preserved
   in git history) plus an interim-only secret-storage recommendation.
-- Pass 2 (this revision): all three flagged gaps closed with real
-  implementations, not workarounds — production `SecretProvider`
-  (§0a), Cloudflare Access API authentication (new, §0b), and the
-  SP-API Login URI (§0c) — plus Railway resource limits/cost analysis
-  (§1) and updated exact OAuth values (§6). Legal pages remain drafts
-  (unchanged, pending operator-supplied legal details). Still no
-  external deployment, DNS, or Amazon console change.
+- Pass 2: all three flagged gaps closed with real implementations, not
+  workarounds — production `SecretProvider` (§0a), Cloudflare Access API
+  authentication (new, §0b), and the SP-API Login URI (§0c) — plus
+  Railway resource limits/cost analysis (§1) and updated exact OAuth
+  values (§6). Legal pages remained drafts (pending operator-supplied
+  legal details). Still no external deployment, DNS, or Amazon console
+  change.
+- Pass 3 (final review gate): found and fixed a concurrent OAuth
+  state double-consume race, a public-Login-URI hijack/disruption gap
+  (§2 audit item), a stale CI assertion blocking migration `0018` (§1
+  CI check), tightened the database connection budget from 11 to 9
+  (§3), fixed a Cloudflare Access cross-origin cookie gap in the
+  frontend (§5), added a secret-key-rotation safety check (§8), and
+  added a build-time gate blocking deployment of draft legal pages
+  (§0e). Still no external deployment, DNS, or Amazon console change.
+- Pass 4 (this revision): the operator-confirmed legal-entity, contact,
+  and pilot-advertiser facts landed on `/privacy`, `/terms`, and
+  `/marketing` (§13 tracks what remains genuinely outstanding), and the
+  Amazon Ads Partner/ownership model is now documented (§7) — not
+  implemented; the Ads application itself is still explicitly deferred.
+  `npm run build`'s own `prebuild` legal-pages gate (pass 3) now passes
+  against the real, finished pages. Still no external deployment, DNS,
+  or Amazon console change.
 
 ## 0. Architectural gaps found during audit — all now resolved in code
 
@@ -438,21 +454,64 @@ worth a dedicated post-deployment check (§11) precisely because it is
 derived from a list's first element rather than its own dedicated
 setting; flagged here rather than silently trusted.
 
-## 7. Amazon Ads API — future redirect URL
+## 7. Amazon Ads API — ownership model and future redirect URL
 
-No Ads OAuth code exists yet (confirmed by the same audit that led to
-§0c) — this is a **prediction** based on the SP-API callback's own path
-convention, for you to note
-for when Ads API approval/scope assignment completes and that
+**Confirmed ownership model (operator-supplied, this revision) — not
+yet implemented, recorded here so the eventual Ads-OAuth implementation
+pass starts from the right design instead of guessing it later:**
+
+- **EWise is the product operator and the intended Amazon Ads API
+  Partner** — not a Direct Advertiser. Amazon's Ads API draws a hard
+  distinction between these two application types (a Direct Advertiser
+  app can only ever act on the single Amazon Ads account it was
+  registered under; a Partner app is built to act on behalf of
+  multiple separate advertisers, each authorizing it independently,
+  which is exactly this product's actual shape — EWise Intelligence
+  serving distinct advertisers, starting with one). **The future Amazon
+  Ads application must be registered and built as a Partner
+  application, not Direct Advertiser** — this determines which Amazon
+  Ads API onboarding path, approval flow, and OAuth scope model
+  applies, and cannot be changed after the fact without re-registering.
+- **AJ Duran is the first pilot advertiser** who will authorize EWise
+  Intelligence (as Partner) against their own Amazon Ads account, once
+  Ads functionality exists — mirroring the SP-API side, where AJ Duran
+  is already the initial pilot advertiser (see `/privacy`'s own "Pilot
+  advertiser and data ownership" section, and `/terms`'s "Private pilot
+  and initial advertiser" section, both this revision).
+- **The Ads LWA security profile should be created through an
+  EWise-controlled Amazon Developer account** — i.e. an Amazon Developer
+  account owned and administered by Ewisepartners LLC/EWise Partners
+  itself, not AJ Duran's own seller/advertiser account. This keeps the
+  Partner application's credentials (LWA client id/secret under the
+  "EWise Ads Intelligence" security profile already referenced in prior
+  passes) under the operator's own control, separable from any single
+  advertiser's account, and consistent with the Partner model above (a
+  Partner app's identity is the operator's, not any one advertiser's).
+- **Amazon Ads functionality is initially read-only** — the eventual
+  implementation reads advertising performance data an advertiser
+  authorizes; it does not place, modify, or manage advertising
+  campaigns. This is already reflected in `/privacy` and `/terms`
+  (this revision) as a stated product commitment, ahead of any code
+  existing to enforce it — the future implementation pass must actually
+  build it read-only, not merely document it as such.
+
+**Still not implemented — do not create or configure the Ads
+application yet.** No Ads OAuth code exists (confirmed by the same
+audit that led to §0c). The redirect URL below remains a **prediction**
+based on the SP-API callback's own path convention, for you to note for
+when Ads API Partner approval/scope assignment completes and that
 integration is actually built:
 ```
 https://api.ewiseintelligence.com/api/v1/amazon/ads-connection/callback   (exact path TBD at implementation time)
 ```
 Do **not** register this with the "EWise Ads Intelligence" LWA security
-profile yet — it names a route that does not exist. Keep Ads
-credentials (a separate LWA client id/secret pair under that profile)
-and tokens fully separate from the SP-API ones already in `Settings` —
-this repo's existing secret-reference format
+profile yet — it names a route that does not exist, and per the
+ownership model above that profile should be created under an
+EWise-controlled Developer account as a **Partner** application, not
+Direct Advertiser, when that implementation pass actually begins. Keep
+Ads credentials (a separate LWA client id/secret pair under that
+profile) and tokens fully separate from the SP-API ones already in
+`Settings` — this repo's existing secret-reference format
 (`asi/amazon/{provider}/...`) already reserves `"ADS_API"` as a
 distinct provider value for exactly this separation
 (`apps/api/app/amazon/secrets.py`), though the OAuth-state table's own
@@ -628,8 +687,8 @@ a placeholder/comment, never a real value.
   new legal-page JSX during this pass).
 - No migration added. No live Amazon or AI call made during this pass.
 
-**Pass 2 (this revision — see the final report delivered alongside this
-document for the complete breakdown):**
+**Pass 2 (see that pass's own delivered report for the complete
+breakdown):**
 - Backend: 1984 passed, 94 skipped (+77 net new since pass 1's 1907: 36
   production-secret-backend tests, 7 secret-migration-admin-CLI tests,
   26 Cloudflare Access tests, 3 net-new combined-middleware-stack tests
@@ -649,3 +708,99 @@ document for the complete breakdown):**
   pass 1 (218 passed).
 - No live Amazon or AI call made during this pass. No Railway,
   Cloudflare, Supabase, or Amazon console configuration performed.
+
+**Pass 3 (final review gate — see that turn's own delivered report for
+the complete breakdown):**
+- Backend: 2001 passed, 94 skipped (+17 net new since pass 2's 1984: 4
+  OAuth-state-consume-concurrency tests, 10 public-Login-URI
+  hijack-prevention tests, 1 OAuth-state-tampering test, 2
+  secret-key-rotation-count tests). 1 CI workflow fix (stale `0017`
+  revision assertions) + 1 new CI job (`0017`→`0018` upgrade) — no new
+  migration.
+- Frontend: 231 passed (+13 net new: 7
+  `api-credentials.test.ts` tests proving every request sends
+  `credentials: "include"`, 6 `check-legal-pages-ready.test.mjs` tests
+  for the new build-time legal-pages gate). TypeScript clean, lint
+  unchanged at the 36-error baseline. `npm run build`'s new `prebuild`
+  step correctly failed at the time (the real pages were still drafts);
+  `npx next build` directly still compiled cleanly.
+- No live Amazon or AI call made. No Railway, Cloudflare, Supabase, or
+  Amazon console configuration performed.
+
+**Pass 4 (this revision — legal-page finalization + Amazon Ads
+ownership model):**
+- Legal-entity, contact, and pilot-advertiser facts confirmed by the
+  operator (Ewisepartners LLC / EWise Partners / EWise Intelligence /
+  Bonney Lake, WA 98391 / info@ewisepartners.com / (630) 261-5987 / AJ
+  Duran as initial pilot advertiser) are now live on `/privacy`,
+  `/terms`, and `/marketing` — see §13 for exactly what still remains
+  outstanding (governing law, liability-limitation language, a fixed
+  retention period, and the Amazon Ads Partner application itself).
+  `scripts/check-legal-pages-ready.mjs` (final review gate, prior
+  revision) now passes against the real repo — confirmed directly:
+  `npm run build` exits `0`, including its `prebuild` step.
+- Backend: unchanged this pass (no backend code touched) — 2001 passed,
+  94 skipped, same as the final review gate's own count.
+- Frontend: 231 passed (unchanged count from the final review gate —
+  editing page content and flipping one CLI-behavior assertion to match
+  the now-finished pages did not add or remove a test). TypeScript
+  clean, lint unchanged at the 36-error baseline (zero in touched
+  files), `npm run build` clean end-to-end.
+- No live Amazon or AI call made. No Railway, Cloudflare, Supabase, or
+  Amazon console configuration performed — the Amazon Ads Partner
+  application specifically has **not** been created (§7); only this
+  document's own description of the intended ownership model changed.
+
+## 13. Remaining manual inputs
+
+Everything in this list requires the operator's own input, decision, or
+external action — none of it is guessed or invented anywhere in this
+codebase or its legal pages, per the governing instruction. Each item
+names exactly what is missing, matching how `/privacy` and `/terms`
+themselves describe the same gaps in user-facing prose (not bracketed
+placeholders — see those pages' own module comments for why).
+
+**Legal (blocks nothing technical; affects `/privacy` and `/terms`
+only):**
+- Governing-law and dispute-resolution jurisdiction for the Terms of
+  Service — not invented; `/terms`'s "Governing law" section states
+  plainly that this is not yet finalized.
+- Warranty-disclaimer and limitation-of-liability clause language,
+  jurisdiction-specific — same treatment, `/terms`'s "Disclaimer of
+  warranty; limitation of liability" section.
+- State of formation and any business-registration number for
+  Ewisepartners LLC, if you want either included in the published legal
+  pages (neither is currently referenced on either page — a registration
+  number in particular is not standard content for a consumer-facing
+  privacy policy/ToS, so this is only needed if you specifically want
+  it disclosed).
+- A full registered street address, if you want one published in
+  addition to the public business location (Bonney Lake, WA 98391)
+  already on both pages.
+- A fixed data-retention period and a self-service deletion mechanism —
+  `/privacy`'s "Retention and deletion" section currently states the
+  qualitative policy (retain only as needed / delete on request, subject
+  to legitimate retention obligations) without a specific day-count,
+  since none was supplied and none should be invented.
+
+**Operational (external actions this pass deliberately did not
+perform):**
+- Generate the production `AMAZON_SECRET_ENCRYPTION_KEYS` value and set
+  it, along with every other §2 environment variable, on the real
+  Railway services once created (§9).
+- Create the Railway project/services, the Cloudflare DNS records and
+  Access application, and register the new SP-API redirect/Login URIs
+  with Amazon — all still pending your explicit go-ahead (§9's own
+  numbered procedure and stop point).
+- Verify Cloudflare Access is actually enabled and enforcing on both
+  `app.*` and `api.*` before treating `/privacy`'s "Access control"
+  section as fully settled — that section already describes the
+  designed mechanism accurately; this is a deployment-time verification
+  step, not a text change.
+- Amazon Ads: do not create the Ads application, the "EWise Ads
+  Intelligence" LWA security profile, or any Ads OAuth code yet (§7).
+  When that work starts, register it as a **Partner** application (not
+  Direct Advertiser) under an EWise-controlled Amazon Developer account,
+  build the redirect URI for real before registering it anywhere, and
+  keep it read-only per the commitment already published on `/privacy`
+  and `/terms`.
