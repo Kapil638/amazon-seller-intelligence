@@ -14,49 +14,81 @@ No existing deployment configuration (`Procfile`, `railway.json`,
 before this pass — confirmed by direct search. This is a greenfield
 deployment design, not a modification of an existing one.
 
-## 0. Two blocking architectural gaps found during audit
+**Revision history:**
+- Pass 1: initial audit + TrustedHostMiddleware, DB pool sizing, worker
+  self-watchdog, public/private domain routing, draft legal pages. Two
+  gaps flagged as unresolved (§0a, §0c below, original text preserved
+  in git history) plus an interim-only secret-storage recommendation.
+- Pass 2 (this revision): all three flagged gaps closed with real
+  implementations, not workarounds — production `SecretProvider`
+  (§0a), Cloudflare Access API authentication (new, §0b), and the
+  SP-API Login URI (§0c) — plus Railway resource limits/cost analysis
+  (§1) and updated exact OAuth values (§6). Legal pages remain drafts
+  (unchanged, pending operator-supplied legal details). Still no
+  external deployment, DNS, or Amazon console change.
 
-Both are reported honestly rather than worked around silently, per the
-audit-first requirement.
+## 0. Architectural gaps found during audit — all now resolved in code
 
-### 0a. Production `SecretProvider` backend does not exist
+### 0a. Production `SecretProvider` backend — implemented
 
-`AMAZON_SECRET_BACKEND=production` raises `SecretAccessError` — it is
-explicitly reserved, unimplemented (`apps/api/app/amazon/secrets.py`,
-`SecretProviderFactory.create`). The only working backend today is
-`DevelopmentSecretProvider`: a plaintext JSON file at a configurable
-local path (`AMAZON_DEVELOPMENT_SECRET_STORE`, default
-`.data/amazon-development-secrets.json`), explicitly documented in its
-own module as "not a production vault."
+Originally: `AMAZON_SECRET_BACKEND=production` raised `SecretAccessError`
+unconditionally — reserved, unimplemented. **Now implemented**:
+`app/amazon/production_secrets.py`'s `ProductionSecretProvider`, backed
+by a new PostgreSQL table (`amazon_encrypted_secrets`, migration `0018`)
+and AES-256-GCM authenticated encryption — see the final report (message
+to operator) for the full design, or the module's own docstring for the
+complete threat model. Summary:
 
-**This means: as shipped, there is no production-grade place to store a
-seller's Amazon refresh-token reference.** Two options, requiring your
-decision before any real seller is connected through the deployed
-pilot:
+- Ciphertext-only storage: `reference` (the existing ASI secret
+  reference, non-secret), `key_version`, `nonce` (fresh per write),
+  `ciphertext`. No column anywhere holds plaintext.
+- The reference string is AES-GCM associated data — a ciphertext can
+  only decrypt successfully under the exact reference it was stored
+  for, defending against a row-swap/relabel at the storage layer.
+- Master key material: `AMAZON_SECRET_ENCRYPTION_KEYS` (JSON
+  `{key_version: base64(32 bytes)}`) + `AMAZON_SECRET_ACTIVE_KEY_VERSION`
+  — Railway encrypted variables only, never committed. Missing/invalid
+  configuration fails closed at `SecretProviderFactory.create()` time,
+  never lazily, never falling back to development.
+- Key rotation: `ProductionSecretProvider.rotate_key_version()`
+  re-encrypts one row under a new configured key_version; rows not yet
+  rotated stay readable under their original key_version indefinitely.
+- Migration path for the existing local seller token: documented and
+  tested (`app/amazon/secret_migration_admin.py`, `migrate` subcommand),
+  **not executed** against the real token — requires a deliberate
+  operator invocation with `AMAZON_SECRET_BACKEND=production` and real
+  key material configured first.
 
-1. **Interim, lower-effort:** keep `AMAZON_SECRET_BACKEND=development`
-   (or unset) on the deployed API service, with a Railway **persistent
-   volume** mounted at the `AMAZON_DEVELOPMENT_SECRET_STORE` path.
-   Works, but: plaintext token storage, single API instance only (no
-   horizontal scaling — two instances would each keep their own
-   divergent file), and the file's own docstring already warns it was
-   never designed for this. Zero new code required.
-2. **Proper fix:** implement a real production `SecretProvider` backed
-   by the existing Supabase Postgres (a new table, values encrypted at
-   rest with a symmetric key supplied via a Railway env var — e.g.
-   Fernet from the `cryptography` package), replacing the
-   `raise SecretAccessError(...)` branch. This is a genuine, scoped
-   feature (new module + a new migration) — **not implemented in this
-   pass**, since it is a real architecture/security decision your
-   review should weigh in on before any code is written, not something
-   to build unilaterally while "preparing deployment configuration."
+No Railway volume is used for secrets in this design — superseding pass
+1's interim "development provider + volume" recommendation entirely.
 
-**Recommendation:** option 1 for the initial private pilot (small,
-known seller count, single API instance, accepted interim risk,
-explicitly disclosed to pilot sellers) with option 2 planned as a
-near-term follow-up milestone before any broader rollout.
+### 0b. API authentication — implemented (new gap, closed in the same pass)
 
-### 0b. Hung-worker detection did not transfer to Railway's per-service model — now fixed in this pass
+CORS and `TrustedHostMiddleware` (pass 1) only ever validate an
+Origin/Host header — not an identity check; any non-browser client can
+set either to anything. `app/core/cloudflare_access.py`'s
+`CloudflareAccessMiddleware`, opt-in via `Settings.api_auth_backend`
+("disabled" by default; "cloudflare_access" for the deployed pilot),
+verifies a Cloudflare Access JWT's signature (RS256, Cloudflare's own
+published JWKS), issuer, audience, and expiry on every route except a
+hardcoded, non-configurable allowlist (`/health`, the OAuth callback,
+the OAuth Login URI). See §5 (now revised) and the final report for the
+full design and exact public-endpoint inventory.
+
+### 0c. SP-API OAuth Login URI — implemented
+
+Originally: no `/connection/login` route existed anywhere in this
+codebase; Amazon's own Developer Console still requires a real, live
+Login URI for a self-authorization SP-API application even though this
+app's actual flow is entirely ISV-initiated. **Now implemented**:
+`GET /api/v1/amazon/connection/login` (`app/api/routes/
+amazon_connection.py`) reuses `AmazonConnectionService.
+start_authorization` exactly — same fresh hashed OAuth state, same
+Seller Central consent URL construction the in-app "Connect Amazon"
+button already uses — and redirects the browser straight there. See §6
+for the exact, tested value.
+
+### 0d. Hung-worker detection did not transfer to Railway's per-service model — fixed in pass 1
 
 `scripts/supervisor.py`'s hung-worker detection (built this session)
 polls a worker's heartbeat *externally* and force-restarts the process
@@ -79,52 +111,63 @@ never fires while heartbeats keep succeeding, fires exactly once after
 genuine silence, and a graceful `stop()` permanently prevents a late
 fire.
 
-### 0c. Amazon Ads OAuth Login URI — not implemented, flagged not fabricated
-
-Confirmed directly in code and prior design docs: the SP-API "Login
-URI" (the endpoint Amazon would hit if a seller started authorization
-*from* Amazon's own app store) was never implemented —
-`docs/milestone-12/milestone-12b1c4a-oauth-callback-foundation.md`
-states this explicitly ("Login URI is not implemented"), and no
-`/connection/login` route exists anywhere in `apps/api/app/api/routes/`.
-This app's only working flow is **ISV-initiated** (a seller clicks
-"Connect Amazon" inside ASI's own UI), which never invokes a Login URI
-at all — Amazon's consent URL (`build_seller_central_consent_url`,
-`apps/api/app/amazon/oauth.py`) only ever sends `application_id`,
-`state`, and optional `version=beta`; no `redirect_uri` or login
-callback is part of that URL.
-
-If Amazon's Developer Console nonetheless requires *some* value in that
-field for a complete SP-API application registration, I cannot report
-a functioning new one — building a real Login URI handler is out of
-this deployment pass's scope. See §6 for what I recommend registering
-there as a safe placeholder, pending your decision.
-
 ## 1. Railway services
 
 One Railway project, six services, sharing one GitHub repo (monorepo —
 each service sets its own **Root Directory**).
 
-| Service | Root Dir | Build | Start Command | Healthcheck | Est. monthly cost (Hobby/Starter tier) |
-|---|---|---|---|---|---|
-| `api` | `apps/api` | Nixpacks (auto: `uv sync`) | `uv run uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'` | `GET /health` | ~$5–10 |
-| `frontend` | `apps/web` | Nixpacks (auto: `npm ci && npm run build`) | `npm run start -- --port $PORT` | `GET /` (via proxy.ts, passes through) | ~$5–10 |
-| `listings-worker` | `apps/api` | same image as `api` | `uv run python -m app.amazon.listings_worker` | none (long-running process; see §0b) | ~$3–5 |
-| `orders-worker` | `apps/api` | same | `uv run python -m app.amazon.orders_worker` | none | ~$3–5 |
-| `sales-traffic-worker` | `apps/api` | same | `uv run python -m app.amazon.sales_traffic_worker` | none | ~$3–5 |
-| `inventory-worker` | `apps/api` | same | `uv run python -m app.amazon.inventory_worker` | none | ~$3–5 |
+| Service | Root Dir | Build | Start Command | Healthcheck | Recommended limits (CPU / RAM) | Est. monthly cost (Hobby/Starter tier) |
+|---|---|---|---|---|---|---|
+| `api` | `apps/api` | Nixpacks (auto: `uv sync`) | `uv run uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'` | `GET /health` | 0.5 vCPU / 512 MB | ~$5–10 |
+| `frontend` | `apps/web` | Nixpacks (auto: `npm ci && npm run build`) | `npm run start -- --port $PORT` | `GET /` (via proxy.ts, passes through) | 0.5 vCPU / 512 MB | ~$5–10 |
+| `listings-worker` | `apps/api` | same image as `api` | `uv run python -m app.amazon.listings_worker` | none (long-running process; see §0d) | 0.25 vCPU / 256 MB | ~$3–5 |
+| `orders-worker` | `apps/api` | same | `uv run python -m app.amazon.orders_worker` | none | 0.25 vCPU / 256 MB | ~$3–5 |
+| `sales-traffic-worker` | `apps/api` | same | `uv run python -m app.amazon.sales_traffic_worker` | none | 0.25 vCPU / 256 MB | ~$3–5 |
+| `inventory-worker` | `apps/api` | same | `uv run python -m app.amazon.inventory_worker` | none | 0.25 vCPU / 256 MB | ~$3–5 |
 
-**Estimated total: ~$25–45/month** on Railway's Hobby/Starter usage-based pricing for a private pilot's expected low traffic — actual cost depends on Railway's current pricing and real usage; confirm current rates before committing.
+**Estimated total: ~$25–45/month** on Railway's Hobby/Starter usage-based pricing for a private pilot's expected low traffic — actual cost depends on Railway's current pricing and real usage; confirm current rates before committing. The CPU/RAM figures are conservative starting points (each worker is idle between polls, never processing more than one job at a time by design — see §3/`*_sync_max_concurrent_jobs_per_organization`), configured as Railway per-service resource limits in its dashboard; raise only if the dashboard's own usage graphs show a service actually approaching its limit.
 
 Every worker service enables `--restart-on-failure` (Railway's default
 for non-cron services) — combined with each worker's own self-watchdog
-(§0b), this is now the full production equivalent of the local
+(§0d), this is now the full production equivalent of the local
 supervisor's hung-worker detection.
 
 No `railway.json`/`railway.toml` files were added — Railway's per-service
 **custom Start Command** (set in its dashboard) is sufficient for all
 six services sharing two build roots, and avoids inventing repo-level
 config I cannot validate without an actual deploy.
+
+**Usage monitoring and spending alerts:** Railway's own per-service
+dashboard already shows CPU/memory/network usage over time — no new
+code needed. Two operator actions to configure once services exist
+(external, not performed by this pass): (1) check each service's usage
+graph during the pilot's first week to validate or revise the resource
+limits above; (2) set a Railway **spending alert** (Team/Project
+Settings → Usage → set a spending limit/notification threshold) at
+roughly $50/month — comfortably above the ~$25–45 estimate, so it
+catches a genuine runaway (an infinite retry loop, a leaked connection)
+without false-alarming on normal pilot usage.
+
+**6 services vs. 3 (reasoned analysis, not measured — do not redesign
+on this estimate alone, per the governing instruction):** Railway's
+Hobby/Starter tiers bill by actual resource consumption (CPU-seconds ×
+allocation, memory-GB-seconds), not a flat per-service fee. Merging the
+4 workers into fewer services (e.g. one process running all 4 worker
+loops, or 3 services combining 2 workers each) would not reduce total
+CPU/memory-time consumed — the same claim/poll loops run the same
+amount either way — so it would not materially reduce Railway's
+usage-based bill. What it *would* lose is the failure isolation the
+governing instruction already asked to keep (item 5): today, a crash or
+a stuck event loop in one worker's dependencies can only take down that
+one worker (contained by `restart-on-failure` + the self-watchdog,
+§0d); merging workers reintroduces one process's failure taking down
+others sharing it. **Recommendation: keep 6 services for the pilot** —
+the isolation benefit is concrete and already required, and the cost
+saving from consolidating is not expected to be material. Revisit only
+if real Railway usage data (once deployed) shows a fixed per-service
+minimum/idle charge large enough to change this conclusion — that number
+cannot be known without an actual deployment, which this pass does not
+perform.
 
 ## 2. Required environment variables per service
 
@@ -140,8 +183,12 @@ SP_API_OAUTH_REDIRECT_URI=https://api.ewiseintelligence.com/api/v1/amazon/connec
 SP_API_PRODUCTION_APPLICATION_ID=<existing value>
 SP_API_PRODUCTION_LWA_CLIENT_ID=<existing value>
 SP_API_PRODUCTION_LWA_CLIENT_SECRET=<existing value, rotate per §7>
-AMAZON_SECRET_BACKEND=development             # see §0a — pending your decision
-AMAZON_DEVELOPMENT_SECRET_STORE=/data/amazon-development-secrets.json   # on an attached Railway volume, §0a option 1
+AMAZON_SECRET_BACKEND=production
+AMAZON_SECRET_ENCRYPTION_KEYS={"v1":"<base64 32-byte key, generate per §8>"}
+AMAZON_SECRET_ACTIVE_KEY_VERSION=v1
+API_AUTH_BACKEND=cloudflare_access
+CLOUDFLARE_ACCESS_TEAM_DOMAIN=<your-team>.cloudflareaccess.com
+CLOUDFLARE_ACCESS_AUDIENCE=<Application Audience (AUD) tag from the Access application protecting api.*>
 DEFAULT_ORGANIZATION_ID=<existing value>
 SUPABASE_URL=<existing value>
 SUPABASE_SERVICE_ROLE_KEY=<existing value>
@@ -150,7 +197,9 @@ RAINFOREST_API_KEY=<existing value>
 # every other existing .env.example value carried over unchanged
 ```
 `ASI_<WORKER>_WORKER_ENABLED` is deliberately **absent** on the `api`
-service — it must never claim/process jobs itself.
+service — it must never claim/process jobs itself. No Railway volume is
+attached to this service — the production secret backend is Postgres,
+not a file.
 
 ### each of the 4 worker services
 ```
@@ -158,11 +207,15 @@ ASI_<WORKER>_WORKER_ENABLED=true    # e.g. ASI_INVENTORY_WORKER_ENABLED=true —
 DATABASE_URL=<same Supabase pooler URL>
 DB_POOL_SIZE=1
 DB_MAX_OVERFLOW=1
-AMAZON_SECRET_BACKEND=development
-AMAZON_DEVELOPMENT_SECRET_STORE=/data/amazon-development-secrets.json   # same shared volume as api, §0a
+AMAZON_SECRET_BACKEND=production
+AMAZON_SECRET_ENCRYPTION_KEYS={"v1":"<same key as api>"}
+AMAZON_SECRET_ACTIVE_KEY_VERSION=v1
 SUPABASE_URL=<existing value>
 SUPABASE_SERVICE_ROLE_KEY=<existing value>
 ```
+No `API_AUTH_BACKEND`/`CLOUDFLARE_ACCESS_*` on worker services — they
+serve no HTTP routes at all, so `CloudflareAccessMiddleware` (an API
+concern) has nothing to protect there.
 `ASI_DB_RUNTIME_CONTEXT` is **not** set here — each worker's own
 `main()` sets it internally (`"listings_worker"` etc.) immediately after
 confirming its own enable flag.
@@ -207,32 +260,48 @@ beyond what it already provides.
 
 ## 5. Cloudflare Access
 
-**Policy scope: `app.ewiseintelligence.com/*` only.** Explicit
-exclusions (never gated by Access):
+**Revised in pass 2**: both `app.ewiseintelligence.com/*` AND
+`api.ewiseintelligence.com/*` are protected by Cloudflare Access —
+superseding pass 1's "do not gate api.* at all" recommendation, which
+relied on CORS as the caller boundary. Correction 2 of the governing
+task was explicit that CORS is not authentication; the backend-side
+`CloudflareAccessMiddleware` (§0b) is the real boundary, and Cloudflare
+Access is what actually issues the JWT it verifies — so `api.*` must sit
+behind an Access application for that JWT to exist on real requests at
+all.
 
+**Recommended setup: one Access application covering
+`*.ewiseintelligence.com` scoped to `app.*` and `api.*` only** (not the
+bare domain/`www`, which stay outside Access entirely per the public
+marketing/legal requirement) — sharing one Application Audience (AUD)
+tag and one login session across both hostnames, so a seller
+authenticates once and both the frontend page load and every direct
+browser→API call (this app's existing fetch pattern, `apps/web/src/lib/
+api.ts`) carry a valid session with no frontend code change required.
+Set `CLOUDFLARE_ACCESS_AUDIENCE` on the `api` Railway service to this
+one application's AUD tag.
+
+Explicit bypass rules required on this Access application (in addition
+to `app.core.cloudflare_access.PUBLIC_PATHS`'s own independent,
+hardcoded exemption for the same three paths — belt and suspenders,
+never relying on only one side):
+
+- `api.ewiseintelligence.com/health` — Railway's own healthcheck prober,
+  and this pass's one remaining public liveness check, hit this
+  directly and can never complete an Access login challenge.
+- `api.ewiseintelligence.com/api/v1/amazon/connection/callback` —
+  Amazon's own server redirects the seller's browser here directly
+  after consent; it can never complete an Access login.
+- `api.ewiseintelligence.com/api/v1/amazon/connection/login` — this
+  app's registered Login URI (§0c); reached the same way.
 - `ewiseintelligence.com/*` and `www.ewiseintelligence.com/*` — a
-  **different hostname**, never touched by an Access policy scoped to
-  `app.*` in the first place; this is the cleanest possible exclusion
-  (no bypass rule needed at all).
-- `api.ewiseintelligence.com/api/v1/amazon/connection/callback` — the
-  registered OAuth redirect URI. Amazon's own server calls this
-  directly; it can never complete a Cloudflare Access login challenge.
-  **Must be an explicit bypass rule** on the `api.*` hostname if Access
-  is ever applied there too (current design does not gate `api.*`
-  behind Access at all — see below).
-- `api.ewiseintelligence.com/health` and `/health/workers` — Railway's
-  own healthcheck prober hits these directly and cannot complete an
-  Access login either.
+  different hostname, never touched by an Access application scoped to
+  `app.*`/`api.*` in the first place; no bypass rule needed at all (the
+  cleanest possible exclusion, unchanged from pass 1).
 
-**Recommendation: do not put `api.ewiseintelligence.com` behind
-Cloudflare Access at all.** The backend has no user-facing browser UI of
-its own — every legitimate caller is either the `app.*` frontend (via
-CORS, already restricted to that one origin) or Amazon's own OAuth
-callback. Gating it with Access would require bypass rules for the
-callback and every health-check path, widening the exclusion surface
-for no real benefit; CORS + TrustedHostMiddleware (§ code changes,
-already implemented) already scope who can call it meaningfully. Apply
-Access to `app.ewiseintelligence.com/*` only.
+`/health/workers` is deliberately **not** a bypass rule — it now
+requires a verified Access identity like any other protected route
+(§0b), since it reveals internal `worker_type` names.
 
 ## 6. SP-API OAuth — exact values
 
@@ -259,18 +328,39 @@ the Amazon Developer Console myself** — this value is for you to enter,
 and I will stop and wait for your confirmation before any live OAuth
 test against the new domain.
 
-**Login URI:** no functioning value exists to report (§0c). If Amazon's
-console requires a non-empty value, the safest **placeholder**
-recommendation — pending your decision — is
-`https://app.ewiseintelligence.com/connection` (the existing "Connect
-Amazon" page a human would land on), clearly understood to not
-implement Amazon's own Login-URI-initiated handshake. Do not register
-this as if it were a working integration.
+**Login URI — real, tested value (pass 2, §0c)**, `GET
+/api/v1/amazon/connection/login` (`apps/api/app/api/routes/
+amazon_connection.py`), covered by `tests/test_amazon_oauth_login.py`
+(6 tests: redirects into the exact same consent-URL construction as
+`POST /connection/authorize`, creates a real hashed OAuth state row,
+ignores any attacker-supplied query parameters, fails closed with 503
+when no application id is configured):
+```
+https://api.ewiseintelligence.com/api/v1/amazon/connection/login
+```
+This is the value to enter in Amazon's Developer Console's Login URI
+field — it is a genuine endpoint of this application, not a
+placeholder, and behaves identically to clicking "Connect Amazon"
+inside ASI's own UI.
+
+**Frontend return URI** (where a seller lands back in the app after the
+callback finishes, success or failure) — read directly from
+`app.amazon.oauth_callback.frontend_connection_return_url`, called by
+the callback route with `cfg.cors_origins[0]` as the origin:
+```
+https://app.ewiseintelligence.com/connection?amazon=success   (or ?amazon=denied / ?amazon=error)
+```
+This depends on `CORS_ORIGINS`'s **first** entry being
+`https://app.ewiseintelligence.com` on the deployed `api` service (§2) —
+worth a dedicated post-deployment check (§11) precisely because it is
+derived from a list's first element rather than its own dedicated
+setting; flagged here rather than silently trusted.
 
 ## 7. Amazon Ads API — future redirect URL
 
-No Ads OAuth code exists yet (§0c audit) — this is a **prediction**
-based on the SP-API callback's own path convention, for you to note
+No Ads OAuth code exists yet (confirmed by the same audit that led to
+§0c) — this is a **prediction** based on the SP-API callback's own path
+convention, for you to note
 for when Ads API approval/scope assignment completes and that
 integration is actually built:
 ```
@@ -297,7 +387,9 @@ implementation pass would need, not this one.
 | `SP_API_PRODUCTION_LWA_CLIENT_ID` / `_SECRET` | Amazon Seller Central Developer Console (Draft/Production app) | Railway env var, `api` only (workers resolve secrets via SecretProvider, not this pair directly — confirm this at implementation time) | Rotate if ever exposed in a log/commit; requires re-registering with Amazon |
 | `OPENAI_API_KEY` | OpenAI dashboard | Railway env var, `api` only | Standard OpenAI key rotation |
 | `RAINFOREST_API_KEY` | Rainforest dashboard | Railway env var, `api` only | Standard provider rotation |
-| Amazon seller refresh-token references | Generated per-seller during OAuth | `DevelopmentSecretProvider`'s JSON file on a Railway volume (§0a interim) | No rotation mechanism exists yet beyond a seller re-authorizing from Seller Central |
+| `AMAZON_SECRET_ENCRYPTION_KEYS` (pass 2, §0a) | Generated locally, once: `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"` — 32 random bytes, base64-encoded, wrapped as `{"v1":"<value>"}` | Railway env var, `api` + 4 workers (identical value on every service — any of them may need to decrypt a row) | Rotation procedure: generate a new key, add it as a new `key_version` alongside the old one in the JSON object (old key stays present so already-encrypted rows keep decrypting), set `AMAZON_SECRET_ACTIVE_KEY_VERSION` to the new version for new writes, then re-encrypt existing rows on your own schedule via `ProductionSecretProvider.rotate_key_version()`; only remove the old key from the JSON object once every row has been confirmed rotated |
+| Amazon seller refresh-token references | Generated per-seller during OAuth | `amazon_encrypted_secrets` (Supabase Postgres), ciphertext only — see §0a | Rotation is per-value re-encryption above; a seller can independently revoke/reauthorize from Seller Central at any time |
+| `CLOUDFLARE_ACCESS_AUDIENCE` (pass 2, §0b) | Cloudflare dashboard, assigned when the Access application is created | Railway env var, `api` only | Not secret-sensitive in the same way as a credential (it identifies an application, not a key) — rotate by editing the Access application if it is ever recreated |
 | `WORKER_WATCHDOG_STALE_AFTER_SECONDS` etc. | Not a secret — operational config | Railway env var, workers | N/A |
 
 **Never committed anywhere** — confirmed: no `.env` file is tracked by
@@ -307,33 +399,49 @@ a placeholder/comment, never a real value.
 
 ## 9. Deployment procedure (once approved)
 
-1. Create the Railway project, connect the GitHub repo.
-2. Create the 6 services per §1, each with its own Root Directory and
-   Start Command.
-3. Set every env var per §2 on each service (copy real values from the
-   current local `.env` for anything marked "existing value" — never
-   paste them into this document or any commit).
-4. Attach a Railway persistent volume to the `api` service (and each
-   worker, if §0a option 1 is confirmed) at the
-   `AMAZON_DEVELOPMENT_SECRET_STORE` path.
-5. Deploy `api` first; confirm `GET https://<railway-api-domain>/health`
-   returns `200` before deploying anything else.
-6. Deploy the 4 workers; confirm each publishes a heartbeat via
-   `GET /health/workers` on the `api` service.
+1. Generate the production secret-encryption key (§8) and note it
+   somewhere secure outside this repo — needed for step 3.
+2. Create the Railway project, connect the GitHub repo.
+3. Create the 6 services per §1, each with its own Root Directory,
+   Start Command, and the resource limits from §1.
+4. Set every env var per §2 on each service (copy real values from the
+   current local `.env` for anything marked "existing value"; use the
+   key from step 1 for `AMAZON_SECRET_ENCRYPTION_KEYS` — never paste
+   any of this into this document or any commit).
+5. Deploy `api` first with `API_AUTH_BACKEND` left at its default
+   (`disabled`/unset) for this initial deploy — the Cloudflare Access
+   application doesn't exist yet (it is created in step 9), so every
+   protected route would 401 with nothing able to issue it a valid
+   token. Confirm `GET https://<railway-api-domain>/health` returns
+   `200` (body `{"status": "ok"}` only) before deploying anything else.
+6. Deploy the 4 workers; confirm each publishes a heartbeat (checked
+   directly against the database, or temporarily via
+   `GET /health/workers` on the Railway-provided domain before Access is
+   enabled — see step 10).
 7. Deploy `frontend` with `NEXT_PUBLIC_API_BASE_URL` pointed at the
    `api` service's Railway-provided domain (not yet the custom domain).
 8. Add the 4 Cloudflare DNS records (§4) once Railway confirms each
    service's custom domain is verified.
-9. Add Cloudflare Access to `app.ewiseintelligence.com/*` only (§5).
-10. **Stop.** Do not touch Amazon's Developer Console yet. Confirm with
-    the operator that `https://api.ewiseintelligence.com/health`
-    resolves correctly end-to-end (through Cloudflare) before any
-    further step.
-11. Only after that confirmation: register the new redirect URI (§6)
-    alongside the existing tunnel one in Amazon's console, update
-    `SP_API_OAUTH_REDIRECT_URI` on the `api` service to the new value,
-    and validate one real OAuth round-trip end-to-end before removing
-    the old tunnel URI.
+9. Create the Cloudflare Access application covering `app.*` and `api.*`
+   (§5), with the 3 bypass rules (`/health`, the callback, the login
+   URI). Note its Application Audience (AUD) tag.
+10. Set `API_AUTH_BACKEND=cloudflare_access` and
+    `CLOUDFLARE_ACCESS_TEAM_DOMAIN`/`CLOUDFLARE_ACCESS_AUDIENCE` on the
+    `api` service using that AUD tag; redeploy `api`. Re-verify
+    `GET https://api.ewiseintelligence.com/health` still returns `200`
+    (it must — this is the one route Access bypasses AND
+    `PUBLIC_PATHS` exempts), and that `GET /health/workers` now requires
+    an authenticated browser session (a bare `curl` should get `401`).
+11. **Stop.** Do not touch Amazon's Developer Console yet. Confirm with
+    the operator that both `https://api.ewiseintelligence.com/health`
+    and `https://app.ewiseintelligence.com` resolve correctly end-to-end
+    (through Cloudflare, through Access) before any further step.
+12. Only after that confirmation: register the new redirect URI AND the
+    new Login URI (§6) — the redirect URI alongside the existing tunnel
+    one, per instruction #14, until validated — in Amazon's console,
+    update `SP_API_OAUTH_REDIRECT_URI` on the `api` service to the new
+    value, and validate one real OAuth round-trip end-to-end before
+    removing the old tunnel redirect URI.
 
 ## 10. Rollback procedure
 
@@ -341,7 +449,7 @@ a placeholder/comment, never a real value.
   its own "Redeploy previous version" per affected service. No DNS
   change needed (same custom domain, same service).
 - **Worker bad deploy:** same per-service rollback; a worker's own
-  restart-on-failure + self-watchdog (§0b) means a genuinely broken
+  restart-on-failure + self-watchdog (§0d) means a genuinely broken
   worker fails visibly (`/health/workers` shows it unavailable) rather
   than silently, so a bad worker deploy is detectable before it causes
   real harm.
@@ -350,26 +458,51 @@ a placeholder/comment, never a real value.
   tunnel remains available as the existing, already-working OAuth path
   throughout (§6 — never removed until the new one is validated), so
   local/dev OAuth testing is never blocked by anything in this rollout.
-- **Amazon OAuth redirect URI change:** since the old URI is kept
-  registered alongside the new one until validated (§6/§9 step 11),
-  rolling back is simply reverting `SP_API_OAUTH_REDIRECT_URI` on the
-  `api` service to the old tunnel value — no Amazon console change
+- **Amazon OAuth redirect/login URI change:** since the old redirect URI
+  is kept registered alongside the new one until validated (§6/§9 step
+  12), rolling back is simply reverting `SP_API_OAUTH_REDIRECT_URI` on
+  the `api` service to the old tunnel value — no Amazon console change
   needed for *this* specific rollback, only for eventually removing the
-  old URI once no longer needed.
-- **Secret-backend interim volume (§0a option 1) lost/corrupted:** every
-  connected seller would need to re-authorize from Seller Central — no
-  ASI business data is lost (that lives in Supabase, separate from the
-  volume), only the connection/token state.
+  old URI once no longer needed. The Login URI has no "old value" to
+  revert to (§0c — none existed before this pass); if it ever needs to
+  stop working temporarily, the safest action is leaving the registered
+  value as-is (it fails closed with a 503 if `SP_API_PRODUCTION_APPLICATION_ID`
+  is ever unset, never with an unhandled error) rather than pointing
+  Amazon's console at a nonexistent route again.
+- **`API_AUTH_BACKEND=cloudflare_access` misconfigured or the Access
+  application itself broken:** set `API_AUTH_BACKEND=disabled` on the
+  `api` service and redeploy — this immediately reopens every route with
+  no auth middleware at all (the pre-pass-2 behavior), unblocking the
+  frontend while the Access application is fixed. Treat this as a
+  temporary, monitored state, not a resting one — CORS/TrustedHost alone
+  are not a substitute (§0b).
+- **Secret backend misconfigured (missing/invalid
+  `AMAZON_SECRET_ENCRYPTION_KEYS`/`AMAZON_SECRET_ACTIVE_KEY_VERSION`):**
+  `SecretProviderFactory.create()` fails closed immediately — the `api`
+  service and every worker will error on any secret operation rather
+  than silently falling back to `development` or losing data. Fix the
+  env var and redeploy; no data is lost or corrupted by this failure
+  mode, since nothing is written until the keys are valid.
+- **A bad key rotation (§8):** since the old key_version stays present
+  in `AMAZON_SECRET_ENCRYPTION_KEYS` until deliberately removed, rows
+  not yet rotated remain readable throughout — a rotation only affects
+  rows explicitly passed to `rotate_key_version()`.
 
 ## 11. Post-deployment verification checklist
 
-- [ ] `GET https://api.ewiseintelligence.com/health` → `200`,
-      `persistence: "configured"`
-- [ ] `GET https://api.ewiseintelligence.com/health/workers` → all 4
-      worker types `available: true` within a few minutes of deploy
-- [ ] `https://app.ewiseintelligence.com` loads the full app
+- [ ] `GET https://api.ewiseintelligence.com/health` → `200`, body is
+      exactly `{"status": "ok"}` (no `persistence` field — pass 2
+      sanitized this route since it is the one public path)
+- [ ] `GET https://api.ewiseintelligence.com/health/workers` with no
+      Access session → `401` (pass 2 — this route now requires a
+      verified identity, since it reveals worker_type names)
+- [ ] `GET https://api.ewiseintelligence.com/health/workers`, from an
+      authenticated browser session → all 4 worker types
+      `available: true` within a few minutes of deploy
+- [ ] `https://app.ewiseintelligence.com` requires a Cloudflare Access
+      login, then loads the full app
 - [ ] `https://ewiseintelligence.com` loads the public marketing page
-      (never the full app)
+      (never the full app), with no Access login required
 - [ ] `https://ewiseintelligence.com/privacy` and `/terms` load without
       Cloudflare Access, from an unauthenticated/incognito session
 - [ ] `https://ewiseintelligence.com/seller/inventory` (an app-only
@@ -378,13 +511,25 @@ a placeholder/comment, never a real value.
 - [ ] `https://app.ewiseintelligence.com/*` requires Cloudflare Access
       login; `https://ewiseintelligence.com/*` does not
 - [ ] CORS: a request to `api.ewiseintelligence.com` from
-      `app.ewiseintelligence.com`'s origin succeeds; from an
-      unrecognized origin, fails
-- [ ] No live Amazon OAuth attempted until §9 step 10's explicit stop
+      `app.ewiseintelligence.com`'s origin succeeds (given a valid
+      Access session); from an unrecognized origin, fails
+- [ ] `GET https://api.ewiseintelligence.com/api/v1/amazon/connection/login`
+      with no Access session, no cookies → `302` straight to
+      `sellercentral.amazon.<tld>/apps/authorize/consent?...` (proves
+      the bypass rule + `PUBLIC_PATHS` both work for the real Login URI)
+- [ ] A bare `curl` (no Access session) against any other
+      `/api/v1/amazon/*` route → `401`, generic body, never a stack
+      trace or internal detail
+- [ ] `SELECT * FROM amazon_encrypted_secrets` from the Supabase SQL
+      editor shows only `reference`/`key_version`/`nonce`/`ciphertext`/
+      timestamps — no plaintext column, confirming the production
+      secret backend is actually the one active (not a silent fallback)
+- [ ] No live Amazon OAuth attempted until §9 step 12's explicit stop
       point is reviewed with the operator
 
 ## 12. Tests run this pass
 
+**Pass 1:**
 - Backend: 1907 passed, 90 skipped (was 1897 before this pass — +10 new:
   3 DB pool-size, 2 TrustedHostMiddleware, 5 heartbeat-watchdog).
 - Frontend: 218 passed (was 204 — +14 new, `public-routing.test.ts`).
@@ -396,3 +541,25 @@ a placeholder/comment, never a real value.
   (11 real `react/no-unescaped-entities` errors found and fixed in the
   new legal-page JSX during this pass).
 - No migration added. No live Amazon or AI call made during this pass.
+
+**Pass 2 (this revision — see the final report delivered alongside this
+document for the complete breakdown):**
+- Backend: 1984 passed, 94 skipped (+77 net new since pass 1's 1907: 36
+  production-secret-backend tests, 7 secret-migration-admin-CLI tests,
+  26 Cloudflare Access tests, 3 net-new combined-middleware-stack tests
+  (2 pre-existing from pass 1 in the same file), 5 OAuth-login-URI
+  tests, plus small updates to 3 existing tests whose assertions named
+  an exact table count/message/head-revision that necessarily changed —
+  no net count change from those). 4 new disposable-PostgreSQL tests for
+  migration `0018` (opt-in, skipped without
+  `ASI_ALLOW_DISPOSABLE_POSTGRES=1`, accounting for the +4 skipped delta
+  90→94).
+- 1 new migration: `0018_amazon_encrypted_secrets`, additive-only,
+  reversible (`downgrade()` drops the table — no seller data is lost by
+  a downgrade since Supabase business data lives elsewhere; only
+  connection/token state would need reauthorization, exactly like the
+  interim-volume story pass 1 already disclosed).
+- No frontend changes this pass — frontend test count unchanged from
+  pass 1 (218 passed).
+- No live Amazon or AI call made during this pass. No Railway,
+  Cloudflare, Supabase, or Amazon console configuration performed.
