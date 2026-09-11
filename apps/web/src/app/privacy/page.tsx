@@ -5,23 +5,21 @@ import { DraftNotice, PublicPageShell } from "@/components/public-page-shell";
 // legal operator Ewisepartners LLC (trading as EWise Partners, operating
 // the public product EWise Intelligence), public business location
 // Bonney Lake, WA 98391, contact info@ewisepartners.com / (630)
-// 261-5987, and initial pilot advertiser AJ Duran.
+// 261-5987, and initial pilot advertiser AJ Duran. Retention policy is
+// the operator-confirmed 90-day standard.
 //
 // This page deliberately contains no bracketed pending-placeholder
 // token — see check-legal-pages-ready.mjs's own docstring for why that
 // specific marker blocks the build. A small number of items the operator
-// has not yet supplied (a governing-law/liability clause, a specific
-// street address distinct from the public business location above, a
-// fixed data-retention period, and confirmation that Cloudflare Access
-// is actually live) are instead described in complete, honest prose
-// that states plainly what is and is not yet finalized — never invented
-// and never disguised as settled. See docs/AI_HANDOVER/
-// 20_PILOT_DEPLOYMENT_EWISE.md's "Remaining manual inputs" for the
-// tracked list of what still needs the operator's input before a wider
-// rollout. Every other claim on this page is a factual, verified
-// description of this codebase's actual current data handling — each
-// grounded in the specific source file noted inline — never
-// aspirational or assumed.
+// has not yet supplied (a specific street address distinct from the
+// public business location above, and a registration number / state of
+// incorporation) are simply not referenced on this page rather than
+// invented — do not add them without the operator's own input. See
+// docs/AI_HANDOVER/20_PILOT_DEPLOYMENT_EWISE.md's "Remaining manual
+// inputs" for the tracked list. Every other claim on this page is a
+// factual, verified description of this codebase's actual current data
+// handling — each grounded in the specific source file noted inline —
+// never aspirational or assumed.
 export const metadata = {
   title: "Privacy Policy — EWise Intelligence",
 };
@@ -52,6 +50,19 @@ export default function PrivacyPage() {
             Amazon account and made available through the Service under their own authorization — the Service does
             not claim ownership of that data, and does not use it for any purpose beyond providing the Service to
             that advertiser.
+          </p>
+        </section>
+
+        <section>
+          <h2 className="mb-2 text-lg font-medium">Purposes of collection and processing</h2>
+          <p>
+            We collect and process the Amazon data described below solely to provide the Service to the advertiser
+            who authorized it: to display marketplace, listing, order, inventory, sales, and (in future,
+            read-only) advertising data back to that advertiser; to calculate deterministic profit, advertising,
+            and listing-quality metrics from it; and, only where an advertiser actively uses an AI-assisted
+            analysis feature, to generate natural-language explanations of it. We do not use Amazon data for
+            advertising to advertisers, for profiling, or for any purpose unrelated to providing the Service to the
+            advertiser it belongs to.
           </p>
         </section>
 
@@ -118,12 +129,12 @@ export default function PrivacyPage() {
         <section>
           <h2 className="mb-2 text-lg font-medium">Retention and deletion</h2>
           <p>
-            We retain advertiser data only for as long as needed to provide the Service, or to meet legitimate
-            legal, accounting, or audit obligations. An advertiser may revoke the Service&apos;s access to their
-            Amazon account at any time (see &quot;Revoking access&quot; below) and may separately request deletion
-            of their data by contacting us at the address above; we will delete data that is not subject to such a
-            retention obligation. A fixed retention period and a self-service deletion tool have not yet been built
-            for this pilot — until they are, a deletion request is handled directly by us on contact.
+            EWise Intelligence retains authorized advertiser data while the connection or pilot service remains
+            active. Following authorization revocation or service termination, the data will be deleted or
+            irreversibly anonymized within 90 days unless a shorter period is required by Amazon policy or a
+            longer period is legally required. An advertiser may revoke the Service&apos;s access to their Amazon
+            account at any time (see &quot;Revoking access&quot; below) and may separately request deletion of
+            their data at any time by contacting us at the address above.
           </p>
         </section>
 

@@ -1,14 +1,13 @@
 import { DraftNotice, PublicPageShell } from "@/components/public-page-shell";
 
 // pilot-deployment-ewise — see privacy/page.tsx's own module comment for
-// the governing rule and rationale: this page deliberately contains no
-// bracketed pending-placeholder token (see check-legal-pages-ready.mjs),
-// but the "Disclaimer of warranty; limitation of liability" and "Governing
-// law" sections below intentionally do not state specific liability-cap
-// or jurisdiction language — that is real legal drafting this document
-// must not invent. Both sections instead honestly state that this
-// specific language is not yet finalized, rather than fabricating it or
-// silently omitting the topic. See docs/AI_HANDOVER/
+// the governing rule and rationale. Warranty disclaimer, third-party-
+// services, liability cap, Washington governing law, 30-day good-faith
+// dispute discussion, and severability provisions below are the
+// operator-approved final language for this pilot. This page
+// deliberately still does not state a street address beyond the public
+// business location, a registration number, or a state of incorporation
+// — none were supplied, and none are invented. See docs/AI_HANDOVER/
 // 20_PILOT_DEPLOYMENT_EWISE.md's "Remaining manual inputs" for the
 // tracked list of what still needs the operator's input.
 export const metadata = {
@@ -75,12 +74,38 @@ export default function TermsPage() {
         </section>
 
         <section>
-          <h2 className="mb-2 text-lg font-medium">Disclaimer of warranty; limitation of liability</h2>
+          <h2 className="mb-2 text-lg font-medium">Third-party services</h2>
           <p>
-            The Service is provided on an as-is basis during this early private pilot. A complete, jurisdiction-
-            specific disclaimer of warranties and limitation-of-liability clause has not yet been finalized and will
-            be published here, and reviewed with advertisers, before the Service is offered more broadly. This
-            paragraph is not a substitute for that clause and does not itself limit either party&apos;s liability.
+            The Service depends on third-party services outside our control, including Amazon&apos;s Selling
+            Partner API and (when introduced) Amazon Ads API, Supabase, Railway, Cloudflare, and OpenAI (see the
+            Privacy Policy&apos;s &quot;Sub-processors and infrastructure&quot; section). We are not responsible for
+            outages, changes, errors, or policy changes made by those third parties, though we will make reasonable
+            efforts to keep the Service working with them and to notify advertisers of material changes.
+          </p>
+        </section>
+
+        <section>
+          <h2 className="mb-2 text-lg font-medium">Disclaimer of warranty</h2>
+          <p>
+            THE SERVICE IS PROVIDED &quot;AS IS&quot; AND &quot;AS AVAILABLE,&quot; WITHOUT WARRANTY OF ANY KIND,
+            EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+            A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. We do not warrant that the Service will be uninterrupted,
+            error-free, or free of inaccuracies (including inaccuracies originating from Amazon&apos;s or another
+            third party&apos;s own data or systems), or that any calculated figure will be correct for any
+            particular purpose.
+          </p>
+        </section>
+
+        <section>
+          <h2 className="mb-2 text-lg font-medium">Limitation of liability</h2>
+          <p>
+            To the maximum extent permitted by law, neither party will be liable to the other for any indirect,
+            incidental, special, consequential, or punitive damages, or for any loss of profits, revenue, data, or
+            business opportunity, arising out of or relating to the Service or these Terms. Each party&apos;s total
+            aggregate liability arising out of or relating to the Service or these Terms will not exceed the
+            greater of (a) the fees the advertiser paid us in the 12 months preceding the claim, or (b) one hundred
+            US dollars (US $100). This limitation does not apply to liability that cannot legally be excluded or
+            limited, or to liability arising from fraud, willful misconduct, or gross negligence.
           </p>
         </section>
 
@@ -90,17 +115,28 @@ export default function TermsPage() {
             Either party may end pilot participation at any time. An advertiser may revoke the Service&apos;s access
             to their Amazon account directly from Amazon Seller Central at any time, independent of this
             application. Data retention after termination follows the Privacy Policy&apos;s own &quot;Retention and
-            deletion&quot; section, including our ability to retain data as needed to meet legitimate legal,
-            accounting, or audit obligations.
+            deletion&quot; section.
           </p>
         </section>
 
         <section>
-          <h2 className="mb-2 text-lg font-medium">Governing law</h2>
+          <h2 className="mb-2 text-lg font-medium">Governing law and dispute resolution</h2>
           <p>
-            A specific governing-law and dispute-resolution clause has not yet been finalized for this pilot and
-            will be published here before the Service is offered more broadly. Until then, any dispute is addressed
-            directly between Ewisepartners LLC and the advertiser.
+            These Terms are governed by the laws of the State of Washington, without regard to its conflict-of-laws
+            principles. Before filing any claim relating to the Service or these Terms, both parties agree to
+            attempt in good faith to resolve the dispute through written discussion for at least 30 days. If the
+            dispute is not resolved within that period, it will be brought exclusively in the state or federal
+            courts located in Washington State, and each party consents to the personal jurisdiction of those
+            courts.
+          </p>
+        </section>
+
+        <section>
+          <h2 className="mb-2 text-lg font-medium">Severability</h2>
+          <p>
+            If any provision of these Terms is held invalid or unenforceable, that provision will be limited or
+            eliminated to the minimum extent necessary, and the remaining provisions will remain in full force and
+            effect.
           </p>
         </section>
 
