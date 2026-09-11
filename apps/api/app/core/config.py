@@ -167,6 +167,60 @@ class Settings(BaseSettings):
         ),
     )
 
+    # pilot-deployment-ewise, correction 2 — API authentication.
+    # CORS/TrustedHostMiddleware are not an identity check (they only
+    # ever validate an Origin/Host header, which any non-browser client
+    # can set to anything); this is the boundary that actually is one.
+    # "disabled" (default) registers no auth middleware at all — local
+    # dev/tests are unaffected, matching allowed_hosts' own opt-in
+    # pattern. "cloudflare_access" requires both
+    # cloudflare_access_team_domain and cloudflare_access_audience to be
+    # set (enforced below) and registers CloudflareAccessMiddleware
+    # (app.core.cloudflare_access) in front of every route not in that
+    # module's own hardcoded PUBLIC_PATHS allowlist — deliberately not
+    # itself settings-configurable, so a misconfigured environment
+    # variable can never silently widen which routes are public.
+    api_auth_backend: str = Field(
+        default="disabled",
+        description=(
+            "'disabled' (default; no auth middleware, current behavior) or "
+            "'cloudflare_access' (deployed pilot — validates Cloudflare "
+            "Access JWTs on every non-public route)."
+        ),
+    )
+    cloudflare_access_team_domain: str = Field(
+        default="",
+        description=(
+            "Cloudflare Access team domain, e.g. 'ewise.cloudflareaccess.com'. "
+            "Used to build both the expected JWT issuer and the JWKS URL. "
+            "Required when api_auth_backend=cloudflare_access."
+        ),
+    )
+    cloudflare_access_audience: str = Field(
+        default="",
+        description=(
+            "Cloudflare Access Application Audience (AUD) tag for the Access "
+            "application protecting api.ewiseintelligence.com. Required when "
+            "api_auth_backend=cloudflare_access. Not a secret, but also not "
+            "committed — Cloudflare assigns this when the Access application "
+            "is created."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_api_auth_backend(self) -> "Settings":
+        if self.api_auth_backend not in {"disabled", "cloudflare_access"}:
+            raise ValueError("api_auth_backend must be 'disabled' or 'cloudflare_access'")
+        if self.api_auth_backend == "cloudflare_access" and (
+            not self.cloudflare_access_team_domain.strip() or not self.cloudflare_access_audience.strip()
+        ):
+            raise ValueError(
+                "cloudflare_access_team_domain and cloudflare_access_audience are both required "
+                "when api_auth_backend=cloudflare_access — this must fail at startup, never fall "
+                "back to running with authentication silently disabled."
+            )
+        return self
+
     # 12B.3G — durable Listings synchronization job: retry/backoff and
     # concurrency defaults. Deliberately typed settings, not constants
     # buried in the worker/service, so operators can tune them per
