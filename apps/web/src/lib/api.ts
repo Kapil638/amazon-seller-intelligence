@@ -101,6 +101,31 @@ function apiBaseUrl(): string {
   return base.replace(/\/$/, "");
 }
 
+// Final review gate, PR #28 — every call in this file targets apiBaseUrl(),
+// a different origin from the frontend itself in any deployed environment
+// (app.ewiseintelligence.com calling api.ewiseintelligence.com; equally
+// true in local dev, http://localhost:3000 calling http://localhost:8000).
+// Cloudflare Access (pilot-deployment-ewise, correction 2) authenticates a
+// browser via a session cookie scoped to the hostname it protects — its
+// edge only forwards the Cf-Access-Jwt-Assertion header CloudflareAccess
+// Middleware verifies (apps/api/app/core/cloudflare_access.py) once it has
+// already recognized the browser as authenticated for that request. A
+// cross-origin fetch() sends NO cookies at all unless credentials:
+// "include" is set explicitly — without it, once Access is enabled on
+// api.ewiseintelligence.com, every one of this file's own requests would
+// be intercepted by Cloudflare's own login challenge instead of ever
+// reaching the API, even for a seller already signed in on
+// app.ewiseintelligence.com. The backend side of this is already in place
+// (CORSMiddleware's allow_credentials=True, non-wildcard allow_origins —
+// see app/main.py's register_request_middleware); this is the matching
+// client-side half. A no-op wherever no cross-site cookie exists yet
+// (plain local dev, or before Access is enabled), so this changes nothing
+// about current behavior — it only enables the cookie to be sent when one
+// legitimately exists.
+function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return fetch(input, { ...init, credentials: "include" });
+}
+
 // fix/inventory-empty-response-and-failure-classification — bare
 // GET /health/workers (not under /api/v1/amazon: this is runtime
 // infrastructure health, not an Amazon domain route). Deliberately
@@ -111,7 +136,7 @@ function apiBaseUrl(): string {
 // page dependency.
 export async function fetchWorkerHealth(): Promise<WorkerHealthResponse | null> {
   try {
-    const response = await fetch(`${apiBaseUrl()}/health/workers`, { cache: "no-store" });
+    const response = await apiFetch(`${apiBaseUrl()}/health/workers`, { cache: "no-store" });
     if (!response.ok) return null;
     return (await response.json()) as WorkerHealthResponse;
   } catch {
@@ -192,7 +217,7 @@ export async function fetchProduct(
 
   let response: Response;
   try {
-    response = await fetch(url);
+    response = await apiFetch(url);
   } catch {
     throw new ProductLookupError(
       "Can't reach the API. Make sure the FastAPI backend is running.",
@@ -208,7 +233,7 @@ export async function createManualProduct(
 ): Promise<ProductResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/products/manual`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/products/manual`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -229,7 +254,7 @@ export async function analyzeListing(
 ): Promise<ListingAnalysisResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ product, source: source ?? null }),
@@ -265,7 +290,7 @@ export async function analyzeListingV2(
 ): Promise<ListingAnalysisV2Response> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -306,7 +331,7 @@ export async function reweightListingV2(payload: {
 }): Promise<ListingReweightResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/reweight`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/reweight`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -338,7 +363,7 @@ export async function listScoringProfiles(
   includeArchived = false,
 ): Promise<ScoringProfileListResponse> {
   const query = includeArchived ? "?include_archived=true" : "";
-  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles${query}`);
+  const response = await apiFetch(`${apiBaseUrl()}/api/v1/scoring-profiles${query}`);
   if (!response.ok) {
     const detail = await readError(response);
     throw new ProductLookupError(detail || "Scoring profiles could not be loaded.", "unknown");
@@ -352,7 +377,7 @@ export async function createScoringProfile(payload: {
   weights: ScoringWeights;
   is_default?: boolean;
 }): Promise<ScoringProfile> {
-  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles`, {
+  const response = await apiFetch(`${apiBaseUrl()}/api/v1/scoring-profiles`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -373,7 +398,7 @@ export async function updateScoringProfile(
     is_default?: boolean;
   },
 ): Promise<ScoringProfile> {
-  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
+  const response = await apiFetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -386,7 +411,7 @@ export async function updateScoringProfile(
 }
 
 export async function archiveScoringProfile(profileId: string): Promise<ScoringProfile> {
-  const response = await fetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
+  const response = await apiFetch(`${apiBaseUrl()}/api/v1/scoring-profiles/${profileId}`, {
     method: "DELETE",
   });
   if (!response.ok) {
@@ -403,7 +428,7 @@ export async function generateAIListingIntelligence(
 ): Promise<AIListingIntelligenceResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/ai`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ product, analysis, source: source ?? null }),
@@ -452,7 +477,7 @@ export async function generateAIListingIntelligenceV2(
 ): Promise<AIListingIntelligenceV2Response> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/ai`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -506,7 +531,7 @@ export async function generateImageIntelligence(
 ): Promise<AIImageIntelligenceResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/images/ai`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/listing/v2/images/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -559,7 +584,7 @@ export async function analyzeCompetitors(
 ): Promise<CompetitorComparisonResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/competitors`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/competitors`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -609,7 +634,7 @@ export async function generateAICompetitiveIntelligence(
 ): Promise<AICompetitiveIntelligenceResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/analysis/competitors/ai`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/analysis/competitors/ai`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ comparison }),
@@ -655,7 +680,7 @@ export async function generateCompetitorSearchQuery(
 ): Promise<CompetitorSearchQueryResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/competitors/query`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/competitors/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ target_product: targetProduct }),
@@ -687,7 +712,7 @@ export async function discoverCompetitors(
 ): Promise<CompetitorDiscoveryResult> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/competitors/discover`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/competitors/discover`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -744,7 +769,7 @@ export async function fetchUsageDashboard(
   const url = `${apiBaseUrl()}/api/v1/usage/dashboard${refresh ? "?refresh=true" : ""}`;
   let response: Response;
   try {
-    response = await fetch(url, { cache: "no-store" });
+    response = await apiFetch(url, { cache: "no-store" });
   } catch {
     throw new ProductLookupError(
       "Can't reach the API. Make sure the FastAPI backend is running.",
@@ -766,7 +791,7 @@ export async function analyzeReport(file: File): Promise<ReportAnalysisResponse>
 
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports/analyze`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports/analyze`, {
       method: "POST",
       body,
     });
@@ -799,7 +824,7 @@ export async function previewBulkFile(file: File): Promise<BulkIngestStats> {
   body.append("file", file);
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/bulk/preview`, { method: "POST", body });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/bulk/preview`, { method: "POST", body });
   } catch {
     throw new ReportAnalysisError(
       "Can't reach the API. Make sure the FastAPI backend is running.",
@@ -826,7 +851,7 @@ export async function startBulkJob(
   body.append("top_n", String(topN));
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/bulk/jobs`, { method: "POST", body });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/bulk/jobs`, { method: "POST", body });
   } catch {
     throw new ReportAnalysisError(
       "Can't reach the API. Make sure the FastAPI backend is running.",
@@ -843,7 +868,7 @@ export async function startBulkJob(
 export async function fetchBulkJob(jobId: string): Promise<BulkJobResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/bulk/jobs/${encodeURIComponent(jobId)}`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/bulk/jobs/${encodeURIComponent(jobId)}`, {
       cache: "no-store",
     });
   } catch {
@@ -859,7 +884,7 @@ export async function fetchBulkJob(jobId: string): Promise<BulkJobResponse> {
 }
 
 export async function downloadBulkReport(jobId: string): Promise<void> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${apiBaseUrl()}/api/v1/bulk/jobs/${encodeURIComponent(jobId)}/report.xlsx`,
   );
   if (!response.ok) {
@@ -893,7 +918,7 @@ export async function fetchSavedAnalyses(params?: {
   }
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports?${search.toString()}`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports?${search.toString()}`, {
       cache: "no-store",
     });
   } catch {
@@ -918,7 +943,7 @@ export async function fetchSavedAnalyses(params?: {
 export async function fetchSavedAnalysis(reportId: string): Promise<SavedAnalysisDetail> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
       cache: "no-store",
     });
   } catch {
@@ -956,7 +981,7 @@ export async function generateSavedAnalysisPdf(
 ): Promise<ClientPdfGenerateResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
       method: "POST",
     });
   } catch {
@@ -981,7 +1006,7 @@ export async function downloadSavedAnalysisPdf(
 ): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}/pdf`, {
       cache: "no-store",
     });
   } catch {
@@ -1016,7 +1041,7 @@ export async function deleteSavedAnalysis(
 ): Promise<{ report_id: string; deleted: boolean }> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/reports/${encodeURIComponent(reportId)}`, {
       method: "DELETE",
     });
   } catch {
@@ -1052,7 +1077,7 @@ function copilotUrl(path: string): string {
 async function copilotRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(copilotUrl(path), {
+    response = await apiFetch(copilotUrl(path), {
       cache: "no-store",
       ...init,
       headers: {
@@ -1190,7 +1215,7 @@ function profitUrl(path: string): string {
 async function profitRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(profitUrl(path), {
+    response = await apiFetch(profitUrl(path), {
       cache: "no-store",
       ...init,
       headers: {
@@ -1239,7 +1264,7 @@ export class AmazonConnectionError extends Error {
 async function amazonConnectionRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, {
       cache: "no-store",
       ...init,
       headers: {
@@ -1325,7 +1350,7 @@ export class ListingsApiError extends Error {
 async function listingsRequest<T>(path: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
   } catch {
     throw new ListingsApiError(
       "Seller Listings could not reach the server. Make sure the API is running.",
@@ -1418,7 +1443,7 @@ export class ListingsSyncError extends Error {
 export async function triggerListingsSync(participationId: string): Promise<ListingsSyncTriggerResponse> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${apiBaseUrl()}/api/v1/amazon/marketplace-participations/${encodeURIComponent(participationId)}/listings/sync`,
       { method: "POST", cache: "no-store" },
     );
@@ -1464,7 +1489,7 @@ export class InventoryApiError extends Error {
 async function inventoryRequest<T>(path: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
   } catch {
     throw new InventoryApiError(
       "FBA Inventory could not reach the server. Make sure the API is running.",
@@ -1583,7 +1608,7 @@ export class InventorySyncError extends Error {
 export async function triggerInventorySync(participationId: string): Promise<InventorySyncTriggerResponse> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${apiBaseUrl()}/api/v1/amazon/marketplace-participations/${encodeURIComponent(participationId)}/inventory/sync`,
       { method: "POST", cache: "no-store" },
     );
@@ -1623,7 +1648,7 @@ export class OrdersApiError extends Error {
 async function ordersRequest<T>(path: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
   } catch {
     throw new OrdersApiError("Orders could not reach the server. Make sure the API is running.", "unavailable");
   }
@@ -1705,7 +1730,7 @@ export async function triggerOrdersSync(
 ): Promise<OrdersSyncTriggerResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon/orders/sync`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon/orders/sync`, {
       method: "POST",
       cache: "no-store",
       headers: { "content-type": "application/json" },
@@ -1761,7 +1786,7 @@ export class SalesTrafficApiError extends Error {
 async function salesTrafficRequest<T>(path: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
   } catch {
     throw new SalesTrafficApiError(
       "Sales and Traffic could not reach the server. Make sure the API is running.",
@@ -1859,7 +1884,7 @@ export async function triggerSalesTrafficSync(
 ): Promise<SalesTrafficSyncTriggerResponse> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/amazon/sales-traffic/sync`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon/sales-traffic/sync`, {
       method: "POST",
       cache: "no-store",
       headers: { "content-type": "application/json" },
@@ -2007,7 +2032,7 @@ export async function previewAdvertising(
 ): Promise<AdvertisingSnapshot> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl()}/api/v1/advertising/preview`, {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/advertising/preview`, {
       cache: "no-store",
       method: "POST",
       headers: { "Content-Type": "application/json" },
