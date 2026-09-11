@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0017_inventory_heartbeat (head)" /tmp/heads.txt
+          grep -q "0018_amazon_encrypted_secrets (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0017_inventory_heartbeat" /tmp/current.txt
+          grep -q "0018_amazon_encrypted_secrets" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
@@ -459,6 +459,51 @@ jobs:
       # still exists) lives in `tests/postgres/
       # test_disposable_postgres_worker_heartbeats.py`, exercised by the
       # `postgres-identity-concurrency` job below (`pytest tests/
+      # postgres/`) rather than duplicated here as raw shell/SQL.
+
+  existing-database-upgrade-0018:
+    name: Existing PostgreSQL (0017) — upgrade to 0018
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0018
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0018
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0017 (simulates an existing pre-pilot-deployment-ewise database, already carrying the inventory heartbeat fix)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0017_inventory_heartbeat
+      - name: alembic upgrade to 0018 (pilot-deployment-ewise correction 1's own upgrade path)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0018_amazon_encrypted_secrets
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0018_amazon_encrypted_secrets"
+      # The deeper behavioral proof (expected ciphertext-only column
+      # shape, the reference primary key rejecting a duplicate insert,
+      # raw nonce/ciphertext bytes round-tripping exactly, and a clean
+      # drop-only downgrade) lives in `tests/postgres/
+      # test_disposable_postgres_amazon_encrypted_secrets.py`, exercised
+      # by the `postgres-identity-concurrency` job below (`pytest tests/
       # postgres/`) rather than duplicated here as raw shell/SQL.
 
   postgres-identity-concurrency:
