@@ -15,10 +15,16 @@ Forbidden callers:
 - Reports
 - Analytics engines
 
-DevelopmentSecretProvider is the local/dev implementation. The production
-backend is reserved and fails closed until a cloud SecretProvider is
-implemented. Application code depends on SecretProvider, not the backend.
-Never log, print, or repr secret material.
+DevelopmentSecretProvider is the local/dev implementation.
+ProductionSecretProvider (app.amazon.production_secrets, PostgreSQL +
+AES-256-GCM) is the AMAZON_SECRET_BACKEND=production implementation —
+imported lazily from SecretProviderFactory.create() to avoid a circular
+import, since that module itself depends on this one. It fails closed
+(SecretAccessError) if AMAZON_SECRET_ENCRYPTION_KEYS /
+AMAZON_SECRET_ACTIVE_KEY_VERSION are missing or invalid; it never falls
+back to DevelopmentSecretProvider. Application code depends on
+SecretProvider, not the backend. Never log, print, or repr secret
+material.
 """
 
 from __future__ import annotations
@@ -47,9 +53,6 @@ ASI_SECRET_ENVIRONMENTS = frozenset({"SANDBOX", "PRODUCTION"})
 SECRET_NOT_FOUND_MESSAGE = "Requested Amazon secret was not found."
 SECRET_ACCESS_FAILURE_MESSAGE = "Amazon secret could not be retrieved."
 INVALID_SECRET_REFERENCE_MESSAGE = "Amazon secret reference is invalid."
-PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE = (
-    "Amazon production secret backend is not implemented."
-)
 UNKNOWN_SECRET_BACKEND_MESSAGE = "Amazon secret backend is not available."
 
 _SECRET_VALUE_PATTERNS = (
@@ -371,10 +374,17 @@ def resolve_amazon_secret_backend(settings: Settings | None = None) -> str:
 class SecretProviderFactory:
     """Select a SecretProvider from configuration. Fail closed except development.
 
-    Production is a reserved backend. It must be selected explicitly and must
-    not fall back to DevelopmentSecretProvider or sandbox .env tokens.
-    A future cloud implementation must still satisfy SecretProvider:
-    put_secret, get_secret, exists, delete_secret; SecretStr only; no logs.
+    Production must be selected explicitly (AMAZON_SECRET_BACKEND=production)
+    and must never fall back to DevelopmentSecretProvider or sandbox .env
+    tokens. It is backed by app.amazon.production_secrets.
+    ProductionSecretProvider (PostgreSQL + AES-256-GCM), imported lazily
+    here to avoid a circular import — that module depends on this one for
+    validate_secret_reference, the exception types, and secret_provider_
+    repr. Missing/invalid AMAZON_SECRET_ENCRYPTION_KEYS or
+    AMAZON_SECRET_ACTIVE_KEY_VERSION raises SecretAccessError from this
+    call, before any secret operation is attempted — never a lazy failure
+    on first use. Every backend must satisfy SecretProvider: put_secret,
+    get_secret, exists, delete_secret; SecretStr only; no logs.
     """
 
     def __repr__(self) -> str:
@@ -390,7 +400,18 @@ class SecretProviderFactory:
                 store_path=cfg.amazon_development_secret_store,
             )
         if backend == AMAZON_SECRET_BACKEND_PRODUCTION:
-            raise SecretAccessError(PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE)
+            from app.amazon.production_secrets import (
+                ProductionSecretProvider,
+                parse_amazon_secret_encryption_keys,
+            )
+
+            keys = parse_amazon_secret_encryption_keys(
+                cfg.amazon_secret_encryption_keys.get_secret_value()
+            )
+            return ProductionSecretProvider(
+                keys=keys,
+                active_key_version=cfg.amazon_secret_active_key_version.strip(),
+            )
         raise SecretAccessError(UNKNOWN_SECRET_BACKEND_MESSAGE)
 
 

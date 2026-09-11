@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -2277,3 +2278,41 @@ class AmazonSellerInventoryObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     marketplace_participation: Mapped[AmazonMarketplaceParticipation] = relationship()
+
+
+class AmazonEncryptedSecret(Base):
+    """pilot-deployment-ewise — production `SecretProvider` backend
+    storage (`app/amazon/production_secrets.py`). Ciphertext only: no
+    column here, or anywhere else in this schema, ever holds a plaintext
+    Amazon refresh/access token.
+
+    `reference` is the existing ASI secret reference string (`asi/amazon/
+    {provider}/{environment}/{organization_id}/{connection_id}`, see
+    `app/amazon/secrets.py`) — itself non-secret, stable record identity —
+    used verbatim both as this table's primary key and as AES-256-GCM's
+    associated data on every encrypt/decrypt, so a ciphertext can only
+    ever be decrypted successfully under the exact reference it was
+    stored for. A row's `ciphertext`/`nonce` copied onto a different
+    `reference` fails authentication (`InvalidTag`), not a silent
+    mis-decrypt.
+
+    `key_version` records which configured master key encrypted this
+    row, independent of whichever key version is currently "active" for
+    new writes — see `ProductionSecretProvider.rotate_key_version` for
+    the rotation procedure this enables: old rows stay readable under a
+    retired key until deliberately re-encrypted.
+
+    `nonce` is a fresh, CSPRNG-sourced 96-bit value generated for every
+    single write — never reused, never derived from `reference`.
+    """
+
+    __tablename__ = "amazon_encrypted_secrets"
+
+    reference: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12), nullable=False)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

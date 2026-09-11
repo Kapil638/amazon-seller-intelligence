@@ -135,6 +135,37 @@ class Settings(BaseSettings):
             "Empty disables file persistence (in-memory only). Never a database path."
         ),
     )
+    # pilot-deployment-ewise, correction 1 — production SecretProvider
+    # (app/amazon/production_secrets.py) master key material. A JSON
+    # object string mapping key-version-id -> base64(32 raw bytes), e.g.
+    # '{"v1":"<base64 32-byte key>"}'. Every value must decode to exactly
+    # 32 bytes (AES-256). Sourced only from a Railway encrypted
+    # environment variable in any deployed environment — never committed,
+    # never placed in a persisted .env file outside local throwaway
+    # testing. Left empty by default: AMAZON_SECRET_BACKEND=production
+    # with no (or invalid) key configuration fails closed at
+    # SecretProviderFactory.create() time — see
+    # parse_amazon_secret_encryption_keys's own docstring for the exact
+    # validation performed and why it raises rather than warns.
+    amazon_secret_encryption_keys: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "JSON object {key_version: base64(32 raw AES-256 key bytes)}. "
+            "Production SecretProvider master key material. Railway encrypted "
+            "variable only. Never committed, never logged."
+        ),
+    )
+    # Which key_version in amazon_secret_encryption_keys new writes use.
+    # Existing rows stay decryptable under whatever key_version they were
+    # written with (see AmazonEncryptedSecret's own docstring on
+    # rotation) — this only selects the key for the *next* put_secret.
+    amazon_secret_active_key_version: str = Field(
+        default="",
+        description=(
+            "Active key_version for new production SecretProvider writes. "
+            "Must be a key present in amazon_secret_encryption_keys."
+        ),
+    )
 
     # 12B.3G — durable Listings synchronization job: retry/backoff and
     # concurrency defaults. Deliberately typed settings, not constants
