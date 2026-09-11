@@ -13,7 +13,7 @@ export function PublicPageShell({ children }: { children: ReactNode }) {
     <div className="mx-auto flex min-h-screen max-w-3xl flex-col px-6 py-10">
       <header className="mb-10 flex items-center justify-between">
         <Link href="/" className="text-lg font-semibold">
-          EWise Amazon Seller Intelligence
+          EWise Intelligence
         </Link>
         <nav className="flex gap-4 text-sm text-muted-foreground">
           <Link href="/privacy" className="hover:text-foreground">
@@ -26,7 +26,7 @@ export function PublicPageShell({ children }: { children: ReactNode }) {
       </header>
       <main className="flex-1">{children}</main>
       <footer className="mt-16 border-t border-border pt-6 text-xs text-muted-foreground">
-        <p>&copy; {new Date().getFullYear()} EWise. All rights reserved.</p>
+        <p>&copy; {new Date().getFullYear()} Ewisepartners LLC, doing business as EWise Partners. All rights reserved.</p>
       </footer>
     </div>
   );
@@ -35,9 +35,10 @@ export function PublicPageShell({ children }: { children: ReactNode }) {
 export function DraftNotice() {
   return (
     <div className="mb-8 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-800">
-      <strong>Draft — pending review.</strong> This page contains placeholder legal-entity and contact details
-      marked <code>[PENDING]</code> below. It must not be treated as published/final until those are confirmed and
-      replaced.
+      <strong>Private pilot.</strong> This is an early-stage, invitation-only private pilot. Legal-entity, contact,
+      and data-handling details on this page are confirmed and current; a small number of jurisdiction-specific
+      legal clauses (governing law, limitation of liability) are explicitly noted below as not yet finalized and
+      will be published before the Service is offered more broadly.
     </div>
   );
 }

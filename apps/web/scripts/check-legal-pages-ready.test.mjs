@@ -75,16 +75,17 @@ describe("findPagesWithPendingMarkers", () => {
 });
 
 describe("check-legal-pages-ready CLI (subprocess, proves the entrypoint guard actually runs)", () => {
-  it("exits non-zero and blocks the build when the real repo's current pages still have [PENDING markers", () => {
+  it("exits zero for the real repo's current pages, now that the operator-confirmed legal details have landed", () => {
     // Runs the actual, unmodified script against the actual, unmodified
     // repo files — this is the exact invocation `npm run build`'s own
-    // `prebuild` step performs. As of this review, apps/web/src/app/
-    // privacy/page.tsx and terms/page.tsx are still drafts (by design —
-    // the operator has not yet supplied legal details), so this must
-    // fail. Once those pages are finished, this specific assertion will
-    // need to flip — that is the intended, correct behavior, not a test
-    // to "fix" by loosening it.
-    expect(() => execFileSync("node", [SCRIPT_PATH], { cwd: process.cwd(), stdio: "pipe" })).toThrow();
+    // `prebuild` step performs. Previously asserted the opposite (the
+    // pages were still drafts with bracketed placeholders, by design) —
+    // flipped now that apps/web/src/app/privacy/page.tsx and terms/
+    // page.tsx carry the operator-confirmed legal-entity/contact content
+    // instead. This is the exact "the check now blocks nothing" state
+    // final-review-gate item 1 asks to confirm.
+    const output = execFileSync("node", [SCRIPT_PATH], { cwd: process.cwd(), stdio: "pipe" }).toString();
+    expect(output).toContain("passed");
   });
 
   it("exits zero for a fixture tree with no pending markers", () => {
