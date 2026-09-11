@@ -1290,12 +1290,42 @@ class AmazonOAuthStateRepository:
         *,
         now: datetime | None = None,
     ) -> AmazonOAuthState | None:
-        row = self.get_by_id(organization_id, state_id)
-        if row is None or row.consumed_at is not None:
-            return None
-        row.consumed_at = now or datetime.now(UTC)
+        """Atomically mark this state row consumed. This is the sole
+        race-closing step for a concurrently-replayed callback carrying the
+        same `state` (two tabs, a browser retry, or a captured/replayed
+        callback URL): a single `UPDATE ... WHERE consumed_at IS NULL` is
+        atomic with respect to concurrent writers of the same row — the
+        database serializes conflicting writes and re-evaluates the WHERE
+        clause against the live, just-committed state, exactly like
+        `AmazonConnectionRepository.claim_identity_for_authorization`'s own
+        atomic claim (same technique, same reason). A prior read-then-write
+        implementation here (`get_by_id` then set `consumed_at` then flush)
+        allowed two concurrent callers to both observe `consumed_at is None`
+        and both "win," each proceeding to exchange the same authorization
+        code — this method is the fix for that gap.
+
+        Returns the row if this call won the race (state was usable and is
+        now consumed by this call). Returns None if the row does not exist,
+        or if it was already consumed — by an earlier legitimate call, or by
+        a concurrent racer that won first — never distinguishing the two, so
+        a caller cannot use timing to learn which case occurred.
+        """
+        moment = now or datetime.now(UTC)
+        statement = (
+            update(AmazonOAuthState)
+            .where(
+                AmazonOAuthState.organization_id == organization_id,
+                AmazonOAuthState.id == state_id,
+                AmazonOAuthState.consumed_at.is_(None),
+            )
+            .values(consumed_at=moment)
+        )
+        outcome = self.session.execute(statement)
         self.session.flush()
-        return row
+        if outcome.rowcount != 1:
+            return None
+        self.session.expire_all()
+        return self.get_by_id(organization_id, state_id)
 
     def get_by_id(self, organization_id: UUID, state_id: UUID) -> AmazonOAuthState | None:
         return self.session.scalars(

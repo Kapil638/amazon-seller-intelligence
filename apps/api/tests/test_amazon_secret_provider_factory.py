@@ -8,8 +8,8 @@ from typing import get_type_hints
 import pytest
 from pydantic import SecretStr
 
+from app.amazon.production_secrets import PRODUCTION_SECRET_KEYS_INVALID_MESSAGE
 from app.amazon.secrets import (
-    PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE,
     UNKNOWN_SECRET_BACKEND_MESSAGE,
     DevelopmentSecretProvider,
     SecretAccessError,
@@ -69,7 +69,10 @@ def test_unknown_provider_fails_safely() -> None:
         reset_secret_provider()
 
 
-def test_production_selection_does_not_fallback_to_development() -> None:
+def test_production_selection_without_keys_does_not_fallback_to_development() -> None:
+    """production is a real backend now (pilot-deployment-ewise, correction
+    1) but must still fail closed — never fall back to development — when
+    no (or invalid) encryption key material is configured."""
     reset_secret_provider()
     try:
         get_secret_provider(_settings("development"))
@@ -78,13 +81,13 @@ def test_production_selection_does_not_fallback_to_development() -> None:
         try:
             provider = SecretProviderFactory().create(settings)
         except SecretAccessError as exc:
-            assert str(exc) == PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE
+            assert str(exc) == PRODUCTION_SECRET_KEYS_INVALID_MESSAGE
             _assert_no_secrets(str(exc))
         else:
             raise AssertionError(f"production backend must not return {type(provider)!r}")
         with pytest.raises(SecretAccessError) as fetched:
             get_secret_provider(settings)
-        assert str(fetched.value) == PRODUCTION_SECRET_BACKEND_UNAVAILABLE_MESSAGE
+        assert str(fetched.value) == PRODUCTION_SECRET_KEYS_INVALID_MESSAGE
         _assert_no_secrets(str(fetched.value))
     finally:
         reset_secret_provider()

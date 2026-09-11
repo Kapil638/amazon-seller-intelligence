@@ -47,7 +47,9 @@ import asyncio
 import logging
 import os
 import secrets as _secrets_module
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.core.config import Settings, get_settings
@@ -105,6 +107,75 @@ def invalidate_heartbeat(worker_type: str, *, instance_id: str) -> None:
         logger.debug("worker heartbeat invalidation failure detail", exc_info=True)
 
 
+class _HeartbeatWatchdog:
+    """pilot-deployment-ewise — a last-resort self-watchdog running on a
+    genuinely separate OS thread, not another `asyncio` task.
+
+    `scripts/supervisor.py`'s own hung-worker detection (heartbeat
+    polled *externally*, by a different process) has no equivalent on
+    Railway, where each worker is deployed as its own isolated service
+    with nothing else watching it. A worker task on the *same* stuck
+    event loop could never notice that loop is stuck — by definition,
+    it would never get scheduled to check either. Only a separate OS
+    thread, whose own `threading.Event.wait()` is serviced by the OS
+    scheduler independent of the (possibly frozen) asyncio loop, can
+    observe "my own process's heartbeat task has not run in a very long
+    time" and act on it.
+
+    Deliberately the most drastic possible response — `os._exit(1)`,
+    not `sys.exit` (which only raises `SystemExit` on the main thread
+    and could itself never be serviced by a truly stuck interpreter) —
+    because by the time this threshold is reached, graceful shutdown
+    has already had `worker_watchdog_stale_after_seconds` (default
+    600s) of opportunity and evidently cannot happen. A real process
+    supervisor (Railway's restart-on-exit policy) is expected to notice
+    the exit and start a fresh instance."""
+
+    def __init__(self, worker_type: str, *, stale_after_seconds: float, check_interval_seconds: float) -> None:
+        self._worker_type = worker_type
+        self._stale_after_seconds = stale_after_seconds
+        self._check_interval_seconds = check_interval_seconds
+        self._lock = threading.Lock()
+        self._last_success_monotonic = time.monotonic()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def mark_success(self) -> None:
+        with self._lock:
+            self._last_success_monotonic = time.monotonic()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._check_interval_seconds):
+            with self._lock:
+                elapsed = time.monotonic() - self._last_success_monotonic
+            if elapsed > self._stale_after_seconds:
+                logger.critical(
+                    "worker heartbeat watchdog: worker_type=%s has not recorded a successful "
+                    "heartbeat write in %.0fs (threshold %.0fs) — exiting immediately (os._exit) "
+                    "so a real process supervisor restarts this worker; see _HeartbeatWatchdog's "
+                    "own docstring for why this runs on a separate OS thread",
+                    self._worker_type, elapsed, self._stale_after_seconds,
+                )
+                os._exit(1)
+                # os._exit() never returns in a real process — this
+                # thread's loop should never reach the next iteration.
+                # Returning here is only reachable when a test has
+                # deliberately replaced os._exit with a non-terminating
+                # spy; without it, that same test would observe this
+                # thread re-firing the same critical log every
+                # check_interval_seconds instead of exactly once.
+                return
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name=f"{self._worker_type}-heartbeat-watchdog", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
 @dataclass(frozen=True)
 class HeartbeatLoopHandle:
     """Returned by `start_heartbeat_loop()`. Callers must `await stop()`
@@ -116,6 +187,7 @@ class HeartbeatLoopHandle:
     task: asyncio.Task[None]
     worker_type: str
     instance_id: str
+    watchdog: _HeartbeatWatchdog | None = field(default=None)
 
     async def stop(self) -> None:
         self.task.cancel()
@@ -123,14 +195,20 @@ class HeartbeatLoopHandle:
             await self.task
         except asyncio.CancelledError:
             pass
+        if self.watchdog is not None:
+            self.watchdog.stop()
         invalidate_heartbeat(self.worker_type, instance_id=self.instance_id)
 
 
-async def _heartbeat_loop(worker_type: str, *, instance_id: str, interval_seconds: float) -> None:
+async def _heartbeat_loop(
+    worker_type: str, *, instance_id: str, interval_seconds: float, watchdog: _HeartbeatWatchdog | None
+) -> None:
     pid = os.getpid()
     while True:
         try:
             record_heartbeat(worker_type, instance_id=instance_id, pid=pid)
+            if watchdog is not None:
+                watchdog.mark_success()
         except Exception:
             # A heartbeat write failure (e.g. a transient database
             # connectivity issue — the same class of failure the claim
@@ -140,7 +218,10 @@ async def _heartbeat_loop(worker_type: str, *, instance_id: str, interval_second
             # tries again. Logged at WARNING, not ERROR: a single missed
             # heartbeat is expected to self-heal and is exactly what
             # worker_heartbeat_stale_after_seconds's own multi-interval
-            # tolerance is for.
+            # tolerance is for. The watchdog (if enabled) is deliberately
+            # NOT marked on a failed write — repeated failures across
+            # worker_watchdog_stale_after_seconds is exactly the
+            # unrecoverable case it exists to catch.
             logger.warning(
                 "worker heartbeat write failed for worker_type=%s (recoverable, retrying next interval)",
                 worker_type,
@@ -150,7 +231,12 @@ async def _heartbeat_loop(worker_type: str, *, instance_id: str, interval_second
 
 
 def start_heartbeat_loop(
-    worker_type: str, *, instance_id: str, interval_seconds: float | None = None, settings: Settings | None = None
+    worker_type: str,
+    *,
+    instance_id: str,
+    interval_seconds: float | None = None,
+    settings: Settings | None = None,
+    enable_watchdog: bool = True,
 ) -> HeartbeatLoopHandle:
     """Writes one heartbeat immediately (before returning), then
     continues writing one every `interval_seconds` in the background,
@@ -163,11 +249,24 @@ def start_heartbeat_loop(
     produce a false unavailable result': by the time a developer's
     browser has loaded the page and they click Sync, the heartbeat this
     call wrote already exists.
+
+    Also starts a same-process self-watchdog (`enable_watchdog=True`,
+    the default) — see `_HeartbeatWatchdog`'s own docstring for why this
+    exists and why it runs on a separate OS thread rather than another
+    `asyncio` task on the same loop.
     """
     cfg = settings or get_settings()
     effective_interval = interval_seconds if interval_seconds is not None else cfg.worker_heartbeat_interval_seconds
     record_heartbeat(worker_type, instance_id=instance_id, pid=os.getpid())
+    watchdog: _HeartbeatWatchdog | None = None
+    if enable_watchdog:
+        watchdog = _HeartbeatWatchdog(
+            worker_type,
+            stale_after_seconds=cfg.worker_watchdog_stale_after_seconds,
+            check_interval_seconds=cfg.worker_watchdog_check_interval_seconds,
+        )
+        watchdog.start()
     task = asyncio.create_task(
-        _heartbeat_loop(worker_type, instance_id=instance_id, interval_seconds=effective_interval)
+        _heartbeat_loop(worker_type, instance_id=instance_id, interval_seconds=effective_interval, watchdog=watchdog)
     )
-    return HeartbeatLoopHandle(task=task, worker_type=worker_type, instance_id=instance_id)
+    return HeartbeatLoopHandle(task=task, worker_type=worker_type, instance_id=instance_id, watchdog=watchdog)

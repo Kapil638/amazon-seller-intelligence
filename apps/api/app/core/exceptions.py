@@ -266,6 +266,22 @@ class SpApiConfigurationError(Exception):
         super().__init__(message)
 
 
+class AmazonConnectionAlreadyInitiatedError(Exception):
+    """Final review gate, PR #28 — raised by `AmazonConnectionService.
+    start_authorization(require_no_existing_connection=True)` (the public
+    Login URI route only, `GET /connection/login`) when a connection row
+    already exists for this organization/provider/environment, in ANY
+    status. The public, unauthenticated Login URI must never be able to
+    disturb or re-target an already-initiated, pending, or connected
+    Amazon connection merely by being requested — only the authenticated
+    in-app `POST /connection/authorize` may do that. Only the very
+    first-ever authorization for a given org/provider/environment may
+    proceed through the public route."""
+
+    def __init__(self, message: str = "Amazon authorization is not available.") -> None:
+        super().__init__(message)
+
+
 class SpApiAuthenticationError(Exception):
     def __init__(self, message: str = "Amazon SP-API authentication failed.") -> None:
         super().__init__(message)

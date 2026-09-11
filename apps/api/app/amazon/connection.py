@@ -51,6 +51,7 @@ from app.amazon.seller_validation import (
 )
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
+    AmazonConnectionAlreadyInitiatedError,
     PersistenceError,
     PersistenceNotConfiguredError,
     SpApiAuthenticationError,
@@ -524,6 +525,7 @@ class AmazonConnectionService:
         environment: str,
         region: str,
         application_id: str,
+        require_no_existing_connection: bool = False,
     ) -> AmazonConnection:
         repo = AmazonConnectionRepository(session)
         row = repo.get(self._org_id(), provider=provider, environment=environment)
@@ -536,6 +538,15 @@ class AmazonConnectionService:
                 status="pending_authorization",
                 application_id=application_id or None,
             )
+        if require_no_existing_connection:
+            # Final review gate, PR #28 — the public Login URI's own safe
+            # mode (see start_authorization's docstring): a connection
+            # row already exists, in ANY status, so refuse to touch it at
+            # all. Checked and enforced inside this same session/
+            # transaction as the row lookup above, so there is no gap
+            # between "checked" and "acted" for a concurrent caller to
+            # exploit.
+            raise AmazonConnectionAlreadyInitiatedError()
         fields: dict[str, Any] = {}
         if row.status != "pending_authorization":
             fields["status"] = "pending_authorization"
@@ -555,11 +566,29 @@ class AmazonConnectionService:
         *,
         environment: ConnectionEnvironment = "PRODUCTION",
         provider: SpApiProvider = "SP_API",
+        require_no_existing_connection: bool = False,
     ) -> AmazonAuthorizationStart:
         """Create hashed OAuth state and return a Seller Central consent URL.
 
         Does not redirect, exchange codes, write secrets, or mark the connection
         connected / pending_validation.
+
+        `require_no_existing_connection=True` is the public-Login-URI-safe
+        mode (final review gate, PR #28 — `GET /connection/login`,
+        unauthenticated by design). Without this flag, calling this method
+        against an org/provider/environment that already has a connection
+        row unconditionally flips its status to `pending_authorization`,
+        regardless of what it currently is (`connected` included) — correct
+        for the authenticated in-app `POST /connection/authorize`, where
+        only an already-authorized operator can trigger it, but unsafe on a
+        public, unauthenticated route: anyone on the internet could
+        otherwise disrupt an already-connected seller's connection with a
+        single anonymous GET, without ever completing (or even attempting)
+        Amazon's own consent flow. With this flag, raises
+        `AmazonConnectionAlreadyInitiatedError` instead — creating no OAuth
+        state and mutating nothing — whenever a connection row already
+        exists in any status; only the very first-ever authorization for
+        this org/provider/environment may proceed through the public route.
         """
         self._require_persistence()
         self._reject_secrets({"environment": environment, "provider": provider})
@@ -591,6 +620,7 @@ class AmazonConnectionService:
                     environment=environment,
                     region=region,
                     application_id=application_id,
+                    require_no_existing_connection=require_no_existing_connection,
                 )
                 AmazonOAuthStateRepository(session).create(
                     organization_id=self._org_id(),

@@ -197,7 +197,21 @@ def get_engine() -> Engine | None:
         _bootstrap_organization(engine)
         return engine
     _guard_engine_creation(url)
-    engine = create_engine(url, pool_pre_ping=True)
+    # pilot-deployment-ewise — only pass pool_size/max_overflow when the
+    # operator has explicitly set them (Settings.db_pool_size/
+    # db_max_overflow default to None): SQLAlchemy's own create_engine
+    # already defaults to pool_size=5, max_overflow=10 when these kwargs
+    # are omitted entirely, so leaving them unset here preserves that
+    # exact existing behavior for local development and every test that
+    # already passes against it — this is additive configuration for a
+    # deployed environment, never a change to the unconfigured default.
+    cfg = get_settings()
+    pool_kwargs: dict[str, int] = {}
+    if cfg.db_pool_size is not None:
+        pool_kwargs["pool_size"] = cfg.db_pool_size
+    if cfg.db_max_overflow is not None:
+        pool_kwargs["max_overflow"] = cfg.db_max_overflow
+    engine = create_engine(url, pool_pre_ping=True, **pool_kwargs)
     _bootstrap_organization(engine)
     return engine
 
