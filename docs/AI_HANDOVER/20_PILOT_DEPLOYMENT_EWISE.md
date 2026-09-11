@@ -111,6 +111,26 @@ never fires while heartbeats keep succeeding, fires exactly once after
 genuine silence, and a graceful `stop()` permanently prevents a late
 fire.
 
+### 0e. Draft legal pages could previously be deployed by accident — now blocked
+
+`/privacy` and `/terms` (pass 1) intentionally still carry `[PENDING:
+...]` placeholders for legal-entity/contact/jurisdiction facts only the
+operator can supply — but nothing previously stopped a `npm run build`
+(the exact command Railway's Nixpacks build step runs, §1) from
+succeeding and deploying them exactly as-is. Final review gate, PR #28:
+`apps/web/scripts/check-legal-pages-ready.mjs`, wired as the `prebuild`
+npm script (npm's own lifecycle convention — runs automatically before
+`build`, no Railway/CI configuration needed), scans both page source
+files directly for the literal `[PENDING` marker and fails the build
+(non-zero exit) if either still contains one. Scanning the actual source
+rather than a separately-maintained "ready" flag means this cannot drift
+out of sync with the real content. `npx next build` (bypassing the npm
+lifecycle hook directly) still compiles the app cleanly — only `npm run
+build`, the real deployment entrypoint, is gated. 6 tests
+(`scripts/check-legal-pages-ready.test.mjs`) prove the detection logic
+against fixture files and run the actual CLI as a subprocess against
+both the real (still-pending) repo pages and a clean fixture tree.
+
 ## 1. Railway services
 
 One Railway project, six services, sharing one GitHub repo (monorepo —
@@ -175,8 +195,8 @@ perform.
 ```
 ASI_DB_RUNTIME_CONTEXT=api                    # NOT auto-set — main.py deliberately never sets this itself
 DATABASE_URL=<Supabase pooler URL>
-DB_POOL_SIZE=2
-DB_MAX_OVERFLOW=1
+DB_POOL_SIZE=1
+DB_MAX_OVERFLOW=0
 CORS_ORIGINS=["https://app.ewiseintelligence.com"]
 ALLOWED_HOSTS=["api.ewiseintelligence.com"]
 SP_API_OAUTH_REDIRECT_URI=https://api.ewiseintelligence.com/api/v1/amazon/connection/callback
@@ -234,13 +254,54 @@ this session under far less load than an unbounded 5-service deploy
 would produce (SQLAlchemy's own default is `pool_size=5 +
 max_overflow=10` = up to 15 connections **per process**, unset).
 
-With the `DB_POOL_SIZE`/`DB_MAX_OVERFLOW` values in §2:
-- `api`: 2 + 1 = 3 max
-- 4 workers: 1 + 1 = 2 max each = 8 max
-- **Total worst case: 11 of 15** — leaves headroom for the Supabase
+**Final review gate, PR #28 — tightened from 11 to 9.** With the
+`DB_POOL_SIZE`/`DB_MAX_OVERFLOW` values in §2:
+- `api`: 1 + 0 = **1** max (was 2 + 1 = 3)
+- 4 workers: 1 + 1 = 2 max each = **8** max (unchanged — see below for
+  why this floor is not further reducible without a real regression)
+- **Total worst case: 9 of 15** — leaves 6 of headroom for the Supabase
   dashboard's own connections and brief overlap during a rolling
-  deploy. Tune down further if this proves too tight in practice; never
-  raise it without recalculating this budget.
+  deploy, roughly double what 11-of-15 left.
+
+**Why workers stay at 2 each, not 1:** each worker runs its liveness
+heartbeat as a genuinely separate `asyncio.create_task` alongside its
+own claim/poll loop (`app/amazon/worker_heartbeat.py`'s
+`start_heartbeat_loop`) — each opens its own `session_scope()`
+independently, so at any given moment a worker may legitimately have
+two DB-bound operations in flight at once: the periodic heartbeat write
+and whatever the main loop is doing. Capping a worker at exactly 1
+connection (`DB_POOL_SIZE=1, DB_MAX_OVERFLOW=0`) would force the
+heartbeat write to queue behind the main loop's connection for as long
+as that connection is held — directly undermining the very liveness
+signal `worker_heartbeat_stale_after_seconds` /
+`worker_watchdog_stale_after_seconds` (§0d) exist to keep reliable, and
+risking a worker being reported/treated as unavailable while it is
+actually fine. `DB_POOL_SIZE=1, DB_MAX_OVERFLOW=1` keeps the steady-
+state cost at one warm connection while still allowing that brief,
+genuine overlap without blocking — this is the safety margin the
+governing instruction's "without weakening request handling" refers to,
+and 2×4=8 is treated as a floor, not a further-negotiable number.
+
+**Why `api` can safely go to 1, not 2:** unlike a worker, the API
+process has no competing background task holding a connection open —
+its DB usage is purely one connection per in-flight HTTP request that
+happens to touch the database (Amazon connection/listings/orders/
+sales-traffic/inventory routes; plain product-lookup/AI routes never
+touch it at all). At `DB_POOL_SIZE=1, DB_MAX_OVERFLOW=0`, a second
+concurrent DB-touching request (e.g. two dashboard widgets fetching in
+parallel) queues for the connection rather than failing — SQLAlchemy's
+pool blocks the checkout (default 30s timeout) instead of erroring, so
+the practical effect is a few extra milliseconds of latency on a rare
+concurrency coincidence, not a dropped request. This is judged an
+acceptable, explicitly-disclosed trade-off **specifically because** this
+is a single-operator, low-traffic private pilot (per the governing
+task's own framing) — revisit (raise `DB_POOL_SIZE` on `api` first,
+recalculating this whole budget) if real post-deployment usage shows
+actual queuing/timeout symptoms, rather than pre-emptively guessing.
+
+Tune down the worker count itself (§1's 6-vs-3-service question) rather
+than shrinking below this floor per-service, if the budget ever needs to
+tighten further than 9.
 
 ## 4. Cloudflare DNS records
 
@@ -277,9 +338,30 @@ marketing/legal requirement) — sharing one Application Audience (AUD)
 tag and one login session across both hostnames, so a seller
 authenticates once and both the frontend page load and every direct
 browser→API call (this app's existing fetch pattern, `apps/web/src/lib/
-api.ts`) carry a valid session with no frontend code change required.
-Set `CLOUDFLARE_ACCESS_AUDIENCE` on the `api` Railway service to this
-one application's AUD tag.
+api.ts`) carry a valid session. Set `CLOUDFLARE_ACCESS_AUDIENCE` on the
+`api` Railway service to this one application's AUD tag.
+
+**Final review gate, PR #28 — a frontend fix was required for this to
+actually work, corrected in this pass.** A cross-origin `fetch()` (every
+call in `api.ts` targets `apiBaseUrl()`, a different origin from the
+frontend itself — true in any deployed environment and in local dev
+alike) sends **no cookies at all** unless `credentials: "include"` is
+set explicitly. Cloudflare Access authenticates a browser via exactly
+such a session cookie; without `credentials: "include"`, a browser
+already signed in on `app.ewiseintelligence.com` would still have every
+one of its own API calls to `api.ewiseintelligence.com` intercepted by
+Cloudflare's own login challenge instead of ever reaching the backend —
+the "no frontend code change required" claim this section originally
+made was wrong. Fixed: every request in `api.ts` now goes through a
+single `apiFetch()` wrapper (`credentials: "include"` set in one place;
+call sites unchanged, a mechanical rename) — verified by
+`src/lib/api-credentials.test.ts`, which both exercises representative
+exported functions against a mocked `fetch` and greps `api.ts`'s own
+source for any bare `fetch(` call site that bypasses the wrapper. The
+backend side of this was already correct (`CORSMiddleware`'s
+`allow_credentials=True` with a non-wildcard `allow_origins` list — the
+combination required for a credentialed cross-origin request to
+succeed at all; see `app/main.py`'s `register_request_middleware`).
 
 Explicit bypass rules required on this Access application (in addition
 to `app.core.cloudflare_access.PUBLIC_PATHS`'s own independent,
@@ -387,7 +469,7 @@ implementation pass would need, not this one.
 | `SP_API_PRODUCTION_LWA_CLIENT_ID` / `_SECRET` | Amazon Seller Central Developer Console (Draft/Production app) | Railway env var, `api` only (workers resolve secrets via SecretProvider, not this pair directly — confirm this at implementation time) | Rotate if ever exposed in a log/commit; requires re-registering with Amazon |
 | `OPENAI_API_KEY` | OpenAI dashboard | Railway env var, `api` only | Standard OpenAI key rotation |
 | `RAINFOREST_API_KEY` | Rainforest dashboard | Railway env var, `api` only | Standard provider rotation |
-| `AMAZON_SECRET_ENCRYPTION_KEYS` (pass 2, §0a) | Generated locally, once: `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"` — 32 random bytes, base64-encoded, wrapped as `{"v1":"<value>"}` | Railway env var, `api` + 4 workers (identical value on every service — any of them may need to decrypt a row) | Rotation procedure: generate a new key, add it as a new `key_version` alongside the old one in the JSON object (old key stays present so already-encrypted rows keep decrypting), set `AMAZON_SECRET_ACTIVE_KEY_VERSION` to the new version for new writes, then re-encrypt existing rows on your own schedule via `ProductionSecretProvider.rotate_key_version()`; only remove the old key from the JSON object once every row has been confirmed rotated |
+| `AMAZON_SECRET_ENCRYPTION_KEYS` (pass 2, §0a) | Generated locally, once: `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"` — 32 random bytes, base64-encoded, wrapped as `{"v1":"<value>"}` | Railway env var, `api` + 4 workers (identical value on every service — any of them may need to decrypt a row) | Rotation procedure, final review gate PR #28 — verified never leaves existing ciphertext permanently unreadable if followed in order: (1) generate a new key, add it as a new `key_version` **alongside** the old one in the JSON object — never replacing it yet, since removing a key while any row still depends on it makes that row's ciphertext permanently, cryptographically unrecoverable (there is no way to decrypt without the exact key it was encrypted with); (2) set `AMAZON_SECRET_ACTIVE_KEY_VERSION` to the new version so new writes use it; (3) re-encrypt existing rows on your own schedule via `ProductionSecretProvider.rotate_key_version()` — rows not yet rotated stay fully readable under the still-present old key the whole time; (4) **before** removing the old key from the JSON object, call `ProductionSecretProvider.count_rows_for_key_version(old_version)` and confirm it returns exactly `0` — this is the one required verification step, not optional; only once it does is the old key safe to delete from `AMAZON_SECRET_ENCRYPTION_KEYS`. See `tests/test_amazon_production_secrets.py`'s rotation tests for the exact behavior this procedure relies on. |
 | Amazon seller refresh-token references | Generated per-seller during OAuth | `amazon_encrypted_secrets` (Supabase Postgres), ciphertext only — see §0a | Rotation is per-value re-encryption above; a seller can independently revoke/reauthorize from Seller Central at any time |
 | `CLOUDFLARE_ACCESS_AUDIENCE` (pass 2, §0b) | Cloudflare dashboard, assigned when the Access application is created | Railway env var, `api` only | Not secret-sensitive in the same way as a credential (it identifies an application, not a key) — rotate by editing the Access application if it is ever recreated |
 | `WORKER_WATCHDOG_STALE_AFTER_SECONDS` etc. | Not a secret — operational config | Railway env var, workers | N/A |
@@ -490,6 +572,10 @@ a placeholder/comment, never a real value.
 
 ## 11. Post-deployment verification checklist
 
+- [ ] Before deploying the frontend at all: `/privacy` and `/terms` no
+      longer contain `[PENDING` (§0e) — if they still do,
+      `npm run build` already refused to build; this is a prerequisite,
+      not a post-deployment check.
 - [ ] `GET https://api.ewiseintelligence.com/health` → `200`, body is
       exactly `{"status": "ok"}` (no `persistence` field — pass 2
       sanitized this route since it is the one public path)
