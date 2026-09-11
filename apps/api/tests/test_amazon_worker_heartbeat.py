@@ -11,18 +11,20 @@ after its first idle-poll-length sleep.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app.amazon.worker_heartbeat import (
+    _HeartbeatWatchdog,
     check_availability,
     invalidate_heartbeat,
     new_instance_id,
     record_heartbeat,
     start_heartbeat_loop,
 )
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.persistence.database import session_scope
 from app.persistence.models import AmazonWorkerHeartbeat
 from app.persistence.repositories import WorkerHeartbeatRepository
@@ -274,3 +276,105 @@ async def test_heartbeat_loop_stop_invalidates_inventory_availability_immediatel
     assert check_availability("inventory", stale_after_seconds=45.0).available is False
     with session_scope() as session:
         assert session.get(AmazonWorkerHeartbeat, "inventory") is None
+
+
+# --- pilot-deployment-ewise: same-process self-watchdog ---------------------
+#
+# `scripts/supervisor.py`'s own hung-worker detection (heartbeat polled
+# *externally*) has no equivalent on Railway, where each worker is its
+# own isolated service with nothing else watching it. `_HeartbeatWatchdog`
+# runs on a genuinely separate OS thread (never another asyncio task on
+# the worker's own loop, which a truly stuck loop could never use to
+# notice itself) and calls os._exit(1) as an unrecoverable last resort.
+# Every test here monkeypatches os._exit to a recording spy — the real
+# call would kill the pytest process outright.
+
+
+def test_watchdog_does_not_fire_while_heartbeats_keep_succeeding(monkeypatch) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr("app.amazon.worker_heartbeat.os._exit", lambda code: calls.append(code))
+
+    watchdog = _HeartbeatWatchdog("orders", stale_after_seconds=0.06, check_interval_seconds=0.02)
+    watchdog.start()
+    try:
+        # Keep "heartbeats" arriving faster than the stale threshold —
+        # the watchdog must never fire while this keeps happening.
+        for _ in range(6):
+            watchdog.mark_success()
+            time.sleep(0.02)
+    finally:
+        watchdog.stop()
+
+    assert calls == []
+
+
+def test_watchdog_fires_after_genuine_silence(monkeypatch) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr("app.amazon.worker_heartbeat.os._exit", lambda code: calls.append(code))
+
+    watchdog = _HeartbeatWatchdog("orders", stale_after_seconds=0.05, check_interval_seconds=0.02)
+    watchdog.start()
+    try:
+        # Never call mark_success() again after construction — simulates
+        # a heartbeat task that has genuinely stopped running.
+        time.sleep(0.15)
+    finally:
+        watchdog.stop()
+
+    assert calls == [1]
+
+
+def test_watchdog_stop_prevents_a_late_fire(monkeypatch) -> None:
+    """Stopping before the threshold elapses must permanently prevent
+    the watchdog from ever firing, even if the caller (incorrectly)
+    waited past the threshold afterward — matches how
+    `HeartbeatLoopHandle.stop()` always stops the watchdog as part of
+    an intentional, graceful shutdown."""
+    calls: list[int] = []
+    monkeypatch.setattr("app.amazon.worker_heartbeat.os._exit", lambda code: calls.append(code))
+
+    watchdog = _HeartbeatWatchdog("orders", stale_after_seconds=0.05, check_interval_seconds=0.02)
+    watchdog.start()
+    watchdog.stop()
+    time.sleep(0.15)
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_wires_the_watchdog_by_default(monkeypatch) -> None:
+    """start_heartbeat_loop()'s default enable_watchdog=True path — the
+    watchdog attached to the returned handle must genuinely receive
+    mark_success() calls as the real heartbeat loop ticks, proven by
+    never firing across several real intervals with a stale threshold
+    shorter than the total elapsed time would otherwise allow."""
+    calls: list[int] = []
+    monkeypatch.setattr("app.amazon.worker_heartbeat.os._exit", lambda code: calls.append(code))
+    fast_settings = Settings(
+        worker_heartbeat_interval_seconds=0.02,
+        worker_heartbeat_stale_after_seconds=1.0,
+        worker_watchdog_stale_after_seconds=1.5,
+        worker_watchdog_check_interval_seconds=0.02,
+    )
+
+    handle = start_heartbeat_loop(
+        "orders", instance_id="watchdog-wiring-test", interval_seconds=0.02, settings=fast_settings
+    )
+    assert handle.watchdog is not None
+    try:
+        await asyncio.sleep(0.15)
+    finally:
+        await handle.stop()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_watchdog_can_be_disabled() -> None:
+    handle = start_heartbeat_loop(
+        "orders", instance_id="watchdog-disabled-test", interval_seconds=60.0, enable_watchdog=False
+    )
+    try:
+        assert handle.watchdog is None
+    finally:
+        await handle.stop()
