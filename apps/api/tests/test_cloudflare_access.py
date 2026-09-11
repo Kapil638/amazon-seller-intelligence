@@ -154,9 +154,10 @@ def test_verify_rejects_alg_none_token() -> None:
 # --- is_public_path ---------------------------------------------------------
 
 
-def test_public_paths_are_exactly_health_and_the_oauth_callback() -> None:
+def test_public_paths_are_exactly_health_login_and_callback() -> None:
     assert is_public_path("/health") is True
     assert is_public_path("/api/v1/amazon/connection/callback") is True
+    assert is_public_path("/api/v1/amazon/connection/login") is True
     assert is_public_path("/health/workers") is False
     assert is_public_path("/api/v1/amazon/connection") is False
     assert is_public_path("/api/v1/amazon/listings") is False

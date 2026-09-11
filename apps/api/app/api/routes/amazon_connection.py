@@ -84,6 +84,40 @@ def authorize_amazon_connection(
     return result
 
 
+@router.get("/connection/login")
+def amazon_oauth_login(
+    service: AmazonConnectionService = Depends(get_amazon_connection_service),
+) -> RedirectResponse:
+    """pilot-deployment-ewise, correction 3 — this application's registered
+    Amazon Website Authorization Workflow "Login URI". Amazon's Developer
+    Console requires a real, live Login URI for any self-authorization
+    SP-API application, even one (like this one) that only ever links
+    Amazon accounts through its own "Connect Amazon" button
+    (`POST /connection/authorize`) and is never listed in the Appstore for
+    a seller-initiated flow — an unreachable placeholder is not an
+    acceptable value there.
+
+    A plain top-level browser GET, not a fetch/XHR — no request body, no
+    CORS involved, never called from application JS. Does exactly what
+    `POST /connection/authorize` already does (build a Seller Central
+    consent URL with a fresh hashed OAuth state, same PRODUCTION
+    environment default) and redirects the browser straight there, so a
+    seller landing here — from a bookmark, from Amazon re-showing this
+    URI, or a first-time visit — reaches the same real consent flow the
+    in-app button starts. Never accepts or trusts any query parameter
+    Amazon might attach to this specific request (this app is not
+    Appstore-listed, so none is expected) — a fresh state is generated
+    unconditionally, exactly like the authenticated JSON endpoint.
+    """
+    try:
+        result = service.start_authorization(environment="PRODUCTION")
+    except (PersistenceNotConfiguredError, SpApiConfigurationError, PersistenceError) as exc:
+        raise _http_error(exc) from exc
+    response = RedirectResponse(url=result.authorization_url, status_code=302)
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 @router.get("/connection/callback")
 def amazon_oauth_callback(
     service: AmazonConnectionService = Depends(get_amazon_connection_service),

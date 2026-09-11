@@ -48,22 +48,28 @@ UNAUTHORIZED_MESSAGE = "Not authenticated."
 
 # Exact, hardcoded public-path allowlist. Every other path requires a
 # verified Cloudflare Access identity when api_auth_backend=
-# cloudflare_access. Both entries are load-bearing:
+# cloudflare_access. Every entry is load-bearing:
 # - /health: narrowly-scoped liveness only (see app.main.health — it
 #   returns nothing beyond {"status": "ok"}, no worker names, database
 #   state, or configuration).
 # - /api/v1/amazon/connection/callback: Amazon's own OAuth redirect
 #   lands the seller's browser here directly, with no Cloudflare Access
-#   session of its own — see app.api.routes.amazon_connection. The
-#   matching Cloudflare Access "bypass" policy for this exact path must
-#   be configured on the Access application itself; this allowlist entry
-#   is this process's own independent half of that same exemption, so a
-#   misconfigured or momentarily-absent Access bypass policy cannot turn
-#   into a broken OAuth callback.
+#   session of its own — see app.api.routes.amazon_connection.
+# - /api/v1/amazon/connection/login: this application's registered
+#   Amazon "Login URI" (pilot-deployment-ewise, correction 3) — reached
+#   the same way (a bare browser navigation, no Access session), and
+#   registered in Amazon's own Developer Console, so it must be reachable
+#   identically to the callback.
+# The matching Cloudflare Access "bypass" policy for these exact paths
+# must be configured on the Access application itself; this allowlist is
+# this process's own independent half of that same exemption, so a
+# misconfigured or momentarily-absent Access bypass policy cannot turn
+# into a broken OAuth flow.
 PUBLIC_PATHS = frozenset(
     {
         "/health",
         "/api/v1/amazon/connection/callback",
+        "/api/v1/amazon/connection/login",
     }
 )
 
