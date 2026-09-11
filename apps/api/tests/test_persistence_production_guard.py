@@ -243,6 +243,76 @@ def test_real_get_engine_succeeds_for_the_admin_context_with_override(
     assert engine is not None
 
 
+# --- pilot-deployment-ewise: configurable per-process pool bounds -----------
+#
+# Settings.db_pool_size / db_max_overflow default to None — SQLAlchemy's
+# own create_engine() then applies its built-in defaults (pool_size=5,
+# max_overflow=10) exactly as it always has. A deployed environment
+# sharing one remote Postgres pooler across several separate processes
+# must set these explicitly; these tests prove both the "unset" (existing
+# behavior unchanged) and "explicitly configured" paths without ever
+# opening a real connection.
+
+
+@pytest.fixture
+def _create_engine_spy(monkeypatch):
+    """Like `_fake_remote_engine_resolution`, but records the exact
+    kwargs `get_engine()` passes to `create_engine`, so a test can assert
+    on them directly instead of only on whether an engine was returned."""
+    from app.core.config import get_settings
+
+    calls: list[dict] = []
+
+    def _fake_create_engine(*_args, **kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setenv(_CONTEXT_ENV_VAR, "api")
+    monkeypatch.setattr(database_module, "sqlalchemy_database_url", lambda *a, **k: _FAKE_REMOTE_URL)
+    monkeypatch.setattr(database_module, "create_engine", _fake_create_engine)
+    monkeypatch.setattr(database_module, "_bootstrap_organization", lambda engine: None)
+    get_settings.cache_clear()
+    database_module.get_engine.cache_clear()
+    yield calls
+    get_settings.cache_clear()
+    database_module.get_engine.cache_clear()
+
+
+def test_get_engine_omits_pool_kwargs_when_unset(monkeypatch, _create_engine_spy) -> None:
+    """Unset db_pool_size/db_max_overflow (the default) must produce a
+    create_engine() call with neither kwarg present at all — proving
+    SQLAlchemy's own defaults are untouched for local dev/every existing
+    test, not merely that some value happens to match them."""
+    database_module.get_engine()
+    assert len(_create_engine_spy) == 1
+    assert "pool_size" not in _create_engine_spy[0]
+    assert "max_overflow" not in _create_engine_spy[0]
+
+
+def test_get_engine_applies_configured_pool_size(monkeypatch, _create_engine_spy) -> None:
+    monkeypatch.setenv("DB_POOL_SIZE", "2")
+    monkeypatch.setenv("DB_MAX_OVERFLOW", "1")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    database_module.get_engine()
+    assert _create_engine_spy[0]["pool_size"] == 2
+    assert _create_engine_spy[0]["max_overflow"] == 1
+
+
+def test_get_engine_applies_pool_size_independently_of_max_overflow(monkeypatch, _create_engine_spy) -> None:
+    """Only one of the two is set — the other must stay absent from the
+    create_engine() call (falling back to SQLAlchemy's own default for
+    just that one), never defaulted to 0 or any other invented value."""
+    monkeypatch.setenv("DB_POOL_SIZE", "3")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    database_module.get_engine()
+    assert _create_engine_spy[0]["pool_size"] == 3
+    assert "max_overflow" not in _create_engine_spy[0]
+
+
 def test_real_get_engine_fails_closed_for_an_unclassified_diagnostic_process(
     monkeypatch, _fake_remote_engine_resolution
 ) -> None:
