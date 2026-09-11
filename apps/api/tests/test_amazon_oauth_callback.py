@@ -720,6 +720,37 @@ def test_invalid_state_rejected() -> None:
         assert stored.consumed_at is None
 
 
+def test_tampered_valid_state_rejected() -> None:
+    """Final review gate, PR #28 — distinct from test_invalid_state_rejected
+    (which uses an arbitrary bogus string): this starts from a genuinely
+    valid, unexpired, real state and flips a single character, proving the
+    hash-lookup design actually detects tampering of an otherwise-real
+    token, not merely rejects tokens that were never real to begin with.
+    A single flipped character changes the SHA-256 digest completely
+    (avalanche effect), so the tampered value can never match the stored
+    hash — it is classified identically to a wholly-invented state."""
+    service, raw = _start()
+    tampered = (raw[:-1] + ("a" if raw[-1] != "a" else "b")) if raw else raw
+    assert tampered != raw
+    result = service.complete_authorization_callback(state=tampered, spapi_oauth_code=TEST_CODE)
+    assert result.outcome == "invalid"
+    assert result.notice == "error"
+    assert result.reason == "oauth_state_invalid"
+    assert result.authorization_code_present is False
+    with session_scope() as session:
+        stored = session.scalars(select(AmazonOAuthState)).one()
+        # The original, untampered state's row is untouched — proving the
+        # tampered value never matched it (a lookup miss, classified
+        # "missing"), rather than the original row having somehow been
+        # located and consumed by this rejected attempt. The real state
+        # therefore remains fully usable afterward; a tampering attempt
+        # must never poison or consume the genuine token it was derived
+        # from.
+        assert stored.consumed_at is None
+        assert stored.state_hash == hash_oauth_state(raw)
+        assert stored.state_hash != hash_oauth_state(tampered)
+
+
 def test_expired_state_rejected() -> None:
     service = _service()
     raw, digest = new_oauth_state()
