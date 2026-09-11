@@ -195,6 +195,27 @@ class ProductionSecretProvider:
         plaintext = self._decrypt(material, key, nonce, ciphertext)
         self._write(key, new_key_version, plaintext)
 
+    def count_rows_for_key_version(self, key_version: str) -> int:
+        """Final review gate, PR #28 — read-only safety check for a key
+        rotation. Removing a key_version from AMAZON_SECRET_ENCRYPTION_KEYS
+        while any row is still encrypted under it makes that row's
+        ciphertext permanently unreadable: decryption requires the exact
+        key material it was encrypted with, and there is no other way to
+        recover the plaintext once that key is gone — this is an inherent
+        property of authenticated encryption, not a bug. Call this for the
+        retiring key_version and confirm it returns 0 before removing that
+        key_version from the configured key map; see
+        rotate_key_version for moving a row off the retiring version."""
+        try:
+            with session_scope() as session:
+                return int(
+                    session.query(AmazonEncryptedSecret).filter_by(key_version=key_version).count()
+                )
+        except SecretAccessError:
+            raise
+        except Exception as exc:
+            raise SecretAccessError(SECRET_ACCESS_FAILURE_MESSAGE) from exc
+
     def _read_row(self, key: str) -> tuple[str, bytes, bytes]:
         try:
             with session_scope() as session:

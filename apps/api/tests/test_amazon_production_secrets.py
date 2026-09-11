@@ -318,6 +318,35 @@ def test_old_key_still_decrypts_rows_not_yet_rotated_after_a_new_active_version_
         assert session.get(AmazonEncryptedSecret, other_reference).key_version == "v2"
 
 
+def test_count_rows_for_key_version_reflects_rotation_progress() -> None:
+    """Final review gate, PR #28 — count_rows_for_key_version is the
+    operator's safety check before removing a retiring key_version:
+    rotation is only safe to finalize (remove the old key from
+    AMAZON_SECRET_ENCRYPTION_KEYS) once this returns 0 for it."""
+    keys = {"v1": base64.b64decode(KEY_V1), "v2": base64.b64decode(KEY_V2)}
+    provider = _provider(keys=keys, active="v1")
+    ref_a = _reference("11111111-1111-1111-1111-111111111111")
+    ref_b = _reference("22222222-2222-2222-2222-222222222222")
+    provider.put_secret(ref_a, SecretStr(REFRESH_TOKEN))
+    provider.put_secret(ref_b, SecretStr(OTHER_TOKEN))
+
+    assert provider.count_rows_for_key_version("v1") == 2
+    assert provider.count_rows_for_key_version("v2") == 0
+
+    provider.rotate_key_version(ref_a, new_key_version="v2")
+    assert provider.count_rows_for_key_version("v1") == 1
+    assert provider.count_rows_for_key_version("v2") == 1
+
+    provider.rotate_key_version(ref_b, new_key_version="v2")
+    assert provider.count_rows_for_key_version("v1") == 0
+    assert provider.count_rows_for_key_version("v2") == 2
+
+
+def test_count_rows_for_key_version_is_zero_for_an_unused_version() -> None:
+    provider = _provider()
+    assert provider.count_rows_for_key_version("v-never-used") == 0
+
+
 def test_row_encrypted_under_a_key_version_no_longer_configured_fails_closed() -> None:
     """A row's key_version pointing at a key that has since been removed
     from this process's configured key map must fail closed, never attempt
