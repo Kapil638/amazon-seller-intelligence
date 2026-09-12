@@ -26,6 +26,14 @@ export function PublicPageShell({ children }: { children: ReactNode }) {
       </header>
       <main className="flex-1">{children}</main>
       <footer className="mt-16 border-t border-border pt-6 text-xs text-muted-foreground">
+        <nav className="mb-2 flex gap-4">
+          <Link href="/privacy" className="hover:text-foreground">
+            Privacy
+          </Link>
+          <Link href="/terms" className="hover:text-foreground">
+            Terms
+          </Link>
+        </nav>
         <p>&copy; {new Date().getFullYear()} Ewisepartners LLC, doing business as EWise Partners. All rights reserved.</p>
       </footer>
     </div>
