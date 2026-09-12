@@ -661,6 +661,80 @@ class Settings(BaseSettings):
             )
         return self
 
+    # 12C — Amazon Ads API OAuth foundation (read-only). Deliberately never
+    # falls back to any SP-API LWA credential: Amazon Ads must be
+    # registered as its own Partner application under a distinct LWA
+    # security profile ("EWise Ads Intelligence", per docs/AI_HANDOVER/
+    # 20_PILOT_DEPLOYMENT_EWISE.md §7), so its client id/secret are wholly
+    # separate settings. Left empty by default — every route that needs
+    # them fails closed with AdsConfigurationError until an operator sets
+    # them, exactly like sp_api_oauth_redirect_uri's own default empty
+    # string keeps the existing SP-API login route inactive today. This
+    # keeps the whole Ads OAuth flow "complete but inactive": the code
+    # path exists and is tested against mocks, but is unreachable in any
+    # real environment until these are deliberately configured AND the
+    # matching Amazon application/Cloudflare bypass exist.
+    ads_lwa_client_id: SecretStr | None = None
+    ads_lwa_client_secret: SecretStr | None = None
+    # LWA's token endpoint is shared infrastructure across every Amazon
+    # API family (SP-API and Ads alike) — same URL, different client
+    # credentials/scope. See docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md
+    # for the source consulted for every Ads-specific URL/header below.
+    ads_lwa_token_url: str = "https://api.amazon.com/auth/o2/token"
+    ads_oauth_redirect_uri: str = ""
+    ads_oauth_consent_base_url: str = "https://www.amazon.com/ap/oa"
+    # Amazon documents exactly one scope for the Ads API's Sponsored Ads
+    # surface, covering both read and write operations — there is no
+    # narrower Amazon-defined "read-only" scope to request instead. This
+    # application enforces read-only behavior itself (no client method
+    # ever issues a create/update/delete call), not through OAuth scope
+    # narrowing, which Amazon does not offer.
+    ads_oauth_scope: str = "advertising::campaign_management"
+    ads_oauth_state_ttl_seconds: int = 600
+    ads_api_timeout_seconds: float = 30
+    ads_application_name: str = "EWise Ads Intelligence"
+    # Amazon Ads API regional endpoint hosts. A profile's own
+    # countryCode/marketplace determines which of these a request for
+    # that profile must use — never guessed from the SP-API connection's
+    # own region, since an Ads profile id and an SP-API selling-partner id
+    # are not interchangeable (see ads_client.py's region resolution).
+    ads_api_base_url_na: str = "https://advertising-api.amazon.com"
+    ads_api_base_url_eu: str = "https://advertising-api-eu.amazon.com"
+    ads_api_base_url_fe: str = "https://advertising-api-fe.amazon.com"
+    # Reporting v3 async state machine tuning (bounded backoff/poll,
+    # matching the same shape as listings_sync_* / inventory_sync_*
+    # above). Report status enum values are a recorded assumption — see
+    # the handover doc — pending confirmation against a real response
+    # once Ads API approval completes.
+    ads_report_poll_interval_seconds: float = Field(
+        default=30.0, gt=0, le=600,
+        description="Delay between polls of an in-flight Ads report's status, before Amazon reports COMPLETED/CANCELLED/FAILURE.",
+    )
+    ads_report_poll_max_attempts: int = Field(
+        default=40, ge=1, le=500,
+        description="Bounded poll attempts for one report before it terminalizes as failed rather than polling forever.",
+    )
+    ads_report_lease_duration_seconds: int = Field(
+        default=300, ge=30, le=3600,
+        description="How long a claimed Ads report job's lease is valid before it is eligible for stale-lease recovery.",
+    )
+    ads_report_max_download_bytes: int = Field(
+        default=52_428_800, ge=1_024,
+        description="Hard cap on a downloaded Ads report body size, checked before and during download — never trust Content-Length alone.",
+    )
+    ads_sync_max_global_concurrent_jobs: int = Field(
+        default=4, ge=1, le=100,
+        description="Maximum number of Ads report jobs any future worker fleet may run simultaneously, across all organizations and profiles.",
+    )
+    ads_sync_max_concurrent_jobs_per_profile: int = Field(
+        default=1, ge=1, le=20,
+        description="Maximum number of Ads report jobs one advertiser profile may run simultaneously — one advertiser's backlog never starves another's.",
+    )
+    ads_sync_lookback_days: int = Field(
+        default=3, ge=0, le=30,
+        description="Rolling lookback window re-requested on each incremental sync so late Amazon attribution adjustments are refreshed, not just the newest day.",
+    )
+
     def consent_application_id(self) -> str:
         """Application id for website authorization. Production/Draft wins over sandbox."""
         production = self.sp_api_production_application_id.strip()

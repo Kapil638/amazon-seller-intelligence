@@ -49,6 +49,18 @@ from app.persistence.models import (
     AmazonSellerOrder,
     AmazonSellerOrderItem,
     AmazonWorkerHeartbeat,
+    AmazonAdsAdGroup,
+    AmazonAdsAdvertisedProduct,
+    AmazonAdsCampaign,
+    AmazonAdsConnection,
+    AmazonAdsDailyPerformanceFact,
+    AmazonAdsKeyword,
+    AmazonAdsOAuthState,
+    AmazonAdsProductTarget,
+    AmazonAdsProfile,
+    AmazonAdsReportRun,
+    AmazonAdsSyncCheckpoint,
+    AmazonAdsSyncError,
 )
 
 
@@ -6567,6 +6579,807 @@ class AmazonSellerInventoryRepository:
                 AmazonSellerInventory.marketplace_participation_id == marketplace_participation_id,
             )
         ).first()
+
+
+# 12C — Amazon Ads API read-only foundation repositories. Wholly separate
+# from every SP-API repository above: no query here ever joins into
+# `amazon_connections`/`amazon_oauth_states`/`amazon_ingestion_runs`, and
+# every method is organization-scoped exactly like its SP-API
+# counterparts (a caller passing another organization's id gets an empty
+# result or a raised ownership error, never another tenant's row).
+
+
+class AmazonAdsConnectionRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_for_org(self, organization_id: UUID) -> AmazonAdsConnection | None:
+        return self.session.scalars(
+            select(AmazonAdsConnection).where(AmazonAdsConnection.organization_id == organization_id)
+        ).first()
+
+    def get_or_create_for_org(
+        self, organization_id: UUID, *, amazon_seller_account_id: UUID | None = None
+    ) -> AmazonAdsConnection:
+        existing = self.get_for_org(organization_id)
+        if existing is not None:
+            return existing
+        row = AmazonAdsConnection(
+            organization_id=organization_id,
+            amazon_seller_account_id=amazon_seller_account_id,
+            status="not_connected",
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_by_id(self, organization_id: UUID, connection_id: UUID) -> AmazonAdsConnection | None:
+        return self.session.scalars(
+            select(AmazonAdsConnection).where(
+                AmazonAdsConnection.organization_id == organization_id,
+                AmazonAdsConnection.id == connection_id,
+            )
+        ).first()
+
+    def mark_pending_authorization(self, organization_id: UUID, connection_id: UUID) -> None:
+        self.session.execute(
+            update(AmazonAdsConnection)
+            .where(AmazonAdsConnection.organization_id == organization_id, AmazonAdsConnection.id == connection_id)
+            .values(status="pending_authorization")
+        )
+        self.session.flush()
+
+    def mark_connected(
+        self, organization_id: UUID, connection_id: UUID, *, token_reference: str, authorized_at: datetime
+    ) -> None:
+        self.session.execute(
+            update(AmazonAdsConnection)
+            .where(AmazonAdsConnection.organization_id == organization_id, AmazonAdsConnection.id == connection_id)
+            .values(
+                status="connected",
+                token_reference=token_reference,
+                authorized_at=authorized_at,
+                last_error_at=None,
+                last_error_code=None,
+            )
+        )
+        self.session.flush()
+
+    def mark_error(self, organization_id: UUID, connection_id: UUID, *, error_code: str, now: datetime) -> None:
+        self.session.execute(
+            update(AmazonAdsConnection)
+            .where(AmazonAdsConnection.organization_id == organization_id, AmazonAdsConnection.id == connection_id)
+            .values(status="error", last_error_at=now, last_error_code=error_code)
+        )
+        self.session.flush()
+
+
+class AmazonAdsOAuthStateRepository:
+    """Mirrors `AmazonOAuthStateRepository`'s exact atomic single-use
+    `consume` design (see that class's own docstring for why a
+    read-then-write implementation is unsafe under concurrent replay)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        organization_id: UUID,
+        connection_id: UUID,
+        state_hash: str,
+        expires_at: datetime,
+        return_path: str,
+        initiating_user_identity: str | None = None,
+        amazon_seller_account_id: UUID | None = None,
+        amazon_state: str | None = None,
+    ) -> AmazonAdsOAuthState:
+        digest = state_hash.strip()
+        if len(digest) != 64:
+            raise TypeError("Amazon Ads OAuth state hash is invalid.")
+        connection = self.session.get(AmazonAdsConnection, connection_id)
+        if connection is None or connection.organization_id != organization_id:
+            raise TypeError("Amazon Ads OAuth state cannot bind a connection from another organization.")
+        row = AmazonAdsOAuthState(
+            organization_id=organization_id,
+            connection_id=connection_id,
+            amazon_seller_account_id=amazon_seller_account_id,
+            initiating_user_identity=(initiating_user_identity or None),
+            return_path=return_path,
+            state_hash=digest,
+            amazon_state=amazon_state,
+            expires_at=expires_at,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_by_hash(self, state_hash: str) -> AmazonAdsOAuthState | None:
+        # Deliberately not organization-scoped in the lookup itself — the
+        # callback arrives with only the opaque state, never an
+        # organization id the caller could be trusted to supply; the
+        # state row itself is what proves which organization/connection
+        # this authorization belongs to (see `app.amazon.ads_connection`,
+        # which reads `row.organization_id` from here rather than
+        # trusting any caller-supplied value).
+        return self.session.scalars(select(AmazonAdsOAuthState).where(AmazonAdsOAuthState.state_hash == state_hash)).first()
+
+    def classify(self, state_hash: str, *, now: datetime | None = None) -> tuple[AmazonAdsOAuthState | None, str]:
+        """Return (row, missing|expired|consumed|usable)."""
+        row = self.get_by_hash(state_hash)
+        if row is None:
+            return None, "missing"
+        moment = now or datetime.now(UTC)
+        expires = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=UTC)
+        moment = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        if row.consumed_at is not None:
+            return row, "consumed"
+        if expires <= moment:
+            return row, "expired"
+        return row, "usable"
+
+    def consume(self, state_id: UUID, *, now: datetime | None = None) -> AmazonAdsOAuthState | None:
+        """Atomic single-use consume. Returns the row if this call won the
+        race; `None` if it was missing or already consumed — never
+        distinguishing the two to the caller."""
+        moment = now or datetime.now(UTC)
+        outcome = self.session.execute(
+            update(AmazonAdsOAuthState)
+            .where(AmazonAdsOAuthState.id == state_id, AmazonAdsOAuthState.consumed_at.is_(None))
+            .values(consumed_at=moment)
+        )
+        self.session.flush()
+        if outcome.rowcount != 1:
+            return None
+        self.session.expire_all()
+        return self.session.get(AmazonAdsOAuthState, state_id)
+
+
+class AmazonAdsProfileRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_for_connection(self, organization_id: UUID, connection_id: UUID) -> list[AmazonAdsProfile]:
+        return list(
+            self.session.scalars(
+                select(AmazonAdsProfile)
+                .where(
+                    AmazonAdsProfile.organization_id == organization_id,
+                    AmazonAdsProfile.connection_id == connection_id,
+                )
+                .order_by(AmazonAdsProfile.created_at.asc())
+            ).all()
+        )
+
+    def get_selected(self, organization_id: UUID, connection_id: UUID) -> AmazonAdsProfile | None:
+        return self.session.scalars(
+            select(AmazonAdsProfile).where(
+                AmazonAdsProfile.organization_id == organization_id,
+                AmazonAdsProfile.connection_id == connection_id,
+                AmazonAdsProfile.is_selected.is_(True),
+            )
+        ).first()
+
+    def get_owned(self, organization_id: UUID, ads_profile_id: UUID) -> AmazonAdsProfile | None:
+        """Ownership-scoped lookup — returns `None` identically for
+        "doesn't exist" and "belongs to another organization" (see
+        `AmazonListingsParticipationNotFoundError`'s own precedent)."""
+        return self.session.scalars(
+            select(AmazonAdsProfile).where(
+                AmazonAdsProfile.id == ads_profile_id,
+                AmazonAdsProfile.organization_id == organization_id,
+            )
+        ).first()
+
+    def upsert_many(
+        self, organization_id: UUID, connection_id: UUID, profiles: list[dict]
+    ) -> list[AmazonAdsProfile]:
+        """Idempotent upsert keyed by (connection_id, profile_id). Never
+        clears `is_selected`/`sync_state` for an already-selected profile
+        that reappears in a later authorization's profile list."""
+        result: list[AmazonAdsProfile] = []
+        for data in profiles:
+            existing = self.session.scalars(
+                select(AmazonAdsProfile).where(
+                    AmazonAdsProfile.connection_id == connection_id,
+                    AmazonAdsProfile.profile_id == data["profile_id"],
+                )
+            ).first()
+            if existing is not None:
+                for key in (
+                    "account_id",
+                    "account_type",
+                    "marketplace_country_code",
+                    "currency_code",
+                    "timezone",
+                    "region",
+                    "display_name",
+                ):
+                    if key in data:
+                        setattr(existing, key, data[key])
+                result.append(existing)
+                continue
+            row = AmazonAdsProfile(organization_id=organization_id, connection_id=connection_id, **data)
+            self.session.add(row)
+            result.append(row)
+        self.session.flush()
+        return result
+
+    def select_profile(self, organization_id: UUID, connection_id: UUID, ads_profile_id: UUID) -> AmazonAdsProfile:
+        """Selects exactly one profile for this connection, deselecting any
+        other — never permits selecting a profile from another connection
+        (raises `AdsProfileNotFoundError` at the service layer, not here;
+        this method raises a plain `ValueError` if the row is foreign, so
+        it can never silently select nothing)."""
+        target = self.get_owned(organization_id, ads_profile_id)
+        if target is None or target.connection_id != connection_id:
+            raise ValueError("Advertiser profile does not belong to this connection.")
+        self.session.execute(
+            update(AmazonAdsProfile)
+            .where(AmazonAdsProfile.connection_id == connection_id, AmazonAdsProfile.id != target.id)
+            .values(is_selected=False)
+        )
+        target.is_selected = True
+        if target.sync_state == "not_synced":
+            target.sync_state = "awaiting_first_sync"
+        self.session.flush()
+        return target
+
+    def update_sync_state(
+        self, organization_id: UUID, ads_profile_id: UUID, *, sync_state: str, last_synced_at: datetime | None = None
+    ) -> None:
+        values: dict[str, Any] = {"sync_state": sync_state}
+        if last_synced_at is not None:
+            values["last_synced_at"] = last_synced_at
+        self.session.execute(
+            update(AmazonAdsProfile)
+            .where(AmazonAdsProfile.organization_id == organization_id, AmazonAdsProfile.id == ads_profile_id)
+            .values(**values)
+        )
+        self.session.flush()
+
+
+class _AmazonAdsEntityRepositoryBase:
+    """Shared paginated-list + idempotent-upsert shape for the four
+    Sponsored Products entity tables below (ad groups, keywords, product
+    targets, advertised products all additionally scope by
+    `ads_campaign_id`/`ads_ad_group_id`; campaigns do not)."""
+
+    model: type
+    natural_key_field = "external_id"
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_for_profile(
+        self, organization_id: UUID, ads_profile_id: UUID, *, offset: int, limit: int
+    ) -> tuple[list, int]:
+        base_filters = (
+            self.model.organization_id == organization_id,
+            self.model.ads_profile_id == ads_profile_id,
+        )
+        total = self.session.scalar(select(func.count()).select_from(self.model).where(*base_filters)) or 0
+        rows = list(
+            self.session.scalars(
+                select(self.model)
+                .where(*base_filters)
+                .order_by(self.model.id.asc())
+                .offset(offset)
+                .limit(limit)
+            ).all()
+        )
+        return rows, int(total)
+
+
+class AmazonAdsCampaignRepository(_AmazonAdsEntityRepositoryBase):
+    model = AmazonAdsCampaign
+
+    def upsert(self, organization_id: UUID, ads_profile_id: UUID, data: dict) -> AmazonAdsCampaign:
+        existing = self.session.scalars(
+            select(AmazonAdsCampaign).where(
+                AmazonAdsCampaign.ads_profile_id == ads_profile_id,
+                AmazonAdsCampaign.external_campaign_id == data["external_campaign_id"],
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_seen_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsCampaign(organization_id=organization_id, ads_profile_id=ads_profile_id, **data)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_owned(self, organization_id: UUID, ads_profile_id: UUID, campaign_id: UUID) -> AmazonAdsCampaign | None:
+        return self.session.scalars(
+            select(AmazonAdsCampaign).where(
+                AmazonAdsCampaign.id == campaign_id,
+                AmazonAdsCampaign.organization_id == organization_id,
+                AmazonAdsCampaign.ads_profile_id == ads_profile_id,
+            )
+        ).first()
+
+    def get_by_external_id(self, ads_profile_id: UUID, external_campaign_id: str) -> AmazonAdsCampaign | None:
+        return self.session.scalars(
+            select(AmazonAdsCampaign).where(
+                AmazonAdsCampaign.ads_profile_id == ads_profile_id,
+                AmazonAdsCampaign.external_campaign_id == external_campaign_id,
+            )
+        ).first()
+
+
+class AmazonAdsAdGroupRepository(_AmazonAdsEntityRepositoryBase):
+    model = AmazonAdsAdGroup
+
+    def upsert(self, organization_id: UUID, ads_profile_id: UUID, ads_campaign_id: UUID, data: dict) -> AmazonAdsAdGroup:
+        existing = self.session.scalars(
+            select(AmazonAdsAdGroup).where(
+                AmazonAdsAdGroup.ads_profile_id == ads_profile_id,
+                AmazonAdsAdGroup.external_ad_group_id == data["external_ad_group_id"],
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_seen_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsAdGroup(
+            organization_id=organization_id, ads_profile_id=ads_profile_id, ads_campaign_id=ads_campaign_id, **data
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_by_external_id(self, ads_profile_id: UUID, external_ad_group_id: str) -> AmazonAdsAdGroup | None:
+        return self.session.scalars(
+            select(AmazonAdsAdGroup).where(
+                AmazonAdsAdGroup.ads_profile_id == ads_profile_id,
+                AmazonAdsAdGroup.external_ad_group_id == external_ad_group_id,
+            )
+        ).first()
+
+
+class AmazonAdsKeywordRepository(_AmazonAdsEntityRepositoryBase):
+    model = AmazonAdsKeyword
+
+    def upsert(
+        self, organization_id: UUID, ads_profile_id: UUID, ads_campaign_id: UUID, ads_ad_group_id: UUID, data: dict
+    ) -> AmazonAdsKeyword:
+        existing = self.session.scalars(
+            select(AmazonAdsKeyword).where(
+                AmazonAdsKeyword.ads_profile_id == ads_profile_id,
+                AmazonAdsKeyword.external_keyword_id == data["external_keyword_id"],
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_seen_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsKeyword(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            ads_campaign_id=ads_campaign_id,
+            ads_ad_group_id=ads_ad_group_id,
+            **data,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonAdsProductTargetRepository(_AmazonAdsEntityRepositoryBase):
+    model = AmazonAdsProductTarget
+
+    def upsert(
+        self, organization_id: UUID, ads_profile_id: UUID, ads_campaign_id: UUID, ads_ad_group_id: UUID, data: dict
+    ) -> AmazonAdsProductTarget:
+        existing = self.session.scalars(
+            select(AmazonAdsProductTarget).where(
+                AmazonAdsProductTarget.ads_profile_id == ads_profile_id,
+                AmazonAdsProductTarget.external_target_id == data["external_target_id"],
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_seen_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsProductTarget(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            ads_campaign_id=ads_campaign_id,
+            ads_ad_group_id=ads_ad_group_id,
+            **data,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonAdsAdvertisedProductRepository(_AmazonAdsEntityRepositoryBase):
+    model = AmazonAdsAdvertisedProduct
+
+    def upsert(
+        self, organization_id: UUID, ads_profile_id: UUID, ads_campaign_id: UUID, ads_ad_group_id: UUID, data: dict
+    ) -> AmazonAdsAdvertisedProduct:
+        existing = self.session.scalars(
+            select(AmazonAdsAdvertisedProduct).where(
+                AmazonAdsAdvertisedProduct.ads_profile_id == ads_profile_id,
+                AmazonAdsAdvertisedProduct.external_ad_id == data["external_ad_id"],
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_seen_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsAdvertisedProduct(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            ads_campaign_id=ads_campaign_id,
+            ads_ad_group_id=ads_ad_group_id,
+            **data,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonAdsDailyPerformanceFactRepository:
+    """Idempotent upsert keyed by the table's own natural key (profile,
+    entity_type, entity_external_id, fact_date, attribution_window) —
+    re-ingesting the same report row twice (a retried/duplicated report
+    download) overwrites the same row rather than duplicating it, which
+    is what makes report ingestion safe to retry at all (see
+    `app.amazon.ads_report_service`)."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert(
+        self, organization_id: UUID, ads_profile_id: UUID, data: dict, *, report_run_id: UUID | None
+    ) -> AmazonAdsDailyPerformanceFact:
+        existing = self.session.scalars(
+            select(AmazonAdsDailyPerformanceFact).where(
+                AmazonAdsDailyPerformanceFact.ads_profile_id == ads_profile_id,
+                AmazonAdsDailyPerformanceFact.entity_type == data["entity_type"],
+                AmazonAdsDailyPerformanceFact.entity_external_id == data["entity_external_id"],
+                AmazonAdsDailyPerformanceFact.fact_date == data["fact_date"],
+                AmazonAdsDailyPerformanceFact.attribution_window == data.get("attribution_window", "14d"),
+            )
+        ).first()
+        if existing is not None:
+            for key, value in data.items():
+                setattr(existing, key, value)
+            existing.last_report_run_id = report_run_id
+            existing.source_synced_at = func.now()
+            self.session.flush()
+            return existing
+        row = AmazonAdsDailyPerformanceFact(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            last_report_run_id=report_run_id,
+            **data,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def series_for_profile(
+        self, organization_id: UUID, ads_profile_id: UUID, *, start: date, end: date, entity_type: str = "campaign"
+    ) -> list[AmazonAdsDailyPerformanceFact]:
+        return list(
+            self.session.scalars(
+                select(AmazonAdsDailyPerformanceFact)
+                .where(
+                    AmazonAdsDailyPerformanceFact.organization_id == organization_id,
+                    AmazonAdsDailyPerformanceFact.ads_profile_id == ads_profile_id,
+                    AmazonAdsDailyPerformanceFact.entity_type == entity_type,
+                    AmazonAdsDailyPerformanceFact.fact_date >= start,
+                    AmazonAdsDailyPerformanceFact.fact_date <= end,
+                )
+                .order_by(AmazonAdsDailyPerformanceFact.fact_date.asc())
+            ).all()
+        )
+
+    def overview_totals(
+        self, organization_id: UUID, ads_profile_id: UUID, *, start: date, end: date
+    ) -> dict[str, Any]:
+        """Aggregated overview metrics — deliberately a separate,
+        summary-only query from `series_for_profile`'s row-level data (see
+        the scaling note in the handover doc: overview aggregation stays
+        cheap and independent of how many detailed rows exist)."""
+        row = self.session.execute(
+            select(
+                func.coalesce(func.sum(AmazonAdsDailyPerformanceFact.cost), 0),
+                func.coalesce(func.sum(AmazonAdsDailyPerformanceFact.attributed_sales), 0),
+                func.coalesce(func.sum(AmazonAdsDailyPerformanceFact.impressions), 0),
+                func.coalesce(func.sum(AmazonAdsDailyPerformanceFact.clicks), 0),
+                func.coalesce(func.sum(AmazonAdsDailyPerformanceFact.attributed_conversions), 0),
+            ).where(
+                AmazonAdsDailyPerformanceFact.organization_id == organization_id,
+                AmazonAdsDailyPerformanceFact.ads_profile_id == ads_profile_id,
+                AmazonAdsDailyPerformanceFact.entity_type == "campaign",
+                AmazonAdsDailyPerformanceFact.fact_date >= start,
+                AmazonAdsDailyPerformanceFact.fact_date <= end,
+            )
+        ).one()
+        spend, sales, impressions, clicks, conversions = row
+        return {
+            "spend": spend,
+            "attributed_sales": sales,
+            "impressions": int(impressions),
+            "clicks": int(clicks),
+            "attributed_conversions": int(conversions),
+        }
+
+
+class AmazonAdsReportRunRepository:
+    """Async-report state-machine ledger. `claim_next_report_job` mirrors
+    `claim_next_sales_traffic_job`'s exact safety properties (PostgreSQL
+    advisory lock serializing the decision step, single-row `SKIP LOCKED`
+    candidate, stale-`started`-lease reclaim first) with a distinct
+    advisory-lock key never shared with any SP-API run type, plus a
+    per-profile concurrency cap (`max_active_per_profile`) so one
+    advertiser's backlog/throttling can never starve another's (12C §8)."""
+
+    _CLAIM_ADVISORY_LOCK_KEY = 991_002_003
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self, organization_id: UUID, ads_profile_id: UUID, *, report_type: str, start_date: date, end_date: date
+    ) -> AmazonAdsReportRun:
+        row = AmazonAdsReportRun(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            report_type=report_type,
+            start_date=start_date,
+            end_date=end_date,
+            status="queued",
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_owned(self, organization_id: UUID, report_run_id: UUID) -> AmazonAdsReportRun | None:
+        return self.session.scalars(
+            select(AmazonAdsReportRun).where(
+                AmazonAdsReportRun.organization_id == organization_id, AmazonAdsReportRun.id == report_run_id
+            )
+        ).first()
+
+    def list_for_profile(self, organization_id: UUID, ads_profile_id: UUID, *, limit: int = 20) -> list[AmazonAdsReportRun]:
+        return list(
+            self.session.scalars(
+                select(AmazonAdsReportRun)
+                .where(
+                    AmazonAdsReportRun.organization_id == organization_id,
+                    AmazonAdsReportRun.ads_profile_id == ads_profile_id,
+                )
+                .order_by(AmazonAdsReportRun.created_at.desc())
+                .limit(limit)
+            ).all()
+        )
+
+    def claim_next_report_job(
+        self,
+        *,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        max_global_active: int,
+        max_active_per_profile: int,
+    ) -> AmazonAdsReportRun | None:
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": self._CLAIM_ADVISORY_LOCK_KEY}
+            )
+
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at.is_not(None),
+                AmazonAdsReportRun.lease_expires_at < func.now(),
+            )
+            .values(status="timed_out", completed_at=func.now(), failure_class="lease_expired", lease_owner=None)
+        )
+        self.session.flush()
+
+        _Global = aliased(AmazonAdsReportRun)
+        global_active_count = (
+            select(func.count()).select_from(_Global).where(_Global.status == "started").scalar_subquery()
+        )
+        _Profile = aliased(AmazonAdsReportRun)
+        profile_active_count = (
+            select(func.count())
+            .select_from(_Profile)
+            .where(_Profile.status == "started", _Profile.ads_profile_id == AmazonAdsReportRun.ads_profile_id)
+            .scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonAdsReportRun.id)
+            .where(
+                or_(
+                    AmazonAdsReportRun.status == "queued",
+                    and_(
+                        AmazonAdsReportRun.status == "waiting_to_retry",
+                        AmazonAdsReportRun.next_retry_at.is_not(None),
+                        AmazonAdsReportRun.next_retry_at <= func.now(),
+                    ),
+                ),
+                global_active_count < max_global_active,
+                profile_active_count < max_active_per_profile,
+            )
+            .order_by(
+                func.coalesce(AmazonAdsReportRun.next_retry_at, AmazonAdsReportRun.created_at).asc(),
+                AmazonAdsReportRun.id.asc(),
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+        claimed = self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry(lease_duration_seconds),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonAdsReportRun.started_at, func.now()),
+                attempt_count=AmazonAdsReportRun.attempt_count + 1,
+            )
+            .returning(AmazonAdsReportRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
+
+    def _lease_expiry(self, duration_seconds: int):
+        if self.session.get_bind().dialect.name == "postgresql":
+            return func.now() + text(f"interval '{int(duration_seconds)} seconds'")
+        return datetime.now(UTC) + timedelta(seconds=duration_seconds)
+
+    def heartbeat(self, report_run_id: UUID, *, lease_owner: str, lease_duration_seconds: int) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id, AmazonAdsReportRun.lease_owner == lease_owner)
+            .values(lease_expires_at=self._lease_expiry(lease_duration_seconds))
+        )
+        self.session.flush()
+
+    def set_amazon_report(self, report_run_id: UUID, *, amazon_report_id: str, amazon_report_status: str) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id)
+            .values(amazon_report_id=amazon_report_id, amazon_report_status=amazon_report_status)
+        )
+        self.session.flush()
+
+    def update_amazon_status(self, report_run_id: UUID, *, amazon_report_status: str) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id)
+            .values(amazon_report_status=amazon_report_status)
+        )
+        self.session.flush()
+
+    def mark_succeeded(self, report_run_id: UUID, *, records_ingested: int) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id)
+            .values(
+                status="succeeded",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                records_ingested=records_ingested,
+            )
+        )
+        self.session.flush()
+
+    def mark_retry(self, report_run_id: UUID, *, next_retry_at: datetime, failure_class: str, failure_detail: str) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id)
+            .values(
+                status="waiting_to_retry",
+                lease_owner=None,
+                lease_expires_at=None,
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                failure_detail=failure_detail,
+            )
+        )
+        self.session.flush()
+
+    def mark_failed(self, report_run_id: UUID, *, failure_class: str, failure_detail: str) -> None:
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(AmazonAdsReportRun.id == report_run_id)
+            .values(
+                status="failed",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                failure_class=failure_class,
+                failure_detail=failure_detail,
+            )
+        )
+        self.session.flush()
+
+
+class AmazonAdsSyncCheckpointRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, ads_profile_id: UUID) -> AmazonAdsSyncCheckpoint | None:
+        return self.session.get(AmazonAdsSyncCheckpoint, ads_profile_id)
+
+    def advance(
+        self, organization_id: UUID, ads_profile_id: UUID, *, synced_through_date: date, report_run_id: UUID
+    ) -> AmazonAdsSyncCheckpoint:
+        existing = self.get(ads_profile_id)
+        if existing is not None:
+            existing.synced_through_date = synced_through_date
+            existing.last_successful_report_run_id = report_run_id
+            self.session.flush()
+            return existing
+        row = AmazonAdsSyncCheckpoint(
+            ads_profile_id=ads_profile_id,
+            organization_id=organization_id,
+            synced_through_date=synced_through_date,
+            last_successful_report_run_id=report_run_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+
+class AmazonAdsSyncErrorRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def record(
+        self,
+        organization_id: UUID,
+        ads_profile_id: UUID,
+        *,
+        error_code: str,
+        error_message: str,
+        report_run_id: UUID | None = None,
+    ) -> AmazonAdsSyncError:
+        row = AmazonAdsSyncError(
+            organization_id=organization_id,
+            ads_profile_id=ads_profile_id,
+            report_run_id=report_run_id,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_recent(self, organization_id: UUID, ads_profile_id: UUID, *, limit: int = 20) -> list[AmazonAdsSyncError]:
+        return list(
+            self.session.scalars(
+                select(AmazonAdsSyncError)
+                .where(
+                    AmazonAdsSyncError.organization_id == organization_id,
+                    AmazonAdsSyncError.ads_profile_id == ads_profile_id,
+                )
+                .order_by(AmazonAdsSyncError.occurred_at.desc())
+                .limit(limit)
+            ).all()
+        )
 
 
 def file_sha256(data: bytes) -> str:

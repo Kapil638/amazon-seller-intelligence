@@ -128,6 +128,7 @@ If a number cannot be calculated from inputs, leave it unknown. Do not ask the L
 | Production Connect Amazon (US live grant) | Proven 25 August 2026 (not a new ingest slice) |
 | 12B.2A Canonical seller identity schema foundation | Schema + migration `0009` + callback identity capture implemented. Not yet wired to any live seller-account/participation creation. |
 | 12B.2 Canonical seller identity (remaining: normalization, ingestion) | **Next. Not started.** Architecture validation: `docs/AI_HANDOVER/12B2_CANONICAL_SELLER_IDENTITY_ARCHITECTURE_VALIDATION.md` |
+| Amazon Ads read-only integration foundation (built ahead of the 12B.2–12B.9 sequence, at explicit operator direction) | OAuth flow, data model (migration `0019`), injectable client, report state machine, read-only API, and Seller UI all implemented and tested against mocks — **inactive**: no Ads credentials configured anywhere, migration not applied to production, no live Amazon Ads call ever made. See `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md` for the activation plan. Does not change 12C's own place in the roadmap below. |
 
 Authorization path:
 
@@ -162,7 +163,7 @@ Connect Amazon defaults (verified in code):
 6. Amazon's Website Authorization Workflow **requires** `selling_partner_id` on the OAuth callback redirect for a self-authorized app. A successful callback (code present, not denied) whose `selling_partner_id` is missing, blank, oversized, token-shaped, or contains control characters now **fails closed**: no LWA exchange, no `SecretProvider` access, no `token_reference` bind, no identity change, no transition toward `pending_validation`/`connected` — reason `seller_identity_missing`. This applies identically to first authorization, reauthorization, reconnect, and concurrent attempts; it does not change the unrelated `access_denied` path. The rejected value is never logged, returned, or included in an exception. It is never invented, hashed, derived, or inferred from any other field (marketplace id, org id, connection id, application id, token reference, OAuth state, region, or the Sellers API response). The captured identifier is never used as the tenant key, org identifier, or authorization grant. `getMarketplaceParticipations`'s `sellingPartnerId` remains **secondary confirmation only** during validation — it is no longer a substitute for a missing callback identity on a successful Website Authorization callback; the old "permit and leave identity unset" fallback for a missing/invalid callback identifier no longer exists. A sequential identity check runs before the authorization code is exchanged and before `put_secret` is ever called, so an obviously conflicting reauthorization never reaches the active secret. The invariant is additionally enforced under **concurrent** callbacks for the same connection via `AmazonConnectionRepository.claim_identity_for_authorization` — a single atomic conditional `UPDATE` that must succeed before this attempt may touch SecretProvider at all, and that now raises `TypeError` rather than trivially succeeding if ever called with a missing identifier; two concurrent callbacks with different identifiers can never both win it (this holds on SQLite and PostgreSQL identically — it relies on universal single-statement UPDATE atomicity, not `SELECT ... FOR UPDATE` or any backend-specific locking). If callback and validation ever disagree, or the callback identifier disagrees with what's already on the connection (sequentially or concurrently), neither identity nor the active secret is overwritten; the connection is marked `identity_conflict` and automatic reconciliation stops.
 7. `amazon_seller_accounts` / `amazon_marketplace_participations` / `amazon_ingestion_runs` exist as schema (12B.2A, migration `0009`) but are not yet populated by any live path. Handshake marketplace lists are still not persisted as canonical rows.
 8. No seller business-data ingestion (listings, orders, inventory, reports, finances).
-9. No Ads API.
+9. No live Ads API integration. A read-only Ads foundation exists (see `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`) but is inactive: no credentials configured, no Amazon registration performed, no migration applied to production, no live call ever made.
 10. Rainforest remains active and must not be removed.
 11. Rainforest vs SP-API ASIN comparison is not done (after 12B.3 listing adapter).
 12. Uvicorn/access logs may expose callback query strings.
@@ -170,10 +171,10 @@ Connect Amazon defaults (verified in code):
 
 ## Current Test Baseline
 
-Verified 26 August 2026, no live Amazon in tests:
+Verified 12 September 2026, no live Amazon in tests:
 
-- Backend: `cd apps/api && uv run pytest` → **664 passed**
-- Frontend: `cd apps/web && npm test` → **35 passed** (3 files)
+- Backend: `cd apps/api && uv run pytest` → **2046 passed**, 94 skipped
+- Frontend: `cd apps/web && npm test` → **243 passed** (18 files)
 
 Do not add live Amazon calls to automated tests. `conftest.py` clears SP-API env and pins listing `DEFAULT_MARKETPLACE=amazon.in` so a local US Connect Amazon `.env` cannot fail listing/profit tests.
 

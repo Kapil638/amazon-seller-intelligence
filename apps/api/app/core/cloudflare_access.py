@@ -70,6 +70,21 @@ PUBLIC_PATHS = frozenset(
         "/health",
         "/api/v1/amazon/connection/callback",
         "/api/v1/amazon/connection/login",
+        # 12C — Amazon Ads OAuth foundation. This application's own half
+        # of the exemption, mirroring the SP-API pair above exactly (same
+        # reason: Amazon's redirect and this app's registered Login URI
+        # are both reached by a bare browser navigation with no
+        # Cloudflare Access session). The matching Cloudflare Access
+        # bypass application has deliberately NOT been created yet — see
+        # docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md — so these
+        # two paths are public-safe in code today but unreachable through
+        # the live deployment until that separate, external change is
+        # made. Every other `/api/v1/amazon/ads*` route (status,
+        # profiles, campaigns, etc.) is deliberately absent from this set
+        # and requires a verified Access identity like any other
+        # protected route.
+        "/api/v1/amazon/ads-connection/login",
+        "/api/v1/amazon/ads-connection/callback",
     }
 )
 
