@@ -366,6 +366,98 @@ class AmazonSellerInventoryNotFoundError(Exception):
         super().__init__(f"Inventory row {inventory_id} was not found.")
 
 
+class AdsConfigurationError(Exception):
+    """Ads client id/secret/redirect URI/team config absent or invalid. Fail closed."""
+
+    def __init__(self, message: str = "Amazon Ads is not configured.") -> None:
+        super().__init__(message)
+
+
+class AdsOAuthStateInvalidError(Exception):
+    """Raised for a missing, expired, already-consumed, or unrecognized OAuth state.
+
+    Deliberately the same generic message for every one of those distinct
+    causes — the public callback must never let a caller distinguish
+    "never existed" from "expired" from "already used", any one of which
+    could otherwise be probed to learn about another session's flow."""
+
+    def __init__(self, message: str = "This Amazon Ads authorization link is no longer valid.") -> None:
+        super().__init__(message)
+
+
+class AdsConnectionHijackError(Exception):
+    """Raised when a callback's bound organization/connection disagrees with
+    the state's own — e.g. a state minted for one organization presented
+    against another's connection row. Never distinguishes the specific
+    mismatch in its message."""
+
+    def __init__(self, message: str = "This Amazon Ads authorization could not be completed.") -> None:
+        super().__init__(message)
+
+
+class AdsProfileNotFoundError(Exception):
+    """A profile id could not be resolved within this connection's own
+    authorized profiles — same sanitized shape for missing, foreign, or
+    cross-connection profile ids."""
+
+    def __init__(self, profile_id: str) -> None:
+        self.profile_id = profile_id
+        super().__init__(f"Advertiser profile {profile_id} was not found.")
+
+
+class AdsProfileNotSelectedError(Exception):
+    def __init__(self, message: str = "Select an advertiser profile before viewing Ads data.") -> None:
+        super().__init__(message)
+
+
+class AdsApiAuthenticationError(Exception):
+    def __init__(self, message: str = "Amazon Ads API authentication failed.") -> None:
+        super().__init__(message)
+
+
+class AdsApiRateLimitedError(Exception):
+    """`retry_after_seconds` is populated only when Amazon's response
+    included a usable `Retry-After` header — see SpApiRateLimitedError's
+    own docstring for why a caller must never guess a fallback here."""
+
+    def __init__(
+        self,
+        message: str = "Amazon Ads API rate limit reached.",
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class AdsApiRequestFailedError(Exception):
+    def __init__(self, message: str = "Amazon Ads API request failed.") -> None:
+        super().__init__(message)
+
+
+class AdsApiInvalidRequestError(Exception):
+    """A non-transient 4xx response. Never retried — see SpApiInvalidRequestError."""
+
+    def __init__(self, message: str = "Amazon Ads API rejected the request.") -> None:
+        super().__init__(message)
+
+
+class AdsApiParseFailedError(Exception):
+    def __init__(self, message: str = "Amazon Ads API response could not be parsed.") -> None:
+        super().__init__(message)
+
+
+class AdsReportFailedError(Exception):
+    """A report reached a terminal failure status, or failed download/decompress/validation."""
+
+    def __init__(self, message: str = "The Amazon Ads report could not be completed.") -> None:
+        super().__init__(message)
+
+
+class AdsReportOversizedError(Exception):
+    def __init__(self, message: str = "The Amazon Ads report exceeded the allowed size.") -> None:
+        super().__init__(message)
+
+
 class SpApiInvalidRequestError(Exception):
     """A non-transient 4xx response (not authentication, not rate limiting).
 
