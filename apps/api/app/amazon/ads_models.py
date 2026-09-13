@@ -18,7 +18,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 AdsRegion = Literal["NA", "EU", "FE"]
 AdsReportStatus = Literal["PENDING", "PROCESSING", "COMPLETED", "CANCELLED", "FAILURE"]
@@ -204,7 +204,18 @@ class AdsReportRow(BaseModel):
     subset this product's read-only foundation persists (matches the
     Ads overview/performance metrics in the frontend). Unknown columns
     are ignored, not rejected, so a future report-column addition never
-    breaks ingestion of the columns already handled."""
+    breaks ingestion of the columns already handled.
+
+    CONFIRMED against a real completed `spCampaigns` report on
+    2026-09-13: Amazon's Reporting v3 API returns entity ids
+    (`campaignId` observed directly; `adGroupId`/`keywordId`/`targetId`/
+    `adId` follow the identical id-field convention in the same API
+    family) as JSON **integers**, not strings — unlike the v3
+    entity-list endpoints (e.g. `/sp/campaigns/list`), which return
+    these same ids as strings (also confirmed live, see
+    `AdsCampaignResponse`). Every one of 35 real report rows failed
+    validation for this exact reason before the fix below
+    (`campaignId: string_type — Input should be a valid string`)."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -225,3 +236,16 @@ class AdsReportRow(BaseModel):
     attributed_sales_14d: Decimal = Field(default=Decimal("0"), alias="sales14d")
     attributed_conversions_14d: int = Field(default=0, alias="purchases14d")
     currency: str | None = None
+
+    @field_validator("campaign_id", "ad_group_id", "keyword_id", "target_id", "ad_id", mode="before")
+    @classmethod
+    def _normalize_entity_id(cls, value: object) -> object:
+        """Only a safe, lossless `int` -> `str` conversion is performed
+        (and `bool` is explicitly excluded, since `True`/`False` are a
+        `int` subclass in Python but would never be a legitimate entity
+        id) — anything else (a float, a dict, a list) is passed through
+        unchanged so it still fails validation visibly rather than being
+        silently coerced into a plausible-looking but wrong string."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
