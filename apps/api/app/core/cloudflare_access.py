@@ -29,6 +29,7 @@ development and the existing test suite unaffected.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -41,6 +42,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 ACCESS_JWT_HEADER = "Cf-Access-Jwt-Assertion"
 ACCESS_JWT_COOKIE = "CF_Authorization"
@@ -170,6 +173,15 @@ class CloudflareAccessMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         token = _extract_token(request)
         if not token:
+            # Diagnostic only — never logs the token itself, a claim, or
+            # any request header value. Distinguishes "browser sent
+            # nothing at all" from a present-but-invalid token below, to
+            # root-cause a production auth failure without weakening the
+            # response the caller sees (still the same fixed generic 401).
+            logger.warning(
+                "cloudflare access rejected path=%s reason=no_token_present",
+                request.url.path,
+            )
             return JSONResponse({"detail": UNAUTHORIZED_MESSAGE}, status_code=401)
         try:
             identity = verify_cloudflare_access_token(
@@ -178,7 +190,12 @@ class CloudflareAccessMiddleware(BaseHTTPMiddleware):
                 audience=self._audience,
                 key_resolver=self._key_resolver,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "cloudflare access rejected path=%s reason=verification_failed error_type=%s",
+                request.url.path,
+                type(exc).__name__,
+            )
             return JSONResponse({"detail": UNAUTHORIZED_MESSAGE}, status_code=401)
         request.state.cloudflare_access_identity = identity
         return await call_next(request)
