@@ -24,15 +24,17 @@ because the docs site did not render for this environment's fetch tool):
 - Reporting v3: `POST /reporting/reports` (create), `GET
   /reporting/reports/{reportId}` (poll) — both profile-scoped.
 - Sponsored Products v3 list endpoints (campaigns/ad groups/product
-  ads/keywords/targets) are POST-based with versioned media types this
-  pass could not directly confirm — `HttpAmazonAdsApiClient`'s entity-list
-  methods are implemented against the field names/shapes this pass IS
-  confident of (stable across the Ads API's long-documented v2/v3
-  history) behind a single generic paginated POST helper; the exact
-  request body/media-type header for each entity type is flagged with a
-  `# ASSUMPTION` comment for the post-approval implementation pass to
-  verify against a real sandbox response before this client is ever
-  actually wired to a live call.
+  ads/keywords/targets) are POST-based with versioned media types.
+  `list_campaigns` was verified against a real production response on
+  2026-09-13 during the controlled read-validation task: it requires
+  `Content-Type`/`Accept: application/vnd.spcampaign.v3+json` (a generic
+  `application/json` request is rejected with 415), and the response
+  envelope key is `"campaigns"`, not the originally assumed `"items"`.
+  `list_ad_groups`/`list_product_ads`/`list_keywords`/`list_product_targets`
+  remain UNCONFIRMED — each is marked with a comment at its call site and
+  must be independently verified against a real response the same way
+  before being wired to any live path; do not assume the campaigns fix
+  generalizes to them.
 """
 
 from __future__ import annotations
@@ -294,10 +296,20 @@ class HttpAmazonAdsApiClient:
         raise AdsApiRequestFailedError("Amazon Ads API request failed.")
 
     async def _request_json(
-        self, ctx: AdsRequestContext, method: str, path: str, *, with_scope: bool, json_body: dict | None = None
+        self,
+        ctx: AdsRequestContext,
+        method: str,
+        path: str,
+        *,
+        with_scope: bool,
+        json_body: dict | None = None,
+        media_type: str | None = None,
     ) -> dict:
         base = resolve_region_base_url(ctx.region)
         headers = self._headers(ctx, with_scope=with_scope)
+        if media_type:
+            headers["Content-Type"] = media_type
+            headers["Accept"] = media_type
         logger.info(
             "ads api request method=%s path=%s correlation_id=%s headers=%s",
             method,
@@ -343,23 +355,16 @@ class HttpAmazonAdsApiClient:
         except ValidationError:
             raise AdsApiParseFailedError("Amazon Ads API profiles response was malformed.") from None
 
-    async def _list_entities(self, ctx, path, model, *, next_token, page_size):
-        # ASSUMPTION: Sponsored Products v3 "list" endpoints are POST-based
-        # with a `{"maxResults": page_size, "nextToken": next_token}` body
-        # and return `{"campaigns"|"adGroups"|...: [...], "nextToken": ...}`
-        # — the field this pass could not directly confirm from the docs
-        # site is the exact versioned `Content-Type`/`Accept` media type
-        # each v3 entity list expects (e.g. `application/vnd.spCampaign.
-        # v3+json`); verify against a real sandbox response before this
-        # method is ever wired to a live call.
+    async def _list_entities(self, ctx, path, model, *, media_type, response_key, next_token, page_size):
         payload = await self._request_json(
             ctx,
             "POST",
             path,
             with_scope=True,
+            media_type=media_type,
             json_body={"maxResults": page_size, **({"nextToken": next_token} if next_token else {})},
         )
-        raw_items = payload.get("items") or []
+        raw_items = payload.get(response_key) or []
         try:
             items = [model.model_validate(item) for item in raw_items]
         except ValidationError:
@@ -367,19 +372,52 @@ class HttpAmazonAdsApiClient:
         return items, payload.get("nextToken")
 
     async def list_campaigns(self, ctx, *, next_token=None, page_size=50):
-        return await self._list_entities(ctx, "/sp/campaigns/list", AdsCampaignResponse, next_token=next_token, page_size=page_size)
+        # CONFIRMED against a real production POST /sp/campaigns/list
+        # response on 2026-09-13: requires this exact versioned
+        # Content-Type/Accept media type (a generic application/json
+        # request is rejected with 415), and the response envelope key
+        # is "campaigns", not the previously-assumed "items".
+        return await self._list_entities(
+            ctx,
+            "/sp/campaigns/list",
+            AdsCampaignResponse,
+            media_type="application/vnd.spcampaign.v3+json",
+            response_key="campaigns",
+            next_token=next_token,
+            page_size=page_size,
+        )
 
     async def list_ad_groups(self, ctx, *, next_token=None, page_size=50):
-        return await self._list_entities(ctx, "/sp/adGroups/list", AdsAdGroupResponse, next_token=next_token, page_size=page_size)
+        # UNCONFIRMED — not yet tested against a real response. Known to
+        # be wrong in the same way list_campaigns was before its 2026-09-13
+        # fix (a generic application/json request will very likely be
+        # rejected with 415); do not wire this to a live path until it is
+        # independently verified the same way list_campaigns was.
+        return await self._list_entities(
+            ctx, "/sp/adGroups/list", AdsAdGroupResponse, media_type="application/json", response_key="items",
+            next_token=next_token, page_size=page_size,
+        )
 
     async def list_product_ads(self, ctx, *, next_token=None, page_size=50):
-        return await self._list_entities(ctx, "/sp/productAds/list", AdsProductAdResponse, next_token=next_token, page_size=page_size)
+        # UNCONFIRMED — see list_ad_groups.
+        return await self._list_entities(
+            ctx, "/sp/productAds/list", AdsProductAdResponse, media_type="application/json", response_key="items",
+            next_token=next_token, page_size=page_size,
+        )
 
     async def list_keywords(self, ctx, *, next_token=None, page_size=50):
-        return await self._list_entities(ctx, "/sp/keywords/list", AdsKeywordResponse, next_token=next_token, page_size=page_size)
+        # UNCONFIRMED — see list_ad_groups.
+        return await self._list_entities(
+            ctx, "/sp/keywords/list", AdsKeywordResponse, media_type="application/json", response_key="items",
+            next_token=next_token, page_size=page_size,
+        )
 
     async def list_product_targets(self, ctx, *, next_token=None, page_size=50):
-        return await self._list_entities(ctx, "/sp/targets/list", AdsProductTargetResponse, next_token=next_token, page_size=page_size)
+        # UNCONFIRMED — see list_ad_groups.
+        return await self._list_entities(
+            ctx, "/sp/targets/list", AdsProductTargetResponse, media_type="application/json", response_key="items",
+            next_token=next_token, page_size=page_size,
+        )
 
     async def create_report(self, ctx: AdsRequestContext, configuration: AdsReportRequestConfiguration) -> AdsReportStatusResponse:
         payload = await self._request_json(
