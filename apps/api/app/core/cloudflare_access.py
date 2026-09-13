@@ -79,7 +79,7 @@ PUBLIC_PATHS = frozenset(
         # are both reached by a bare browser navigation with no
         # Cloudflare Access session). The matching Cloudflare Access
         # bypass application has deliberately NOT been created yet — see
-        # docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md — so these
+        # docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md — so these
         # two paths are public-safe in code today but unreachable through
         # the live deployment until that separate, external change is
         # made. Every other `/api/v1/amazon/ads*` route (status,

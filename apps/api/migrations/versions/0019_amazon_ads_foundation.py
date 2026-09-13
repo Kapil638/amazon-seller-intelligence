@@ -14,7 +14,7 @@ Amazon endpoint by this migration's existence; every table here is a
 wholly separate family from the existing SP-API tables (no FK into
 `amazon_connections`, `amazon_oauth_states`, or `amazon_ingestion_runs`,
 and none from those tables into here) — see
-`docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md`.
+`docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`.
 
 Twelve new tables, in dependency order: `amazon_ads_connections`,
 `amazon_ads_oauth_states`, `amazon_ads_profiles`, `amazon_ads_campaigns`,

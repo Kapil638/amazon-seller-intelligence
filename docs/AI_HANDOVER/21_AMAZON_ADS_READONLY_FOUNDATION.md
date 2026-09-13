@@ -3,7 +3,7 @@
 Status: **built, complete, inactive.** No live Amazon Ads call has been
 made. No Cloudflare, Railway, Supabase production, or Amazon console
 change has been made. Nothing here starts, enables, or deploys anything
-by its own existence — see §8 (activation plan) for what a human must
+by its own existence — see §10 (activation plan) for what a human must
 still do, in order, before any of it goes live.
 
 This is a foundation pass, not milestone 12C itself — the numbered
@@ -157,17 +157,25 @@ migrated to a proper foreign key.
 
 | Variable | Purpose |
 |---|---|
+| `ADS_API_BACKEND` | Which Ads REST client is actually constructed — `disabled` (default, fail-closed, no network call possible), `mock` (tests/local dev only), or `http` (production). Never falls back silently between these; an unrecognized value raises. See `app.amazon.ads_client.build_amazon_ads_api_client`. |
 | `ADS_LWA_CLIENT_ID` | Ads Partner application LWA client id |
 | `ADS_LWA_CLIENT_SECRET` | Ads Partner application LWA client secret |
 | `ADS_OAUTH_REDIRECT_URI` | Must exactly match what's registered with Amazon |
 | `ADS_LWA_TOKEN_URL` | Defaults to the shared LWA endpoint; override only if Amazon documents otherwise |
 | `ADS_OAUTH_CONSENT_BASE_URL` | Defaults to `https://www.amazon.com/ap/oa` |
 | `ADS_OAUTH_SCOPE` | Defaults to `advertising::campaign_management` |
-| `ASI_ADS_WORKER_ENABLED` | Must stay unset/false until the activation plan (§8) is fully complete |
+| `ASI_ADS_WORKER_ENABLED` | Must stay unset/false until the activation plan (§10) is fully complete. The worker also independently requires `ADS_API_BACKEND=http` — either alone is insufficient to start it for real (see `app.amazon.ads_worker.main`'s two distinct exit codes, `EXIT_DISABLED` and `EXIT_BACKEND_NOT_HTTP`). |
 
 All other `ads_*` settings have safe numeric/string defaults (see
 `apps/api/app/core/config.py`) and do not need new Railway variables
 unless tuning is required.
+
+**Two independent gates, not one:** `ADS_API_BACKEND` controls which
+Ads REST *client* gets constructed (the network layer); `ADS_LWA_CLIENT_ID`/
+`_SECRET`/`ADS_OAUTH_REDIRECT_URI` control whether the OAuth *flow* is
+considered configured (`AmazonAdsConnectionService.is_configured`).
+Both must be satisfied independently before a live call can happen —
+setting only one leaves the feature inactive.
 
 ## 8. Cloudflare — required public paths, not yet added
 
@@ -214,6 +222,36 @@ this pass**:
   documented placeholder — verify against real sandbox responses before
   wiring them to a live call.
 
+**Second verification pass (production-client wiring task):** the
+official docs site still did not render for this environment's fetch
+tool (client-rendered SPA, returns only a page title). Additional
+corroboration found this pass, from Amazon's own `amzn/ads-advanced-
+tools-docs` repository and third-party Postman-collection references,
+without changing any of the above:
+
+- `Accept`/`Content-Type: application/vnd.spCampaign.v3+json` confirmed
+  again for the v3 Sponsored Products campaigns list, and the
+  `/sp/campaigns/list` POST path confirmed again by name.
+- `GET /v2/profiles` and the `Amazon-Advertising-API-Scope` header
+  confirmed again.
+- One third-party Postman mirror (`dbrent-amazon/Advertising-API-
+  Postman-Collection`) shows an **older, GET-based** `/v2/campaigns`,
+  `/v2/adGroups`, `/v2/keywords` pattern — this is the deprecated v2
+  list shape, not the v3 one this codebase implements; it was not used
+  to change anything, flagged here only so a future reader who finds
+  that mirror doesn't mistake it for current.
+- A `dbrent-amazon` gist describing report creation via `POST /v1/
+  keywords/report` with statuses `IN_PROGRESS`/`SUCCESS` is the
+  **deprecated v1 Reporting API** (different endpoint family, different
+  status vocabulary entirely from v3's `PENDING`/`COMPLETED`/etc.) — also
+  not used, flagged for the same reason.
+- The v3 report status enum's non-`PENDING` values and the exact v3
+  list-endpoint request-body shape remain genuinely unconfirmed against
+  one full official response, exactly as flagged in the first pass.
+  **This must be verified directly against Amazon's own sandbox once
+  approval completes** (see the activation plan's step 7 below) before
+  any of this is trusted for a live account.
+
 ## 10. Activation plan (do in this order; each step gates the next)
 
 1. Amazon Ads API Partner access approval completes (already submitted,
@@ -222,32 +260,51 @@ this pass**:
    Developer account as a **Partner** application, using the exact URLs
    in §2.
 3. Set `ADS_LWA_CLIENT_ID`, `ADS_LWA_CLIENT_SECRET`,
-   `ADS_OAUTH_REDIRECT_UI` on the `api` Railway service (masked secrets,
+   `ADS_OAUTH_REDIRECT_URI` on the `api` Railway service (masked secrets,
    never printed — same pattern as every other credential in this repo).
-4. Add the Cloudflare Access bypass for the two paths in §8.
-5. Apply migration `0019` to production Supabase (`alembic upgrade
+   `ADS_API_BACKEND` is still unset/`disabled` at this point — the OAuth
+   routes exist and will build a correct consent URL, but any attempt to
+   actually exchange a code or discover profiles still refuses clearly.
+4. Set `ADS_API_BACKEND=http` on the `api` Railway service. This is the
+   moment the app becomes capable of making a live Ads API call — do it
+   deliberately, immediately before the manual OAuth test in step 7, not
+   earlier. (`mock` is never appropriate on a real Railway service; it
+   exists for tests/local dev only.)
+5. Add the Cloudflare Access bypass for the two paths in §8.
+6. Apply migration `0019` to production Supabase (`alembic upgrade
    head`) during a low-traffic window — additive only, no data
    migration needed.
-6. Manually complete one real OAuth authorization (as the operator, on
+7. Manually complete one real OAuth authorization (as the operator, on
    AJ Duran's own Ads account) and confirm `GET
    /api/v1/amazon/ads-connection/status` shows `connected` with the
-   expected profile(s).
-7. Verify §9's flagged assumptions against the real profiles/report
+   expected profile(s). This is the first point any live Amazon Ads call
+   is made — everything before it is inert by construction.
+8. Verify §9's flagged assumptions against the real profiles/report
    responses now observable; fix `ads_models.py`/`ads_client.py` if any
    assumption was wrong.
-8. Select the correct AJ Duran profile via `POST
-   .../profiles/select`.
-9. Run `AmazonAdsReportService.process_one_claimed_job()` manually
-   (still not a deployed worker) against one real, small date range;
-   confirm ingested facts look correct.
-10. Only after step 9 is verified correct: deploy a dedicated Ads worker
-    (see §11) and set `ASI_ADS_WORKER_ENABLED=true` on it alone.
+9. Select the correct AJ Duran profile via `POST .../profiles/select`.
+10. Run `AmazonAdsReportService.process_one_claimed_job()` manually
+    (still not a deployed worker, still on the `api` service/a local
+    shell — `ADS_API_BACKEND=http` there is what makes this a real call)
+    against one real, small date range; confirm ingested facts look
+    correct.
+11. Only after step 10 is verified correct: deploy a dedicated Ads
+    worker (see §11) and, on that worker service specifically, set
+    **both** `ADS_API_BACKEND=http` and `ASI_ADS_WORKER_ENABLED=true`.
+    Neither alone starts it for real — `main()` exits with a distinct
+    code for each missing half (`EXIT_DISABLED` if the flag is unset,
+    `EXIT_BACKEND_NOT_HTTP` if the backend isn't `http`, even with the
+    flag set).
 
-**Rollback at any point:** unset `ASI_ADS_WORKER_ENABLED` (worker exits
-immediately, code 3); the OAuth routes fail closed the instant any of
-the three required env vars is unset; no other service is affected,
-since every Ads table is a separate family with no foreign key into
-existing SP-API or business tables.
+**Rollback at any point:** unsetting `ADS_API_BACKEND` (or setting it
+back to `disabled`) on any service immediately makes every Ads call on
+that service impossible again, independent of every other setting —
+this is the fastest, single-variable kill switch. Unsetting
+`ASI_ADS_WORKER_ENABLED` stops the worker specifically (exit code 3);
+the OAuth routes on `api` fail closed the instant any of the three
+required OAuth env vars is unset. No other service is affected in any
+case, since every Ads table is a separate family with no foreign key
+into existing SP-API or business tables.
 
 ## 11. Future Ads worker deployment recommendation (not created this pass)
 
@@ -269,8 +326,10 @@ point for a future `ads-worker` service:
   directly — do not re-attempt the `asia-southeast1` builder pool
   without first checking whether the `NIXPACKS_UV_VERSION` pin is still
   needed (see this session's own build-failure history for that region).
-- **Enable flag:** `ASI_ADS_WORKER_ENABLED=true` only after the full
-  activation plan (§10) is complete and manually verified.
+- **Enable flags:** `ADS_API_BACKEND=http` **and** `ASI_ADS_WORKER_ENABLED=true`,
+  both set on this worker service specifically, only after the full
+  activation plan (§10) is complete and manually verified. Either alone
+  leaves `main()` refusing to start (see §10's step 11).
 
 ## 12. Security and compliance review against the published Privacy Notice
 
