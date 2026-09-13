@@ -197,3 +197,24 @@ def test_sync_status_distinguishes_not_connected_from_awaiting_first_sync(
 
     response = client.get("/api/v1/amazon/ads/sync-status", params={"ads_profile_id": profile_id})
     assert response.json()["status"] == "awaiting_first_sync"
+
+
+def test_callback_route_redirects_to_the_configured_frontend_origin_not_the_api_host(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the real production defect: the callback route
+    must build an absolute URL against the configured frontend origin
+    (first CORS_ORIGINS entry), never let `RedirectResponse` resolve a
+    bare relative path against its own (API) host."""
+    monkeypatch.setenv("CORS_ORIGINS", '["https://app.ewiseintelligence.com"]')
+    get_settings.cache_clear()
+    try:
+        response = client.get(
+            "/api/v1/amazon/ads-connection/callback", params={"error": "access_denied"}, follow_redirects=False
+        )
+        assert response.status_code == 302
+        location = response.headers["location"]
+        assert location == "https://app.ewiseintelligence.com/seller/advertising?ads=denied"
+        assert not location.startswith("https://api.ewiseintelligence.com")
+    finally:
+        get_settings.cache_clear()

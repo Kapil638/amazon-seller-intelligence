@@ -22,6 +22,8 @@ from app.amazon.ads_connection import (
     AmazonAdsConnectionService,
     get_amazon_ads_connection_service,
 )
+from app.amazon.ads_oauth import frontend_ads_return_url
+from app.core.config import get_settings
 from app.core.exceptions import (
     AdsConfigurationError,
     AdsConnectionHijackError,
@@ -127,7 +129,10 @@ async def ads_oauth_callback(
         AdsConfigurationError,
     ) as exc:
         raise _http_error(exc) from exc
-    response = RedirectResponse(url=f"{result.return_path}?ads={result.notice}", status_code=302)
+    cfg = get_settings()
+    origin = str(cfg.cors_origins[0]) if cfg.cors_origins else "http://localhost:3000"
+    location = frontend_ads_return_url(origin=origin, return_path=result.return_path, notice=result.notice)
+    response = RedirectResponse(url=location, status_code=302)
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
