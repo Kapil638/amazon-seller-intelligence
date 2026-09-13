@@ -296,17 +296,44 @@ class AmazonAdsReportService:
             )
 
         try:
-            rows = _parse_report_body(body, max_bytes=self._cfg.ads_report_max_download_bytes)
+            parsed = _parse_report_body(body, max_bytes=self._cfg.ads_report_max_download_bytes)
         except AdsReportFailedError as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
                 failure_class="report_malformed", detail=str(exc),
             )
 
+        if parsed.total_rows > 0 and not parsed.rows:
+            # A nonempty report where every row failed schema validation
+            # is a deterministic row-contract mismatch, not a transient
+            # failure — retrying would reprocess the exact same bytes
+            # and fail identically, so this fails immediately rather
+            # than consuming retry attempts. Never marked "succeeded":
+            # zero facts are persisted and the checkpoint never
+            # advances (both happen only in the block below, which this
+            # branch returns before reaching).
+            detail = (
+                f"Amazon returned {parsed.total_rows} row(s) but 0 were accepted "
+                f"({parsed.rejected_rows} rejected) — report row-contract mismatch."
+            )
+            with session_scope() as session:
+                AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, failure_class="report_row_contract_mismatch", failure_detail=detail
+                )
+                AmazonAdsSyncErrorRepository(session).record(
+                    organization_id, ads_profile_id, error_code="report_row_contract_mismatch",
+                    error_message=detail, report_run_id=run_id,
+                )
+            logger.warning(
+                "ads report rejected in full run_id=%s total_rows=%s rejected_rows=%s",
+                run_id, parsed.total_rows, parsed.rejected_rows,
+            )
+            return ReportJobOutcome(report_run_id=run_id, outcome="failed")
+
         with session_scope() as session:
             fact_repo = AmazonAdsDailyPerformanceFactRepository(session)
             ingested = 0
-            for row in rows:
+            for row in parsed.rows:
                 if row.campaign_id is None or row.report_date is None:
                     continue
                 fact_repo.upsert(
@@ -363,12 +390,23 @@ class AmazonAdsReportService:
         return ReportJobOutcome(report_run_id=run_id, outcome=outcome)
 
 
-def _parse_report_body(body: bytes, *, max_bytes: int) -> list[AdsReportRow]:
+@dataclass(frozen=True)
+class ParsedReportBody:
+    rows: list[AdsReportRow]
+    total_rows: int
+    rejected_rows: int
+
+
+def _parse_report_body(body: bytes, *, max_bytes: int) -> ParsedReportBody:
     """Validate content before trusting it as report data: bounded size
     (already enforced by the client's own download path — re-checked
     here defensively), valid JSON, and a JSON array — never a bare
     object or scalar. Rows that fail schema validation are skipped and
-    counted, never silently coerced."""
+    counted, never silently coerced. Returns total/rejected counts
+    alongside the accepted rows so the caller can tell "a few rows had
+    unrelated issues" apart from "every row failed" (see
+    `_download_and_ingest`'s explicit all-rejected check — a genuinely
+    different outcome, not just a smaller version of the same thing)."""
     if len(body) > max_bytes:
         raise AdsReportFailedError("Amazon Ads report exceeded the allowed size.")
     try:
@@ -378,15 +416,15 @@ def _parse_report_body(body: bytes, *, max_bytes: int) -> list[AdsReportRow]:
     if not isinstance(payload, list):
         raise AdsReportFailedError("Amazon Ads report body was not a JSON array of rows.")
     rows: list[AdsReportRow] = []
-    skipped = 0
+    rejected = 0
     for raw_row in payload:
         if not isinstance(raw_row, dict):
-            skipped += 1
+            rejected += 1
             continue
         try:
             rows.append(AdsReportRow.model_validate(raw_row))
         except (ValidationError, InvalidOperation):
-            skipped += 1
-    if skipped:
-        logger.warning("ads report parse skipped malformed rows count=%s", skipped)
-    return rows
+            rejected += 1
+    if rejected:
+        logger.warning("ads report parse skipped malformed rows count=%s total=%s", rejected, len(payload))
+    return ParsedReportBody(rows=rows, total_rows=len(payload), rejected_rows=rejected)

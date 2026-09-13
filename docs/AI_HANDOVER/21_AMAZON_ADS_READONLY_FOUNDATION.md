@@ -316,6 +316,39 @@ an unconfirmed assumption:
 - `list_ad_groups`/`list_product_ads`/`list_keywords`/
   `list_product_targets` remain unconfirmed, unchanged by this pass.
 
+**Fifth verification pass (Reporting v3 row-contract diagnosis,
+2026-09-13):** with the fourth pass's request-structure fix deployed,
+one real report was created, completed, and downloaded end to end for
+the first time — but **all 35 returned rows failed `AdsReportRow`
+validation**, for a single, uniform reason:
+
+- Amazon's Reporting v3 API returns entity ids (`campaignId` directly
+  observed; `adGroupId`/`keywordId`/`targetId`/`adId` inferred by the
+  same id-field convention within the same API family, not yet each
+  independently confirmed) as **JSON integers**, not strings — the
+  opposite of the v3 entity-list endpoints (e.g. `/sp/campaigns/list`),
+  which return these same ids as strings (confirmed live in the third
+  pass). `AdsReportRow` now normalizes a plain `int` id to its string
+  form via a `field_validator(mode="before")`, explicitly excluding
+  `bool` (an `int` subclass in Python) and any other non-int shape
+  (e.g. a float), which still fail validation visibly rather than being
+  silently coerced.
+- A genuine second, independent finding from the same pass: the report
+  lifecycle marked this run `succeeded` with `records_ingested=0` even
+  though every one of 35 rows was rejected — a nonempty report with
+  zero accepted rows is now treated as a deterministic row-contract
+  failure (`report_row_contract_mismatch`), not a success, and not
+  retried (retrying would reprocess identical bytes to an identical
+  result). The sync checkpoint no longer advances in this case. A
+  report with only *some* rows rejected is unaffected — that remains a
+  success, ingesting the valid rows.
+- The download host was observed live for the first time during this
+  pass: `offline-report-storage-us-east-1-prod.s3.amazonaws.com`
+  (recorded here only as a hostname — never the signed path/query).
+  `download_report`'s existing HTTPS-only + no-redirect design (fourth
+  pass) was not changed; this observation is additive context, not a
+  new allowlist in shipped code.
+
 ## 10. Activation plan (do in this order; each step gates the next)
 
 1. Amazon Ads API Partner access approval completes (already submitted,
