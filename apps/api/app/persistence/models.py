@@ -2326,7 +2326,7 @@ class AmazonEncryptedSecret(Base):
 # interchangeable (see `amazon_seller_account_id` below, which is a
 # best-effort, nullable cross-reference only — never a join key any
 # query depends on for correctness). See docs/AI_HANDOVER/
-# 22_AMAZON_ADS_READONLY_FOUNDATION.md for the full design.
+# 21_AMAZON_ADS_READONLY_FOUNDATION.md for the full design.
 
 
 class AmazonAdsConnection(Base):

@@ -18,7 +18,7 @@ const TABS = [
   // advertiser profile), never the `participation` param the other tabs
   // share — an Ads profile id and an SP-API marketplace participation
   // are not interchangeable (see docs/AI_HANDOVER/
-  // 22_AMAZON_ADS_READONLY_FOUNDATION.md). The `participation` query
+  // 21_AMAZON_ADS_READONLY_FOUNDATION.md). The `participation` query
   // param is therefore deliberately NOT carried over onto this tab.
   { href: "/seller/advertising", label: "Advertising" },
 ] as const;

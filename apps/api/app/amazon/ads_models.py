@@ -6,7 +6,7 @@ Field names/shapes below are Amazon's own documented response fields,
 consulted this pass against Amazon's current Ads API guides and
 corroborating sources (the docs site is a client-rendered SPA that could
 not be fetched server-side in this environment — see
-`docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md` for exactly what
+`docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md` for exactly what
 was and was not directly confirmed). `AdsReportStatus`'s non-`PENDING`
 values are a recorded assumption pending confirmation against a real
 response once Ads API approval completes — see that doc.
