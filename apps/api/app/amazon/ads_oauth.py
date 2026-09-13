@@ -88,6 +88,39 @@ def validate_return_path(path: str | None) -> str:
     return DEFAULT_RETURN_PATH
 
 
+ALLOWED_CALLBACK_NOTICES = frozenset({"success", "denied", "error", "expired"})
+DEFAULT_CALLBACK_NOTICE = "error"
+
+
+def frontend_ads_return_url(*, origin: str, return_path: str | None, notice: str) -> str:
+    """Build the browser's final post-callback redirect. Mirrors
+    `app.amazon.oauth_callback.frontend_connection_return_url`'s exact
+    trusted-origin pattern for the existing SP-API callback: the
+    *origin* comes only from server-side configuration (the first
+    configured CORS origin — see the route, which never accepts a
+    caller-supplied host), never from any request parameter, and the
+    *path* is re-validated against the closed allowlist here
+    independently of whatever the caller already did — this function is
+    provably safe to call with an arbitrary string on either side,
+    rather than relying on every call site to have validated first.
+
+    Fixes a real production defect: `RedirectResponse` resolves a
+    relative path (e.g. `/seller/advertising`) against the *current*
+    request's own host — which for this route is `api.
+    ewiseintelligence.com`, not the frontend — so passing a bare
+    relative path straight to `RedirectResponse` silently redirected the
+    browser to a nonexistent route on the API host instead of the
+    frontend. This function always returns a full, absolute URL.
+    """
+    base = (origin or "").strip().rstrip("/")
+    if not base:
+        base = "http://localhost:3000"
+    path = validate_return_path(return_path)
+    valid_notice = notice if notice in ALLOWED_CALLBACK_NOTICES else DEFAULT_CALLBACK_NOTICE
+    query = urlencode({"ads": valid_notice})
+    return f"{base}{path}?{query}"
+
+
 def build_ads_consent_url(
     *,
     base_url: str,
