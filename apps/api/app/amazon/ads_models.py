@@ -60,6 +60,17 @@ class AdsProfileListResponse(BaseModel):
     profiles: list[AdsProfileResponse]
 
 
+class AdsCampaignBudget(BaseModel):
+    """Confirmed against a real production `POST /sp/campaigns/list`
+    response on 2026-09-13: campaign budget arrives as a nested object,
+    not the flat `dailyBudget` field this pass previously assumed."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    budget: Decimal
+    budget_type: str = Field(alias="budgetType")
+
+
 class AdsCampaignResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -67,7 +78,7 @@ class AdsCampaignResponse(BaseModel):
     name: str
     state: AdsEntityState
     targeting_type: str | None = Field(default=None, alias="targetingType")
-    daily_budget: Decimal | None = Field(default=None, alias="dailyBudget")
+    budget: AdsCampaignBudget | None = None
     start_date: date | None = Field(default=None, alias="startDate")
     end_date: date | None = Field(default=None, alias="endDate")
     portfolio_id: str | None = Field(default=None, alias="portfolioId")

@@ -252,6 +252,38 @@ without changing any of the above:
   approval completes** (see the activation plan's step 7 below) before
   any of this is trusted for a live account.
 
+**Third verification pass (controlled production read-validation task,
+2026-09-13): `list_campaigns` verified against a real production
+response for the selected Nonin Medical profile — two of the two
+remaining unknowns turned out wrong:**
+
+- `Content-Type`/`Accept: application/vnd.spcampaign.v3+json` is
+  **required**, confirmed by a live 415 rejection when sent as generic
+  `application/json` (Amazon's own error body named the required value
+  explicitly). The second-pass corroboration above had the *path* and
+  *media-type name* right, but the code was never actually sending it —
+  `_request_json` had no way to override the hardcoded generic
+  `application/json` header before this pass's fix.
+- The response envelope key is **`"campaigns"`**, not the previously
+  assumed `"items"`. This was a genuine implementation bug, not just an
+  unconfirmed guess — a real response would have silently parsed to zero
+  campaigns forever.
+- Campaign budget arrives as a **nested `budget: {budget, budgetType}`
+  object**, not a flat `dailyBudget` field. `AdsCampaignResponse` and
+  `ads_client.py` were corrected accordingly (see the corrective PR
+  referenced in the changelog below); `AdsCampaignBudget` is the new
+  nested model.
+- `list_ad_groups`/`list_product_ads`/`list_keywords`/
+  `list_product_targets` remain **exactly as unconfirmed as before** —
+  the campaigns fix does not generalize to them; each still sends the
+  old generic `application/json` and will very likely also 415 in
+  production. Do not wire any of them to a live path until each is
+  independently verified the same way.
+- Reporting v3 report **creation** was not exercised this pass (the
+  controlled read-validation task stopped before Phase 4 once this
+  contract mismatch was found) — its request/response shape remains
+  exactly as unconfirmed as the second pass left it.
+
 ## 10. Activation plan (do in this order; each step gates the next)
 
 1. Amazon Ads API Partner access approval completes (already submitted,
