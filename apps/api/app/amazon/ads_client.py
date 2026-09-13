@@ -11,7 +11,7 @@ documented, reviewed target for the implementation pass that follows
 Ads API approval — it is never constructed by any wired code path yet.
 
 Protocol details consulted from Amazon's current Ads API documentation
-this pass (see `docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md`
+this pass (see `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`
 for exact sources and which specifics are corroborated-but-unconfirmed
 because the docs site did not render for this environment's fetch tool):
 - Headers: `Amazon-Advertising-API-ClientId`, `Authorization: Bearer
@@ -61,6 +61,7 @@ from app.core.exceptions import (
     AdsApiParseFailedError,
     AdsApiRateLimitedError,
     AdsApiRequestFailedError,
+    AdsConfigurationError,
     AdsReportOversizedError,
 )
 
@@ -418,3 +419,109 @@ class HttpAmazonAdsApiClient:
         except httpx.HTTPError:
             raise AdsApiRequestFailedError("Could not download the Amazon Ads report.") from None
         return decompress_gzip_json(raw, max_bytes=max_bytes)
+
+
+# --------------------------------------------------------------------
+# Backend selection — `Settings.ads_api_backend`. This is the single
+# choke point every caller (the OAuth connection service, the report
+# service, the inert worker) goes through to obtain an
+# `AmazonAdsApiClient`; none of them ever construct
+# `MockAmazonAdsApiClient`/`HttpAmazonAdsApiClient` directly against a
+# default. Three values, no silent fallback between them:
+#
+# - "disabled" (the default — matches every other Amazon credential
+#   family in this codebase, e.g. `AMAZON_SECRET_BACKEND`'s own
+#   "development" default and fail-closed "production" selection):
+#   `DisabledAmazonAdsApiClient` — every method raises
+#   `AdsConfigurationError` synchronously, before any network I/O could
+#   even be attempted. Authorization/profile-discovery/report-sync all
+#   refuse clearly and identically to "Amazon Ads is not configured."
+# - "mock": `MockAmazonAdsApiClient` — tests and local development only.
+#   Never selected by default; an operator must explicitly set
+#   `ADS_API_BACKEND=mock`.
+# - "http": `HttpAmazonAdsApiClient` — the real, live client. Only
+#   meaningful once Amazon has approved the Partner application and
+#   `ADS_LWA_CLIENT_ID`/`ADS_LWA_CLIENT_SECRET`/`ADS_OAUTH_REDIRECT_URI`
+#   are configured (checked separately by
+#   `AmazonAdsConnectionService.is_configured`/`_require_configured` —
+#   the client backend and the OAuth-credential check are independent
+#   gates, both must pass before a live call can ever happen).
+#
+# An unrecognized value is a configuration error (raised), never
+# treated as any of the three above — this is what makes "never falls
+# back to mock" true even under a typo'd environment variable.
+ADS_API_BACKEND_DISABLED = "disabled"
+ADS_API_BACKEND_MOCK = "mock"
+ADS_API_BACKEND_HTTP = "http"
+_ADS_API_BACKENDS = frozenset({ADS_API_BACKEND_DISABLED, ADS_API_BACKEND_MOCK, ADS_API_BACKEND_HTTP})
+
+_DISABLED_MESSAGE = (
+    "Amazon Ads is not configured (ADS_API_BACKEND=disabled). "
+    "Authorization, profile discovery, and report synchronization are unavailable."
+)
+
+
+class DisabledAmazonAdsApiClient:
+    """The fail-closed default. Every method raises `AdsConfigurationError`
+    immediately — no `httpx` client is ever constructed, no host is ever
+    resolved, no socket is ever opened. This is what makes "disabled"
+    structurally incapable of a live call, rather than merely
+    unconfigured-and-hoping nothing calls it."""
+
+    def __repr__(self) -> str:
+        return "DisabledAmazonAdsApiClient()"
+
+    async def list_profiles(self, ctx: AdsRequestContext) -> list:
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def list_campaigns(self, ctx, *, next_token=None, page_size=50):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def list_ad_groups(self, ctx, *, next_token=None, page_size=50):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def list_product_ads(self, ctx, *, next_token=None, page_size=50):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def list_keywords(self, ctx, *, next_token=None, page_size=50):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def list_product_targets(self, ctx, *, next_token=None, page_size=50):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def create_report(self, ctx, configuration):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def get_report_status(self, ctx, report_id):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+    async def download_report(self, ctx, url, *, max_bytes):
+        raise AdsConfigurationError(_DISABLED_MESSAGE)
+
+
+def resolve_ads_api_backend(settings) -> str:  # noqa: ANN001 - app.core.config.Settings, avoiding an import cycle in the type position
+    """Normalize `Settings.ads_api_backend`. Default is "disabled" —
+    mirrors `resolve_amazon_secret_backend`'s own "safe unless
+    deliberately opted in" convention."""
+    return (getattr(settings, "ads_api_backend", "") or ADS_API_BACKEND_DISABLED).strip().lower()
+
+
+def build_amazon_ads_api_client(settings=None) -> "AmazonAdsApiClient":  # noqa: ANN001
+    """The single factory every caller uses to obtain an Ads client.
+    Raises `AdsConfigurationError` for anything other than the three
+    recognized backend values — never silently falls back to mock or to
+    disabled for an unrecognized/typo'd value."""
+    if settings is None:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+    backend = resolve_ads_api_backend(settings)
+    if backend == ADS_API_BACKEND_DISABLED:
+        return DisabledAmazonAdsApiClient()
+    if backend == ADS_API_BACKEND_MOCK:
+        return MockAmazonAdsApiClient()
+    if backend == ADS_API_BACKEND_HTTP:
+        return HttpAmazonAdsApiClient(timeout_seconds=getattr(settings, "ads_api_timeout_seconds", 30))
+    raise AdsConfigurationError(
+        f"Unknown ADS_API_BACKEND value: {backend!r}. Must be one of {sorted(_ADS_API_BACKENDS)}."
+    )

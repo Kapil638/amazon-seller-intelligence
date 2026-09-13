@@ -674,11 +674,28 @@ class Settings(BaseSettings):
     # path exists and is tested against mocks, but is unreachable in any
     # real environment until these are deliberately configured AND the
     # matching Amazon application/Cloudflare bypass exist.
+    # Which Ads REST client implementation is actually constructed — see
+    # `app.amazon.ads_client.build_amazon_ads_api_client`'s own docstring
+    # for the full contract. "disabled" (default) makes every Ads
+    # operation fail closed with no possibility of a network call;
+    # "mock" is tests/local-dev only; "http" is the real, live client,
+    # meaningful only once Amazon has approved the Partner application.
+    # An unrecognized value raises rather than silently choosing any of
+    # the three — this is a distinct gate from the OAuth credentials
+    # below (both must be satisfied before a live call can ever happen).
+    ads_api_backend: str = Field(
+        default="disabled",
+        description=(
+            "Amazon Ads REST client backend. 'disabled' (default, fail-closed, no network "
+            "call possible), 'mock' (tests/local dev only), or 'http' (production, requires "
+            "Amazon Partner-application approval and ads_lwa_client_id/_secret configured)."
+        ),
+    )
     ads_lwa_client_id: SecretStr | None = None
     ads_lwa_client_secret: SecretStr | None = None
     # LWA's token endpoint is shared infrastructure across every Amazon
     # API family (SP-API and Ads alike) — same URL, different client
-    # credentials/scope. See docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md
+    # credentials/scope. See docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md
     # for the source consulted for every Ads-specific URL/header below.
     ads_lwa_token_url: str = "https://api.amazon.com/auth/o2/token"
     ads_oauth_redirect_uri: str = ""

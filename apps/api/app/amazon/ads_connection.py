@@ -11,7 +11,7 @@ the verified Cloudflare Access identity (`request.state.
 cloudflare_access_identity`, see `app.core.cloudflare_access`) at
 state-creation time — a string, never a foreign key to a user that does
 not exist. This is a recorded architectural gap, not an invented
-substitute: see `docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md`.
+substitute: see `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`.
 
 Connection-hijack prevention: every callback re-derives organization_id
 and connection_id from the OAuth state row itself (`AmazonAdsOAuthState`,
@@ -31,7 +31,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from app.amazon.ads_client import AdsRequestContext, AmazonAdsApiClient, MockAmazonAdsApiClient
+from app.amazon.ads_client import AdsRequestContext, AmazonAdsApiClient, build_amazon_ads_api_client
 from app.amazon.ads_lwa_token import AdsLwaTokenService
 from app.amazon.ads_models import AdsProfileResponse
 from app.amazon.ads_oauth import (
@@ -116,11 +116,17 @@ def _correlation_id() -> str:
 
 
 class AmazonAdsConnectionService:
-    """Ads OAuth start/callback + profile listing/selection. Never issues
-    a live Amazon call this iteration except through an injected
-    `AmazonAdsApiClient` (default: `MockAmazonAdsApiClient`, so this
-    service is exercised end-to-end in tests without ever touching a
-    socket) and an injectable LWA token exchanger."""
+    """Ads OAuth start/callback + profile listing/selection.
+
+    The Ads client is never hardcoded to a mock. When no `ads_client` is
+    injected (the real FastAPI dependency-injection path, see
+    `get_amazon_ads_connection_service`), it is resolved from
+    `Settings.ads_api_backend` via `build_amazon_ads_api_client` —
+    `disabled` (the default) until an operator deliberately opts into
+    `mock` (tests/local dev only) or `http` (production, after Amazon
+    approval and credential configuration). See
+    `app.amazon.ads_client`'s module docstring for the full backend
+    contract."""
 
     def __init__(
         self,
@@ -132,7 +138,7 @@ class AmazonAdsConnectionService:
     ) -> None:
         self._settings = settings
         self._secret_provider = secret_provider
-        self._ads_client = ads_client or MockAmazonAdsApiClient()
+        self._ads_client = ads_client or build_amazon_ads_api_client(self._cfg())
         self._lwa_token_service = lwa_token_service
 
     def _cfg(self) -> Settings:
@@ -262,6 +268,12 @@ class AmazonAdsConnectionService:
                 correlation_id=_correlation_id(),
             )
             profiles = await self._ads_client.list_profiles(ctx)
+        except AdsConfigurationError:
+            # Backend deliberately disabled (or misconfigured) — refuse
+            # clearly rather than silently degrading to "no profiles
+            # found," which would look like a successful-but-empty
+            # authorization instead of "this feature isn't turned on."
+            raise
         except Exception:
             logger.warning("ads profile discovery failed after successful token exchange")
             profiles = []

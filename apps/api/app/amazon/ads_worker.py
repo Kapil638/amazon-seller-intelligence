@@ -2,7 +2,7 @@
 
 **Never deployed this iteration** — no fifth Railway service exists or is
 created by this file's existence (see the governing task's explicit
-constraint and `docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md`'s
+constraint and `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`'s
 deployment-plan section for the resource/connection-budget estimate a
 future deployment pass would use).
 
@@ -12,9 +12,18 @@ any Amazon endpoint and exits with `EXIT_DISABLED` if unset — the same
 mechanism that already makes the four real workers safe to build/deploy
 without becoming active claim/poll processes. This file is never
 imported by `app.main` (the API process) and is not referenced by any
-Railway service configuration; running it manually with the flag unset
-(the only way it is ever invoked in this repository today, from tests)
-proves the disabled path and nothing else.
+Railway service configuration.
+
+A second, independent gate sits behind the first: even with
+`ASI_ADS_WORKER_ENABLED=true`, `main()` refuses to start (`EXIT_BACKEND_
+NOT_HTTP`) unless `Settings.ads_api_backend` resolves to `"http"` (see
+`app.amazon.ads_client.build_amazon_ads_api_client`). Both must be
+deliberately configured together — the enable flag alone can never
+start a worker that talks to anything but the fail-closed
+`DisabledAmazonAdsApiClient`, and the backend setting alone can never
+start an actual claim/poll loop. Running this file today (from tests;
+it is not referenced by any Railway service) with neither set proves
+only the disabled path.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import os
 
 from pydantic import ValidationError
 
-from app.amazon.ads_client import MockAmazonAdsApiClient
+from app.amazon.ads_client import ADS_API_BACKEND_HTTP, build_amazon_ads_api_client, resolve_ads_api_backend
 from app.amazon.ads_report_service import AmazonAdsReportService
 from app.amazon.secrets import get_secret_provider
 from app.core.config import get_settings
@@ -38,6 +47,7 @@ _WORKER_ENABLED_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 EXIT_OK = 0
 EXIT_CONFIGURATION_ERROR = 2
 EXIT_DISABLED = 3
+EXIT_BACKEND_NOT_HTTP = 4
 
 
 def is_worker_enabled() -> bool:
@@ -86,16 +96,28 @@ def main() -> int:
         )
         return EXIT_CONFIGURATION_ERROR
 
-    # `MockAmazonAdsApiClient` here is deliberate, not a placeholder bug:
-    # this file is never enabled in any deployed environment this
-    # iteration (see module docstring), so there is no real
-    # `HttpAmazonAdsApiClient` wiring to inject yet. The post-approval
-    # deployment pass must replace this before ever setting
-    # ASI_ADS_WORKER_ENABLED=true anywhere real.
+    # Second, independent gate: even with the enable flag set, this
+    # worker must never run against anything but the real HTTP backend —
+    # a deployed worker actually claiming/processing jobs with
+    # ADS_API_BACKEND left at its "disabled" default (or accidentally
+    # "mock") would either do nothing useful or silently write fabricated
+    # data into production tables. Both this flag and the backend must be
+    # deliberately configured together; neither alone is sufficient.
+    backend = resolve_ads_api_backend(settings)
+    if backend != ADS_API_BACKEND_HTTP:
+        logger.error(
+            "amazon ads worker is enabled but ADS_API_BACKEND=%r (must be %r to run for real) — "
+            "refusing to start (exit code %d)",
+            backend,
+            ADS_API_BACKEND_HTTP,
+            EXIT_BACKEND_NOT_HTTP,
+        )
+        return EXIT_BACKEND_NOT_HTTP
+
     service = AmazonAdsReportService(
         settings=settings,
         secret_provider=get_secret_provider(settings),
-        ads_client=MockAmazonAdsApiClient(),
+        ads_client=build_amazon_ads_api_client(settings),
         lease_owner=_default_lease_owner(),
     )
 

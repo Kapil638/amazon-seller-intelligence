@@ -88,7 +88,7 @@ def ads_oauth_login(
 ) -> RedirectResponse:
     """Amazon Ads' registered Login URI, once this application is
     registered with Amazon (not performed this iteration — see
-    docs/AI_HANDOVER/22_AMAZON_ADS_READONLY_FOUNDATION.md). Public by
+    docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md). Public by
     necessity, matching `amazon_connection.amazon_oauth_login`'s own
     reasoning exactly: an unauthenticated seller/Amazon-driven browser
     navigation must be able to reach it. This path is listed in
@@ -120,7 +120,12 @@ async def ads_oauth_callback(
     route's current (inactive) Cloudflare exposure."""
     try:
         result: AdsCallbackResult = await service.complete_authorization_callback(state=state, code=code, error=error)
-    except (PersistenceNotConfiguredError, AdsConnectionHijackError, AdsOAuthStateInvalidError) as exc:
+    except (
+        PersistenceNotConfiguredError,
+        AdsConnectionHijackError,
+        AdsOAuthStateInvalidError,
+        AdsConfigurationError,
+    ) as exc:
         raise _http_error(exc) from exc
     response = RedirectResponse(url=f"{result.return_path}?ads={result.notice}", status_code=302)
     response.headers["Referrer-Policy"] = "no-referrer"
