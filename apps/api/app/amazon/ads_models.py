@@ -134,8 +134,11 @@ class AdsProductTargetResponse(BaseModel):
     bid: Decimal | None = None
 
 
-class AdsReportRequestConfiguration(BaseModel):
-    """Request body for `POST /reporting/reports`."""
+class AdsReportConfigurationBody(BaseModel):
+    """The nested `configuration` object Amazon requires inside a
+    `POST /reporting/reports` request body — see
+    `AdsReportRequestConfiguration`'s docstring for how this was
+    confirmed."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -145,8 +148,26 @@ class AdsReportRequestConfiguration(BaseModel):
     format: Literal["GZIP_JSON"] = "GZIP_JSON"
     group_by: list[str] = Field(alias="groupBy")
     columns: list[str]
+
+
+class AdsReportRequestConfiguration(BaseModel):
+    """Request body for `POST /reporting/reports`.
+
+    CONFIRMED against a real production response on 2026-09-13: Amazon
+    requires `adProduct`/`reportTypeId`/`timeUnit`/`format`/`groupBy`/
+    `columns` nested under a top-level `configuration` object, with only
+    `name`/`startDate`/`endDate` at the top level. The previous flat
+    shape (all fields top-level, no `configuration` wrapper, no `name`)
+    was rejected outright: `{"code":"400","detail":"Required fields are
+    invalid or missing: configuration"}` — a real implementation bug, not
+    an unconfirmed assumption."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
     start_date: date = Field(alias="startDate")
     end_date: date = Field(alias="endDate")
+    configuration: AdsReportConfigurationBody
 
 
 class AdsReportStatusResponse(BaseModel):
