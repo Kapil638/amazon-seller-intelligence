@@ -2316,3 +2316,537 @@ class AmazonEncryptedSecret(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# 12C — Amazon Ads API read-only foundation. A wholly separate table
+# family from every `amazon_*` SP-API table above: no foreign key from
+# here into `amazon_connections`, `amazon_oauth_states`, or
+# `amazon_ingestion_runs`, and none from those tables into here. An Ads
+# profile id and an SP-API selling-partner id are never assumed
+# interchangeable (see `amazon_seller_account_id` below, which is a
+# best-effort, nullable cross-reference only — never a join key any
+# query depends on for correctness). See docs/AI_HANDOVER/
+# 22_AMAZON_ADS_READONLY_FOUNDATION.md for the full design.
+
+
+class AmazonAdsConnection(Base):
+    """Organization-owned Amazon Ads authorization metadata. Not seller
+    business data — mirrors `AmazonConnection`'s own contract exactly:
+    never stores refresh/access tokens; `token_reference` is an opaque
+    SecretProvider pointer. One row per organization (V1 simplification —
+    a single Ads Partner authorization may cover several advertiser
+    profiles, tracked in `AmazonAdsProfile`, not several connection rows).
+    """
+
+    __tablename__ = "amazon_ads_connections"
+    __table_args__ = (
+        UniqueConstraint("organization_id", name="uq_amazon_ads_connections_org"),
+        CheckConstraint(
+            "status IN ("
+            "'not_connected', 'pending_authorization', 'connected', 'revoked', 'error'"
+            ")",
+            name="ck_amazon_ads_connections_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    # Best-effort cross-reference to an existing SP-API seller identity,
+    # if one exists for this org at authorization time — informational
+    # only (never a join key; see module note above).
+    amazon_seller_account_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_seller_accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_connected")
+    token_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+
+
+class AmazonAdsOAuthState(Base):
+    """Temporary Ads authorization transaction. Stores a state hash only
+    — never the raw state, authorization code, or any token. Bound to
+    organization, connection, a best-effort initiating-user identity
+    (this codebase has no `users` table yet — see module docstring in
+    `app.amazon.ads_connection` — so this is the verified Cloudflare
+    Access identity email/subject captured at state-creation time, never
+    a foreign key), a best-effort seller-account reference, and a closed
+    allowlisted frontend return path (never an arbitrary caller-supplied
+    URL — see `app.amazon.ads_oauth.validate_return_path`)."""
+
+    __tablename__ = "amazon_ads_oauth_states"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_amazon_ads_oauth_states_state_hash"),
+        Index("ix_amazon_ads_oauth_states_org", "organization_id"),
+        Index("ix_amazon_ads_oauth_states_connection_id", "connection_id"),
+        Index("ix_amazon_ads_oauth_states_expires_at", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    connection_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_connections.id", ondelete="RESTRICT"), nullable=False
+    )
+    amazon_seller_account_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_seller_accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    initiating_user_identity: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    return_path: Mapped[str] = mapped_column(String(128), nullable=False)
+    state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    amazon_state: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    organization: Mapped[Organization] = relationship()
+    connection: Mapped[AmazonAdsConnection] = relationship()
+
+
+class AmazonAdsProfile(Base):
+    """One Amazon Ads advertiser profile returned by `GET /v2/profiles`
+    for this connection. A single authorization commonly returns several
+    (one per marketplace/account) — `is_selected` marks the one profile
+    an authorized user has confirmed is the correct advertiser (AJ Duran)
+    to synchronize; no synchronization may begin for an unselected
+    profile (enforced in `app.amazon.ads_connection`, not just here)."""
+
+    __tablename__ = "amazon_ads_profiles"
+    __table_args__ = (
+        UniqueConstraint("connection_id", "profile_id", name="uq_amazon_ads_profiles_connection_profile"),
+        Index("ix_amazon_ads_profiles_org", "organization_id"),
+        CheckConstraint("region IN ('NA', 'EU', 'FE')", name="ck_amazon_ads_profiles_region"),
+        CheckConstraint(
+            "sync_state IN ('not_synced', 'awaiting_first_sync', 'synced', 'delayed', 'failed')",
+            name="ck_amazon_ads_profiles_sync_state",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    connection_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_connections.id", ondelete="RESTRICT"), nullable=False
+    )
+    profile_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    account_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    marketplace_country_code: Mapped[str] = mapped_column(String(8), nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(8), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(8), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    sync_state: Mapped[str] = mapped_column(String(32), nullable=False, default="not_synced")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    connection: Mapped[AmazonAdsConnection] = relationship()
+
+
+class AmazonAdsCampaign(Base):
+    __tablename__ = "amazon_ads_campaigns"
+    __table_args__ = (
+        UniqueConstraint(
+            "ads_profile_id", "external_campaign_id", name="uq_amazon_ads_campaigns_profile_external_id"
+        ),
+        Index("ix_amazon_ads_campaigns_org", "organization_id"),
+        Index("ix_amazon_ads_campaigns_profile", "ads_profile_id"),
+        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_campaigns_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_campaign_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    targeting_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    daily_budget: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    portfolio_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsAdGroup(Base):
+    __tablename__ = "amazon_ads_ad_groups"
+    __table_args__ = (
+        UniqueConstraint(
+            "ads_profile_id", "external_ad_group_id", name="uq_amazon_ads_ad_groups_profile_external_id"
+        ),
+        Index("ix_amazon_ads_ad_groups_org", "organization_id"),
+        Index("ix_amazon_ads_ad_groups_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_ad_groups_campaign", "ads_campaign_id"),
+        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_ad_groups_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_campaign_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_campaigns.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_ad_group_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    default_bid: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+    campaign: Mapped[AmazonAdsCampaign] = relationship()
+
+
+class AmazonAdsAdvertisedProduct(Base):
+    """A Sponsored Products ad linking an ad group to a specific ASIN/SKU."""
+
+    __tablename__ = "amazon_ads_advertised_products"
+    __table_args__ = (
+        UniqueConstraint("ads_profile_id", "external_ad_id", name="uq_amazon_ads_advertised_products_profile_ad"),
+        Index("ix_amazon_ads_advertised_products_org", "organization_id"),
+        Index("ix_amazon_ads_advertised_products_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_advertised_products_ad_group", "ads_ad_group_id"),
+        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_advertised_products_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_campaign_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_campaigns.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_ad_group_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_ad_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_ad_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    asin: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    sku: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsKeyword(Base):
+    __tablename__ = "amazon_ads_keywords"
+    __table_args__ = (
+        UniqueConstraint("ads_profile_id", "external_keyword_id", name="uq_amazon_ads_keywords_profile_external_id"),
+        Index("ix_amazon_ads_keywords_org", "organization_id"),
+        Index("ix_amazon_ads_keywords_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_keywords_ad_group", "ads_ad_group_id"),
+        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_keywords_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_campaign_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_campaigns.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_ad_group_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_ad_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_keyword_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    keyword_text: Mapped[str] = mapped_column(String(512), nullable=False)
+    match_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    bid: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsProductTarget(Base):
+    """A product/category/audience target — non-keyword Sponsored Products targeting."""
+
+    __tablename__ = "amazon_ads_product_targets"
+    __table_args__ = (
+        UniqueConstraint("ads_profile_id", "external_target_id", name="uq_amazon_ads_product_targets_profile_external_id"),
+        Index("ix_amazon_ads_product_targets_org", "organization_id"),
+        Index("ix_amazon_ads_product_targets_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_product_targets_ad_group", "ads_ad_group_id"),
+        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_product_targets_state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_campaign_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_campaigns.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_ad_group_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_ad_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    expression_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    expression: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    bid: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsReportRun(Base):
+    """Ads Reporting v3 async state-machine ledger — a dedicated table,
+    never `amazon_ingestion_runs` (see module note). Lease semantics
+    mirror `AmazonIngestionRun`'s own claim/lease design exactly (`status`
+    vocabulary, `lease_owner`/`lease_expires_at`, `next_retry_at`/
+    `retry_count` for bounded backoff) so `app.persistence.repositories`'
+    claim query for this table can reuse the same proven shape
+    (`claim_next_sales_traffic_job`) rather than inventing a new one.
+
+    `amazon_report_id` is durably stored the moment Amazon's
+    `createReport` succeeds (before polling begins) so a worker
+    restarted mid-poll never re-creates a duplicate report."""
+
+    __tablename__ = "amazon_ads_report_runs"
+    __table_args__ = (
+        Index("ix_amazon_ads_report_runs_org", "organization_id"),
+        Index("ix_amazon_ads_report_runs_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_report_runs_claimable", "status", "next_retry_at"),
+        CheckConstraint(
+            "status IN ('queued', 'started', 'waiting_to_retry', 'succeeded', 'failed', 'timed_out')",
+            name="ck_amazon_ads_report_runs_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    report_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amazon_report_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    amazon_report_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    records_ingested: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsDailyPerformanceFact(Base):
+    """Decimal-safe, currency-tagged daily performance metrics for one
+    entity (campaign, ad group, keyword, product target, or advertised
+    product), one date, one attribution window. `fact_date` is
+    interpreted in the owning profile's own `timezone` (never UTC or
+    server-local — see `app.amazon.ads_ingestion`), matching Amazon's own
+    reporting convention. `attribution_window` is explicit (`'14d'` for
+    Sponsored Products' documented default) rather than assumed, so a
+    future additional window never collides silently with this one."""
+
+    __tablename__ = "amazon_ads_daily_performance_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "ads_profile_id",
+            "entity_type",
+            "entity_external_id",
+            "fact_date",
+            "attribution_window",
+            name="uq_amazon_ads_daily_performance_facts_natural_key",
+        ),
+        Index("ix_amazon_ads_daily_performance_facts_org", "organization_id"),
+        Index(
+            "ix_amazon_ads_daily_performance_facts_profile_date",
+            "ads_profile_id",
+            "fact_date",
+        ),
+        Index(
+            "ix_amazon_ads_daily_performance_facts_entity",
+            "ads_profile_id",
+            "entity_type",
+            "entity_external_id",
+        ),
+        CheckConstraint(
+            "entity_type IN ('campaign', 'ad_group', 'keyword', 'product_target', 'advertised_product')",
+            name="ck_amazon_ads_daily_performance_facts_entity_type",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_external_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    ads_campaign_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_campaigns.id", ondelete="SET NULL"), nullable=True
+    )
+    ads_ad_group_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_ad_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    fact_date: Mapped[date] = mapped_column(Date, nullable=False)
+    attribution_window: Mapped[str] = mapped_column(String(8), nullable=False, default="14d")
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    impressions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    clicks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost: Mapped[Decimal] = mapped_column(Numeric(19, 4), nullable=False, default=Decimal("0"))
+    attributed_sales: Mapped[Decimal] = mapped_column(Numeric(19, 4), nullable=False, default=Decimal("0"))
+    attributed_conversions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_report_run_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_report_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    source_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsSyncCheckpoint(Base):
+    """One row per advertiser profile, storing only a raw calendar-date
+    high-water mark — mirrors `amazon_sales_traffic_sync_checkpoints`
+    exactly. `synced_through_date` is always re-requested minus
+    `ads_sync_lookback_days` on the next incremental sync (never advanced
+    past that rolling window), so late Amazon attribution adjustments are
+    refreshed rather than permanently skipped."""
+
+    __tablename__ = "amazon_ads_sync_checkpoints"
+
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), primary_key=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(Guid(), nullable=False)
+    synced_through_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_successful_report_run_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_report_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AmazonAdsSyncError(Base):
+    """Queryable synchronization-failure history for one profile,
+    independent of `amazon_ads_report_runs`' own retention — support can
+    review "what has gone wrong for this advertiser" without joining
+    through report-run rows that may later be pruned. Never stores
+    secrets; `error_message` is operator-facing, redacted text only
+    (see `app.amazon.secrets.redact_secret_material`)."""
+
+    __tablename__ = "amazon_ads_sync_errors"
+    __table_args__ = (
+        Index("ix_amazon_ads_sync_errors_org", "organization_id"),
+        Index("ix_amazon_ads_sync_errors_profile", "ads_profile_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    report_run_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_report_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    error_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

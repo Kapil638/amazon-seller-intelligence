@@ -2348,3 +2348,144 @@ export type InventoryHealthEvidence = InventoryHealthRow & {
   thresholds: InventoryHealthThresholds;
 };
 
+// 12C — Amazon Ads read-only foundation. Mirrors apps/api/app/amazon/
+// ads_connection.py and ads_read.py's response models field-for-field.
+export type AdsConnectionStatus = "not_connected" | "pending_authorization" | "connected" | "revoked" | "error";
+
+export type AdsProfile = {
+  id: string;
+  profile_id: string;
+  account_id: string | null;
+  account_type: string | null;
+  marketplace_country_code: string;
+  currency_code: string;
+  timezone: string;
+  region: "NA" | "EU" | "FE";
+  display_name: string | null;
+  is_selected: boolean;
+  sync_state: "not_synced" | "awaiting_first_sync" | "synced" | "delayed" | "failed";
+};
+
+export type AdsConnectionOverview = {
+  status: AdsConnectionStatus;
+  persisted: boolean;
+  organization_id: string;
+  configured: boolean;
+  authorized_at: string | null;
+  profiles: AdsProfile[];
+  selected_profile_id: string | null;
+};
+
+export type AdsSyncStatus =
+  | "not_configured"
+  | "not_connected"
+  | "connected_no_profile"
+  | "awaiting_first_sync"
+  | "synced"
+  | "delayed"
+  | "failed";
+
+export type AdsSyncStatusResponse = {
+  status: AdsSyncStatus;
+  last_synced_at: string | null;
+  synced_through_date: string | null;
+  last_report_status: string | null;
+};
+
+export type AdsOverview = {
+  start_date: string;
+  end_date: string;
+  currency_code: string | null;
+  spend: string;
+  attributed_sales: string;
+  impressions: number;
+  clicks: number;
+  attributed_orders: number;
+  acos: string | null;
+  roas: string | null;
+  ctr: string | null;
+  cpc: string | null;
+};
+
+export type AdsPerformancePoint = {
+  date: string;
+  spend: string;
+  attributed_sales: string;
+  impressions: number;
+  clicks: number;
+  attributed_orders: number;
+};
+
+export type AdsPerformanceSeries = {
+  points: AdsPerformancePoint[];
+};
+
+export type AdsPageMeta = {
+  offset: number;
+  limit: number;
+  total: number;
+};
+
+export type AdsCampaign = {
+  id: string;
+  external_campaign_id: string;
+  name: string;
+  state: "ENABLED" | "PAUSED" | "ARCHIVED";
+  targeting_type: string | null;
+  daily_budget: string | null;
+  currency_code: string | null;
+  start_date: string | null;
+  end_date: string | null;
+};
+
+export type AdsCampaignPage = { items: AdsCampaign[]; page: AdsPageMeta };
+
+export type AdsAdGroup = {
+  id: string;
+  external_ad_group_id: string;
+  campaign_id: string;
+  name: string;
+  state: "ENABLED" | "PAUSED" | "ARCHIVED";
+  default_bid: string | null;
+  currency_code: string | null;
+};
+
+export type AdsAdGroupPage = { items: AdsAdGroup[]; page: AdsPageMeta };
+
+export type AdsKeyword = {
+  id: string;
+  external_keyword_id: string;
+  ad_group_id: string;
+  keyword_text: string;
+  match_type: string;
+  state: "ENABLED" | "PAUSED" | "ARCHIVED";
+  bid: string | null;
+  currency_code: string | null;
+};
+
+export type AdsKeywordPage = { items: AdsKeyword[]; page: AdsPageMeta };
+
+export type AdsProductTarget = {
+  id: string;
+  external_target_id: string;
+  ad_group_id: string;
+  expression_type: string | null;
+  expression: string | null;
+  state: "ENABLED" | "PAUSED" | "ARCHIVED";
+  bid: string | null;
+  currency_code: string | null;
+};
+
+export type AdsProductTargetPage = { items: AdsProductTarget[]; page: AdsPageMeta };
+
+export type AdsAdvertisedProduct = {
+  id: string;
+  external_ad_id: string;
+  ad_group_id: string;
+  asin: string | null;
+  sku: string | null;
+  state: "ENABLED" | "PAUSED" | "ARCHIVED";
+};
+
+export type AdsAdvertisedProductPage = { items: AdsAdvertisedProduct[]; page: AdsPageMeta };
+

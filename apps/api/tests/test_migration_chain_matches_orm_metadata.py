@@ -112,17 +112,30 @@ def test_full_migration_chain_compiles_for_postgresql_with_no_collisions() -> No
     assert "amazon_seller_inventory" in tables
     assert "amazon_seller_inventory_observations" in tables
     assert "amazon_encrypted_secrets" in tables
-    # 36 application tables (12B.4B added amazon_ingestion_run_marketplace_
-    # participations, amazon_seller_orders, amazon_seller_order_items,
-    # amazon_orders_sync_checkpoints; 12B.6A added amazon_sales_traffic_
-    # daily_facts, amazon_sales_traffic_product_facts, amazon_sales_
-    # traffic_sync_checkpoints; fix/ingestion-worker-runtime-availability
-    # added amazon_worker_heartbeats (migration 0015); 12B.6B added
-    # amazon_seller_inventory, amazon_seller_inventory_observations
-    # (renumbered to migration 0016 after that fix landed); pilot-
-    # deployment-ewise correction 1 added amazon_encrypted_secrets
-    # (migration 0018)) + alembic's own bookkeeping table.
-    assert len(tables) == 37, sorted(tables)
+    assert "amazon_ads_connections" in tables
+    assert "amazon_ads_oauth_states" in tables
+    assert "amazon_ads_profiles" in tables
+    assert "amazon_ads_campaigns" in tables
+    assert "amazon_ads_ad_groups" in tables
+    assert "amazon_ads_advertised_products" in tables
+    assert "amazon_ads_keywords" in tables
+    assert "amazon_ads_product_targets" in tables
+    assert "amazon_ads_report_runs" in tables
+    assert "amazon_ads_daily_performance_facts" in tables
+    assert "amazon_ads_sync_checkpoints" in tables
+    assert "amazon_ads_sync_errors" in tables
+    # 37 application tables through migration 0018 (12B.4B added
+    # amazon_ingestion_run_marketplace_participations, amazon_seller_orders,
+    # amazon_seller_order_items, amazon_orders_sync_checkpoints; 12B.6A
+    # added amazon_sales_traffic_daily_facts, amazon_sales_traffic_product_
+    # facts, amazon_sales_traffic_sync_checkpoints; fix/ingestion-worker-
+    # runtime-availability added amazon_worker_heartbeats (migration 0015);
+    # 12B.6B added amazon_seller_inventory, amazon_seller_inventory_
+    # observations (renumbered to migration 0016 after that fix landed);
+    # pilot-deployment-ewise correction 1 added amazon_encrypted_secrets
+    # (migration 0018)) + alembic's own bookkeeping table, plus 12 new 12C
+    # Amazon Ads foundation tables (migration 0019, this pass).
+    assert len(tables) == 49, sorted(tables)
 
 
 def test_migration_chain_table_set_matches_orm_metadata() -> None:

@@ -69,6 +69,16 @@ import type {
   SalesTrafficSummary,
   SalesTrafficSyncJobStatus,
   SalesTrafficSyncTriggerResponse,
+  AdsAdGroupPage,
+  AdsAdvertisedProductPage,
+  AdsCampaignPage,
+  AdsConnectionOverview,
+  AdsKeywordPage,
+  AdsOverview,
+  AdsPerformanceSeries,
+  AdsProductTargetPage,
+  AdsProfile,
+  AdsSyncStatusResponse,
   InventoryCollectionResponse,
   InventoryDetail,
   InventoryHealthCollectionResponse,
@@ -2059,4 +2069,141 @@ export async function previewAdvertising(
     detail || "Advertising Intelligence could not complete this request.",
     response.status === 400 || response.status === 404 ? "invalid" : "unknown",
   );
+}
+
+// 12C — Amazon Ads read-only foundation. Mirrors the Sales & Traffic
+// fetch helpers' own contract exactly: every non-transport, non-parse
+// outcome (not configured, not found, unavailable) is a normal
+// structured error a caller catches and renders — only a genuine
+// transport failure or an unparseable response is unexpected.
+export class AdsApiError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "not_found" | "unavailable" | "unknown",
+  ) {
+    super(message);
+    this.name = "AdsApiError";
+  }
+}
+
+async function adsRequest<T>(path: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon${path}`, { cache: "no-store" });
+  } catch {
+    throw new AdsApiError("Amazon Ads could not reach the server. Make sure the API is running.", "unavailable");
+  }
+  if (response.ok) {
+    return (await response.json()) as T;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new AdsApiError(detail || "This was not found.", "not_found");
+  }
+  if (response.status === 503) {
+    throw new AdsApiError(detail || "Amazon Ads is not configured right now.", "unavailable");
+  }
+  throw new AdsApiError(detail || "Amazon Ads could not complete this request.", "unknown");
+}
+
+export async function fetchAdsConnectionStatus(): Promise<AdsConnectionOverview> {
+  return adsRequest<AdsConnectionOverview>("/ads-connection/status");
+}
+
+export async function fetchAdsProfiles(): Promise<AdsProfile[]> {
+  return adsRequest<AdsProfile[]>("/ads-connection/profiles");
+}
+
+export async function selectAdsProfile(adsProfileId: string): Promise<AdsProfile> {
+  let response: Response;
+  try {
+    response = await apiFetch(`${apiBaseUrl()}/api/v1/amazon/ads-connection/profiles/select`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ads_profile_id: adsProfileId }),
+    });
+  } catch {
+    throw new AdsApiError("Amazon Ads could not reach the server. Make sure the API is running.", "unavailable");
+  }
+  if (response.ok) {
+    return (await response.json()) as AdsProfile;
+  }
+  const detail = await readError(response);
+  if (response.status === 404) {
+    throw new AdsApiError(detail || "This advertiser profile was not found.", "not_found");
+  }
+  throw new AdsApiError(detail || "Amazon Ads could not complete this request.", "unknown");
+}
+
+export async function fetchAdsSyncStatus(adsProfileId: string): Promise<AdsSyncStatusResponse> {
+  const params = new URLSearchParams({ ads_profile_id: adsProfileId });
+  return adsRequest<AdsSyncStatusResponse>(`/ads/sync-status?${params.toString()}`);
+}
+
+export async function fetchAdsOverview(adsProfileId: string, start: string, end: string): Promise<AdsOverview> {
+  const params = new URLSearchParams({ ads_profile_id: adsProfileId, start, end });
+  return adsRequest<AdsOverview>(`/ads/overview?${params.toString()}`);
+}
+
+export async function fetchAdsPerformanceSeries(
+  adsProfileId: string,
+  start: string,
+  end: string,
+): Promise<AdsPerformanceSeries> {
+  const params = new URLSearchParams({ ads_profile_id: adsProfileId, start, end });
+  return adsRequest<AdsPerformanceSeries>(`/ads/performance?${params.toString()}`);
+}
+
+export type AdsPageQuery = { offset?: number; limit?: number };
+
+export async function fetchAdsCampaigns(adsProfileId: string, query: AdsPageQuery = {}): Promise<AdsCampaignPage> {
+  const params = new URLSearchParams({
+    ads_profile_id: adsProfileId,
+    offset: String(query.offset ?? 0),
+    limit: String(query.limit ?? 25),
+  });
+  return adsRequest<AdsCampaignPage>(`/ads/campaigns?${params.toString()}`);
+}
+
+export async function fetchAdsAdGroups(adsProfileId: string, query: AdsPageQuery = {}): Promise<AdsAdGroupPage> {
+  const params = new URLSearchParams({
+    ads_profile_id: adsProfileId,
+    offset: String(query.offset ?? 0),
+    limit: String(query.limit ?? 25),
+  });
+  return adsRequest<AdsAdGroupPage>(`/ads/ad-groups?${params.toString()}`);
+}
+
+export async function fetchAdsKeywords(adsProfileId: string, query: AdsPageQuery = {}): Promise<AdsKeywordPage> {
+  const params = new URLSearchParams({
+    ads_profile_id: adsProfileId,
+    offset: String(query.offset ?? 0),
+    limit: String(query.limit ?? 25),
+  });
+  return adsRequest<AdsKeywordPage>(`/ads/keywords?${params.toString()}`);
+}
+
+export async function fetchAdsProductTargets(
+  adsProfileId: string,
+  query: AdsPageQuery = {},
+): Promise<AdsProductTargetPage> {
+  const params = new URLSearchParams({
+    ads_profile_id: adsProfileId,
+    offset: String(query.offset ?? 0),
+    limit: String(query.limit ?? 25),
+  });
+  return adsRequest<AdsProductTargetPage>(`/ads/product-targets?${params.toString()}`);
+}
+
+export async function fetchAdsAdvertisedProducts(
+  adsProfileId: string,
+  query: AdsPageQuery = {},
+): Promise<AdsAdvertisedProductPage> {
+  const params = new URLSearchParams({
+    ads_profile_id: adsProfileId,
+    offset: String(query.offset ?? 0),
+    limit: String(query.limit ?? 25),
+  });
+  return adsRequest<AdsAdvertisedProductPage>(`/ads/advertised-products?${params.toString()}`);
 }

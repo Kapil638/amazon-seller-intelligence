@@ -14,6 +14,13 @@ const TABS = [
   // has no visibility into merchant-fulfilled stock (see
   // seller-inventory-view.ts's own note).
   { href: "/seller/inventory", label: "FBA Inventory" },
+  // 12C: Advertising uses a distinct `profile` selector (an Amazon Ads
+  // advertiser profile), never the `participation` param the other tabs
+  // share — an Ads profile id and an SP-API marketplace participation
+  // are not interchangeable (see docs/AI_HANDOVER/
+  // 22_AMAZON_ADS_READONLY_FOUNDATION.md). The `participation` query
+  // param is therefore deliberately NOT carried over onto this tab.
+  { href: "/seller/advertising", label: "Advertising" },
 ] as const;
 
 /**
@@ -27,7 +34,7 @@ const TABS = [
 export function SellerLocalNav({
   active,
 }: {
-  active: "overview" | "listings" | "orders" | "sales-traffic" | "inventory";
+  active: "overview" | "listings" | "orders" | "sales-traffic" | "inventory" | "advertising";
 }) {
   const searchParams = useSearchParams();
   const participation = searchParams.get("participation");
@@ -40,8 +47,12 @@ export function SellerLocalNav({
           (active === "listings" && tab.href === "/seller/listings") ||
           (active === "orders" && tab.href === "/seller/orders") ||
           (active === "sales-traffic" && tab.href === "/seller/sales-traffic") ||
-          (active === "inventory" && tab.href === "/seller/inventory");
-        const href = participation ? `${tab.href}?participation=${encodeURIComponent(participation)}` : tab.href;
+          (active === "inventory" && tab.href === "/seller/inventory") ||
+          (active === "advertising" && tab.href === "/seller/advertising");
+        const href =
+          participation && tab.href !== "/seller/advertising"
+            ? `${tab.href}?participation=${encodeURIComponent(participation)}`
+            : tab.href;
         return (
           <Link
             key={tab.href}

@@ -25,7 +25,7 @@ afterEach(() => {
 });
 
 describe("SellerLocalNav", () => {
-  it("renders Overview, Listings, Orders, Sales & Traffic, and FBA Inventory tabs", () => {
+  it("renders Overview, Listings, Orders, Sales & Traffic, FBA Inventory, and Advertising tabs", () => {
     useSearchParamsMock.mockReturnValue(new URLSearchParams());
     render(<SellerLocalNav active="overview" />);
     expect(screen.getByRole("link", { name: "Overview" })).toBeInTheDocument();
@@ -33,6 +33,24 @@ describe("SellerLocalNav", () => {
     expect(screen.getByRole("link", { name: "Orders" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Sales & Traffic" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "FBA Inventory" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Advertising" })).toBeInTheDocument();
+  });
+
+  it("marks the Advertising tab active with aria-current", () => {
+    useSearchParamsMock.mockReturnValue(new URLSearchParams());
+    render(<SellerLocalNav active="advertising" />);
+    expect(screen.getByRole("link", { name: "Advertising" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("link", { name: "FBA Inventory" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("never carries the SP-API participation param onto the Advertising tab", () => {
+    useSearchParamsMock.mockReturnValue(new URLSearchParams("participation=abc-123"));
+    render(<SellerLocalNav active="listings" />);
+    expect(screen.getByRole("link", { name: "Advertising" })).toHaveAttribute("href", "/seller/advertising");
+    expect(screen.getByRole("link", { name: "Orders" })).toHaveAttribute(
+      "href",
+      "/seller/orders?participation=abc-123",
+    );
   });
 
   it("marks the Sales & Traffic tab active with aria-current", () => {
