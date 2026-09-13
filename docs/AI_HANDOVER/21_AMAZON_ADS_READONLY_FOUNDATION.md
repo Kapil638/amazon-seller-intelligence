@@ -284,6 +284,38 @@ remaining unknowns turned out wrong:**
   contract mismatch was found) — its request/response shape remains
   exactly as unconfirmed as the second pass left it.
 
+**Fourth verification pass (Reporting v3 diagnosis + fix, 2026-09-13):**
+`POST /reporting/reports` was exercised live twice (once via the full
+report-service orchestrator, once as an isolated diagnostic call) and
+both times Amazon rejected the previously-implemented flat request body
+outright with `{"code":"400","detail":"Required fields are invalid or
+missing: configuration"}` — a genuine, evidenced implementation bug, not
+an unconfirmed assumption:
+
+- Amazon requires `adProduct`/`reportTypeId`/`timeUnit`/`format`/
+  `groupBy`/`columns` nested under a top-level **`configuration`**
+  object, with only `name`/`startDate`/`endDate` at the top level. This
+  matches a community-documented Amazon Ads example found independently
+  before the live call, and the live error (naming the missing field
+  explicitly) made it conclusive rather than inferred.
+- `AdsReportRequestConfiguration` was restructured accordingly (new
+  `AdsReportConfigurationBody` nested model); `report_name_for_run()`
+  generates a deterministic, non-secret, non-seller-identifying report
+  name (`asi-sp-campaigns-<internal-run-id>-<start>-<end>`).
+- No override to the generic `Content-Type: application/json` was
+  needed for this endpoint — unlike campaign-list, Amazon's rejection
+  here was a schema/body-structure error (`400`), not a media-type
+  rejection (`415`).
+- While fixing this, `HttpAmazonAdsApiClient.download_report` was also
+  hardened to require HTTPS and never follow a redirect, mirroring
+  `app.amazon.reports_client`'s identical, already-reviewed "honestly
+  scoped" download-safety design for SP-API's own presigned report URLs
+  (no fixed hostname allowlist is published by Amazon for either API, so
+  scheme + no-redirect is the verifiable, conservative guarantee this
+  codebase already committed to elsewhere).
+- `list_ad_groups`/`list_product_ads`/`list_keywords`/
+  `list_product_targets` remain unconfirmed, unchanged by this pass.
+
 ## 10. Activation plan (do in this order; each step gates the next)
 
 1. Amazon Ads API Partner access approval completes (already submitted,

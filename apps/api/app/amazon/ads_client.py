@@ -439,8 +439,24 @@ class HttpAmazonAdsApiClient:
         # Amazon's pre-signed download URL carries its own auth (query
         # signature) — never attach this app's Bearer token/client id to
         # this request.
+        #
+        # Download-host validation, honestly scoped: Amazon's Reporting
+        # v3 docs do not publish a fixed allowlist of hostnames a
+        # presigned download URL may resolve to, mirroring
+        # `app.amazon.reports_client`'s identical situation for SP-API's
+        # own presigned report-document URLs (see that module's
+        # docstring). This enforces the two properties that are
+        # verifiable and safe regardless of the exact host: the URL must
+        # be `https`, and the download never follows a redirect — a
+        # narrower, more conservative guarantee than "matches an
+        # allowlisted Amazon domain," stated honestly as such rather than
+        # inventing an unverified hostname suffix.
+        if not url.lower().startswith("https://"):
+            raise AdsApiInvalidRequestError("Refusing to download an Amazon Ads report over a non-HTTPS URL.")
         try:
-            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+            async with httpx.AsyncClient(
+                timeout=self._timeout, transport=self._transport, follow_redirects=False
+            ) as client:
                 async with client.stream("GET", url) as response:
                     self._raise_for_status(response)
                     content_length = response.headers.get("Content-Length")

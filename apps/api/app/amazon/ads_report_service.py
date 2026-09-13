@@ -37,7 +37,7 @@ from pydantic import ValidationError
 
 from app.amazon.ads_client import AdsRequestContext, AmazonAdsApiClient
 from app.amazon.ads_lwa_token import refresh_ads_access_token
-from app.amazon.ads_models import AdsReportRequestConfiguration, AdsReportRow
+from app.amazon.ads_models import AdsReportConfigurationBody, AdsReportRequestConfiguration, AdsReportRow
 from app.amazon.secrets import SecretNotFoundError, SecretProvider
 from app.core.config import Settings
 from app.core.exceptions import (
@@ -67,6 +67,16 @@ class ReportJobOutcome:
     report_run_id: UUID
     outcome: str  # "succeeded" | "retrying" | "failed" | "no_job"
     records_ingested: int = 0
+
+
+def report_name_for_run(report_run_id: UUID, start_date: date, end_date: date) -> str:
+    """A deterministic, safe report name: contains only this internal
+    (non-secret, non-seller-identifying) ledger row id and the requested
+    date range — never a seller name, profile id, or account identifier.
+    Unique per run so two ledger rows can never collide on Amazon's side
+    even if they happen to cover the same date range. Well under any
+    documented Amazon report-name length limit."""
+    return f"asi-sp-campaigns-{report_run_id}-{start_date.isoformat()}-{end_date.isoformat()}"
 
 
 def next_sync_window(
@@ -193,13 +203,16 @@ class AmazonAdsReportService:
                 created = await self._client.create_report(
                     ctx,
                     AdsReportRequestConfiguration(
-                        adProduct="SPONSORED_PRODUCTS",
-                        reportTypeId="spCampaigns",
-                        timeUnit="DAILY",
-                        groupBy=["campaign"],
-                        columns=["date", "campaignId", "impressions", "clicks", "cost", "sales14d", "purchases14d"],
+                        name=report_name_for_run(run_id, start_date, end_date),
                         startDate=start_date,
                         endDate=end_date,
+                        configuration=AdsReportConfigurationBody(
+                            adProduct="SPONSORED_PRODUCTS",
+                            reportTypeId="spCampaigns",
+                            timeUnit="DAILY",
+                            groupBy=["campaign"],
+                            columns=["date", "campaignId", "impressions", "clicks", "cost", "sales14d", "purchases14d"],
+                        ),
                     ),
                 )
                 amazon_report_id = created.report_id
