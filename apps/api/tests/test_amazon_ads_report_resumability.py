@@ -692,7 +692,8 @@ async def test_poll_rate_limit_exceeding_lease_duration_releases_lease_and_retur
         raise_on={"get_report_status": AdsApiRateLimitedError("slow down", retry_after_seconds=300.0)},
     )
     service = AmazonAdsReportService(
-        settings=_settings(ads_report_lease_duration_seconds=30), secret_provider=secrets, ads_client=client, lease_owner="w1"
+        settings=_settings(ads_report_lease_duration_seconds=30, ads_api_timeout_seconds=5),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
     )
     run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
     before = datetime.now(UTC)
@@ -878,16 +879,185 @@ async def test_process_one_claimed_job_surfaces_lease_lost_end_to_end(monkeypatc
 
     outcome = await stale_service.process_one_claimed_job()
 
-    # The Amazon call itself isn't gated on ownership (fencing happens at
-    # the database write boundary, not before every external call) —
-    # what matters is that its result never got written under a lease
-    # this worker no longer held.
+    # The fenced pre-call gate (_renew_lease_or_raise) catches the lost
+    # lease before the LWA refresh even runs, so create_report is never
+    # reached at all here — this worker makes ZERO external calls once
+    # it no longer owns the lease.
     assert outcome.outcome == "lease_lost"
+    assert client.calls.count("create_report") == 0
     with session_scope() as session:
         run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
         assert run.status == "started"  # worker-a's mark_failed(report_create_invalid_request) never applied
         assert run.failure_class is None
         assert run.lease_owner == "worker-b"  # worker-b's claim intact, never overwritten
+
+
+# --------------------------------------------------------------------
+# Final correction — a stale worker must never make an external Amazon
+# call at all, not merely have its later database write rejected.
+# _renew_lease_or_raise gates every external call (LWA refresh, create,
+# poll, download) on a fenced heartbeat immediately before the call.
+# --------------------------------------------------------------------
+
+
+def _hijack_lease_on_nth_heartbeat(monkeypatch, run_id: UUID, *, n: int, new_owner: str = "worker-b") -> None:
+    """Patches AmazonAdsReportRunRepository.heartbeat so that its Nth
+    invocation for this run_id (1-indexed) first flips lease_owner to
+    new_owner in a separate, immediately-committed transaction, then
+    delegates to the real (fenced) heartbeat — deterministically
+    reproducing 'another worker reclaimed this row between this
+    worker's Nth and (N-1)th external-call pre-checks' without relying
+    on real timing. _renew_lease_or_raise calls heartbeat immediately
+    before every external call this service makes (LWA refresh, then —
+    only if amazon_report_id is not already set — create, then each
+    poll iteration, then download), so the call count picks out
+    exactly which external call the hijack lands in front of."""
+    from app.persistence.repositories import AmazonAdsReportRunRepository as RunRepo
+
+    original_heartbeat = RunRepo.heartbeat
+    counter = {"count": 0}
+
+    def _patched(self, report_run_id, *, lease_owner, lease_duration_seconds):
+        if report_run_id == run_id:
+            counter["count"] += 1
+            if counter["count"] == n:
+                with session_scope() as hijack_session:
+                    hijack_session.execute(
+                        sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run_id).values(lease_owner=new_owner)
+                    )
+        return original_heartbeat(self, report_run_id, lease_owner=lease_owner, lease_duration_seconds=lease_duration_seconds)
+
+    monkeypatch.setattr(RunRepo, "heartbeat", _patched)
+
+
+@pytest.mark.asyncio
+async def test_worker_a_loses_ownership_before_create_makes_no_amazon_request(monkeypatch) -> None:
+    """1. Worker A loses ownership before create. 2. Worker A performs
+    no Amazon request at all. 3. Worker B retains the claim and is the
+    only worker allowed to subsequently record a create."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run = repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+        run_id = run.id
+
+    client = MockAmazonAdsApiClient()
+    stale_service = AmazonAdsReportService(settings=_settings(), secret_provider=secrets, ads_client=client, lease_owner="worker-a")
+    # The pre-LWA-refresh heartbeat is the first one issued — hijacking
+    # it here means the lease is already lost before ANY external call,
+    # LWA included, which only strengthens "before create" (create is
+    # strictly later in the sequence and is never reached either).
+    _hijack_lease_on_nth_heartbeat(monkeypatch, run_id, n=1)
+
+    outcome = await stale_service.process_one_claimed_job()
+
+    assert outcome.outcome == "lease_lost"
+    assert client.calls.count("create_report") == 0
+    assert client.calls.count("get_report_status") == 0
+    assert client.calls.count("download_report") == 0
+
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run_row = repo.get_owned(ORG_ID, run_id)
+        assert run_row.status == "started"
+        assert run_row.lease_owner == "worker-b"  # worker-b's claim intact
+        assert run_row.amazon_report_id is None
+
+        # Worker B retains the claim and is the only one allowed to
+        # subsequently record a create for this run.
+        assert repo.set_amazon_report(
+            run_id, lease_owner="worker-a", amazon_report_id="r-fraudulent", amazon_report_status="PENDING"
+        ) is False
+        assert repo.set_amazon_report(
+            run_id, lease_owner="worker-b", amazon_report_id="r-legitimate", amazon_report_status="PENDING"
+        ) is True
+
+
+@pytest.mark.asyncio
+async def test_worker_loses_ownership_before_poll_makes_no_poll_request(monkeypatch) -> None:
+    """Ownership is lost after create succeeded (amazon_report_id
+    already persisted) but before the first poll — the poll's own
+    fenced pre-call renewal must catch this and make zero poll/download
+    requests, never a second create either."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run = repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+        run_id = run.id
+        # Simulates a report Amazon already accepted in an earlier
+        # attempt — create is skipped structurally (amazon_report_id is
+        # already set), so the next heartbeat this service issues is
+        # the poll loop's own pre-call check, not create's.
+        session.execute(
+            sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run_id).values(
+                amazon_report_id="r-existing", amazon_report_status="PENDING"
+            )
+        )
+
+    client = MockAmazonAdsApiClient(report_status_sequence=[AdsReportStatusResponse(reportId="r-existing", status="PENDING")])
+    stale_service = AmazonAdsReportService(settings=_settings(), secret_provider=secrets, ads_client=client, lease_owner="worker-a")
+    # Heartbeat #1 = pre-LWA check (succeeds); heartbeat #2 = the poll
+    # loop's own first pre-call check (create's own check never fires —
+    # amazon_report_id is already set, so that branch is skipped
+    # entirely) — hijacking #2 lands exactly in front of the poll call.
+    _hijack_lease_on_nth_heartbeat(monkeypatch, run_id, n=2)
+
+    outcome = await stale_service.process_one_claimed_job()
+
+    assert outcome.outcome == "lease_lost"
+    assert client.calls.count("get_report_status") == 0
+    assert client.calls.count("create_report") == 0
+    assert client.calls.count("download_report") == 0
+    with session_scope() as session:
+        run_row = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run_row.lease_owner == "worker-b"
+        assert run_row.amazon_report_id == "r-existing"  # untouched
+
+
+@pytest.mark.asyncio
+async def test_worker_loses_ownership_before_download_makes_no_download_request(monkeypatch) -> None:
+    """Ownership is lost after the poll observed COMPLETED but before
+    the download — the download's own fenced pre-call renewal must
+    catch this and make zero download requests."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run = repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+        run_id = run.id
+        session.execute(
+            sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run_id).values(
+                amazon_report_id="r-existing", amazon_report_status="PENDING"
+            )
+        )
+
+    client = MockAmazonAdsApiClient(
+        report_status_sequence=[AdsReportStatusResponse(reportId="r-existing", status="COMPLETED", url="https://x/r.gz")],
+        report_bodies={"https://x/r.gz": _report_body([{"date": "2020-01-01", "campaignId": 1, "impressions": 1, "clicks": 0, "cost": 1.0, "sales14d": 0, "purchases14d": 0}])},
+    )
+    stale_service = AmazonAdsReportService(settings=_settings(), secret_provider=secrets, ads_client=client, lease_owner="worker-a")
+    # Heartbeat #1 = pre-LWA, #2 = poll's pre-call check (succeeds, the
+    # single get_report_status call returns COMPLETED immediately), #3
+    # = download's own pre-call check — hijacking #3 lands exactly in
+    # front of the download call.
+    _hijack_lease_on_nth_heartbeat(monkeypatch, run_id, n=3)
+
+    outcome = await stale_service.process_one_claimed_job()
+
+    assert outcome.outcome == "lease_lost"
+    assert client.calls.count("get_report_status") == 1  # the poll that observed COMPLETED
+    assert client.calls.count("download_report") == 0
+    assert client.calls.count("create_report") == 0
+    with session_scope() as session:
+        run_row = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run_row.lease_owner == "worker-b"
+        assert run_row.records_ingested == 0
+        assert AmazonAdsSyncCheckpointRepository(session).get(profile_id) is None
 
 
 # --------------------------------------------------------------------

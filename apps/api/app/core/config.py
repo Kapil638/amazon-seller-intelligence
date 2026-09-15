@@ -793,6 +793,27 @@ class Settings(BaseSettings):
         description="Rolling lookback window re-requested on each incremental sync so late Amazon attribution adjustments are refreshed, not just the newest day.",
     )
 
+    @model_validator(mode="after")
+    def _validate_ads_report_timeout_within_lease_duration(self) -> "Settings":
+        """A single Ads API HTTP call (LWA refresh, create/poll/download)
+        must comfortably fit inside one report-run lease window, with
+        real margin left over — not merely be numerically smaller. This
+        margin is what makes AmazonAdsReportService's fenced pre-call
+        lease renewal (`_renew_lease_or_raise`) a meaningful guarantee
+        rather than a coin flip: that renewal grants a fresh, full lease
+        duration immediately before the call, and the point is that the
+        call's own timeout can never itself outlast the lease it was
+        just granted under, even in the worst case where the call runs
+        for its full configured timeout. Required: at most half the
+        lease duration may be spent on any single call."""
+        if self.ads_api_timeout_seconds * 2 > self.ads_report_lease_duration_seconds:
+            raise ValueError(
+                "ads_api_timeout_seconds must be safely below ads_report_lease_duration_seconds "
+                f"(at most half of it): got ads_api_timeout_seconds={self.ads_api_timeout_seconds}, "
+                f"ads_report_lease_duration_seconds={self.ads_report_lease_duration_seconds}"
+            )
+        return self
+
     def consent_application_id(self) -> str:
         """Application id for website authorization. Production/Draft wins over sandbox."""
         production = self.sp_api_production_application_id.strip()

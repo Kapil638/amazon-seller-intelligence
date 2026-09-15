@@ -183,6 +183,38 @@ class AmazonAdsReportService:
             )
             return run.id
 
+    async def _renew_lease_or_raise(self, run_id: UUID) -> None:
+        """Fenced pre-call gate: called immediately before every external
+        call this service makes (LWA token refresh, create_report,
+        get_report_status, download_report). Confirms this worker still
+        owns the row's lease AND extends it by a full lease duration, so
+        the upcoming call has a safe window before natural expiry could
+        occur mid-request — `ads_api_timeout_seconds` is validated at
+        startup to be safely below `ads_report_lease_duration_seconds`
+        (see `Settings._validate_ads_report_timeout_within_lease_
+        duration`), so a single call's own timeout can never itself
+        outlast the lease this renewal just granted.
+
+        Raises `_LeaseLost` immediately — making ZERO external calls —
+        if renewal fails, i.e. this worker's lease was already lost to
+        another claim. This is what prevents the specific race a fenced
+        *post-call* write alone cannot: without this, a stale worker
+        could still issue a duplicate `create_report` against Amazon
+        even though its later database write would correctly be
+        rejected — the external side effect would already be done and
+        cannot be undone by rejecting the write. This does not close
+        every gap (ownership can still change while the network request
+        itself is in flight; that residual case is exactly what the
+        fenced *post-call* write, and PR #35's HTTP 425 duplicate-report
+        handling, exist for) — it closes the specific, avoidable one
+        where this worker enters the call already knowing it does not
+        own the lease."""
+        with session_scope() as session:
+            if not AmazonAdsReportRunRepository(session).heartbeat(
+                run_id, lease_owner=self._lease_owner, lease_duration_seconds=self._cfg.ads_report_lease_duration_seconds
+            ):
+                raise _LeaseLost()
+
     async def process_one_claimed_job(self) -> ReportJobOutcome:
         """Claim exactly one eligible job and drive it to a terminal or
         retry-scheduled state. Never claims/starts a second job for the
@@ -271,6 +303,13 @@ class AmazonAdsReportService:
                     raise _LeaseLost()
             return ReportJobOutcome(report_run_id=run_id, outcome="failed")
 
+        # Fenced renewal immediately before the LWA call — "where
+        # practical" per the pre-call-gating requirement: this is an
+        # external network call like the Ads API calls below, so it is
+        # gated the same way, even though it carries no Amazon-side
+        # side effect of its own worth preventing a duplicate of.
+        await self._renew_lease_or_raise(run_id)
+
         try:
             access_token_response = await refresh_ads_access_token(
                 client_id=self._cfg.ads_lwa_client_id,
@@ -293,6 +332,14 @@ class AmazonAdsReportService:
             correlation_id=str(run_id),
         )
 
+        if not amazon_report_id:
+            # The critical pre-call gate: create_report is the one call
+            # in this service whose external side effect (a new Amazon
+            # report) cannot be undone by rejecting this worker's later
+            # database write — see _renew_lease_or_raise's own docstring.
+            # Raises _LeaseLost (making zero calls, including this one)
+            # if this worker's lease was already lost.
+            await self._renew_lease_or_raise(run_id)
         try:
             if not amazon_report_id:
                 created = await self._client.create_report(
@@ -455,11 +502,12 @@ class AmazonAdsReportService:
         amazon_report_id: str,
     ) -> ReportJobOutcome:
         for _attempt in range(self._cfg.ads_report_poll_max_attempts):
-            with session_scope() as session:
-                if not AmazonAdsReportRunRepository(session).heartbeat(
-                    run_id, lease_owner=self._lease_owner, lease_duration_seconds=self._cfg.ads_report_lease_duration_seconds
-                ):
-                    raise _LeaseLost()
+            # Fenced pre-call gate, same as create_report/download_report
+            # — see _renew_lease_or_raise's own docstring. get_report_status
+            # has no Amazon-side side effect of its own to duplicate, but
+            # gating it the same way keeps every external call under this
+            # one consistent rule rather than special-casing polling.
+            await self._renew_lease_or_raise(run_id)
             try:
                 status_response = await self._client.get_report_status(ctx, amazon_report_id)
             except AdsApiRateLimitedError as exc:
@@ -537,6 +585,12 @@ class AmazonAdsReportService:
         with session_scope() as session:
             attempt_count = AmazonAdsReportRunRepository(session).get_owned(organization_id, run_id).attempt_count
 
+        # Fenced pre-call gate — see _renew_lease_or_raise's own
+        # docstring. download_report has no Amazon-side side effect
+        # worth preventing a duplicate of, but a stale worker still has
+        # no business spending its own time/bandwidth downloading a
+        # report it can no longer persist facts or a checkpoint for.
+        await self._renew_lease_or_raise(run_id)
         try:
             body = await self._client.download_report(ctx, url, max_bytes=self._cfg.ads_report_max_download_bytes)
         except AdsApiAuthenticationError as exc:
