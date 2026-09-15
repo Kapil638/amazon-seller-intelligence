@@ -792,6 +792,23 @@ class Settings(BaseSettings):
         default=3, ge=0, le=30,
         description="Rolling lookback window re-requested on each incremental sync so late Amazon attribution adjustments are refreshed, not just the newest day.",
     )
+    ads_entity_list_page_size: int = Field(
+        default=100, ge=1, le=1000,
+        description=(
+            "Default maxResults for a Sponsored Products v3 entity-list request (campaigns/ad "
+            "groups/product ads/keywords/product targets). SP v3's own documented list operations "
+            "do not publish an exact numeric maximum (blueprint §13.4 — 'Not documented' beyond "
+            "'max page size for given API'); bounded here to the same 1-1000 range Ads API v1's "
+            "sibling SPQueryCampaign operation documents for the same kind of call, as a "
+            "conservative, explicit limit rather than an unbounded one. Ownership: "
+            "app.amazon.ads_client.HttpAmazonAdsApiClient never reads this setting itself — "
+            "page_size is always an explicit per-call argument on list_campaigns()/list_ad_groups()/"
+            "etc., validated against the same 1-1000 range (rejected, not silently clamped, if "
+            "out of range). PR B1 introduces this setting but does not yet wire it to any caller; "
+            "PR B2's orchestration is the intended reader — it is expected to pass "
+            "settings.ads_entity_list_page_size as page_size on each list call."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_ads_report_timeout_within_lease_duration(self) -> "Settings":

@@ -143,7 +143,7 @@ def test_http_backend_never_logs_secrets(caplog: pytest.LogCaptureFixture) -> No
     redacted headers."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"items": [], "nextToken": None})
+        return httpx.Response(200, json={"campaigns": [], "nextToken": None})
 
     transport = httpx.MockTransport(handler)
     client = HttpAmazonAdsApiClient(transport=transport)

@@ -10,31 +10,50 @@ caller in this codebase (tests, and the inert `ads_worker.py`) injects
 documented, reviewed target for the implementation pass that follows
 Ads API approval — it is never constructed by any wired code path yet.
 
-Protocol details consulted from Amazon's current Ads API documentation
-this pass (see `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`
-for exact sources and which specifics are corroborated-but-unconfirmed
-because the docs site did not render for this environment's fetch tool):
+PR B1 — Sponsored Products hierarchy contracts. Every endpoint-specific
+fact below (path, media type, request/response fields) is sourced from
+`docs/AI_HANDOVER/23_AMAZON_ADS_API_OFFICIAL_RESEARCH_AND_INGESTION_BLUEPRINT.md`,
+the sole Amazon Ads contract authority — see that document's own
+confidence labels for exactly what is officially verified. This module
+never asserts a fact the blueprint does not establish; where the
+blueprint leaves something unconfirmed (see below), the code says so
+inline rather than silently generalizing from a sibling endpoint.
+
 - Headers: `Amazon-Advertising-API-ClientId`, `Authorization: Bearer
-  <token>`, `Amazon-Advertising-API-Scope: <profileId>`, `Content-Type:
-  application/json`.
+  <token>`, `Amazon-Advertising-API-Scope: <profileId>` (blueprint §6.6,
+  §10.2-10.4). The blueprint records an unresolved official conflict
+  over the ClientId header's own name (§7.1, `Amazon-Ads-ClientId` vs
+  `Amazon-Advertising-API-ClientId`) — this client sends the latter,
+  matching every SP v3/Reporting v3/Profiles sample and EWise's own
+  live-confirmed usage, and fails closed on 401 rather than guessing a
+  second header (blueprint §13.3).
 - Regional hosts: NA `https://advertising-api.amazon.com`, EU
   `https://advertising-api-eu.amazon.com`, FE
-  `https://advertising-api-fe.amazon.com`.
-- Profiles: `GET /v2/profiles` (list, unscoped by profile header).
+  `https://advertising-api-fe.amazon.com` (blueprint §3).
+- Profiles: `GET /v2/profiles` (list, unscoped by profile header;
+  blueprint §10.1).
 - Reporting v3: `POST /reporting/reports` (create), `GET
-  /reporting/reports/{reportId}` (poll) — both profile-scoped.
-- Sponsored Products v3 list endpoints (campaigns/ad groups/product
-  ads/keywords/targets) are POST-based with versioned media types.
-  `list_campaigns` was verified against a real production response on
-  2026-09-13 during the controlled read-validation task: it requires
-  `Content-Type`/`Accept: application/vnd.spcampaign.v3+json` (a generic
-  `application/json` request is rejected with 415), and the response
-  envelope key is `"campaigns"`, not the originally assumed `"items"`.
-  `list_ad_groups`/`list_product_ads`/`list_keywords`/`list_product_targets`
-  remain UNCONFIRMED — each is marked with a comment at its call site and
-  must be independently verified against a real response the same way
-  before being wired to any live path; do not assume the campaigns fix
-  generalizes to them.
+  /reporting/reports/{reportId}` (poll) — both profile-scoped (blueprint
+  §9). Untouched by PR B1.
+- Sponsored Products v3 entity-list endpoints (blueprint §10.2-10.4,
+  §11.5-11.6), all `POST`, all profile-scoped:
+
+  | Entity | Path | Media type | Envelope key |
+  |---|---|---|---|
+  | Campaign | `/sp/campaigns/list` | `application/vnd.spcampaign.v3+json` | `campaigns` — **live-confirmed** (2026-09-13) |
+  | Ad group | `/sp/adGroups/list` | `application/vnd.spAdGroup.v3+json` — **officially documented** (§10.3) | `adGroups` — **officially documented** (§10.3) |
+  | Product ad | `/sp/productAds/list` | `application/vnd.spProductAd.v3+json` — **officially documented** (§10.4) | `productAds` — **UNCONFIRMED**: §10.4 documents the response *item* schema but never states the envelope key; inferred from the operation name (`ListSponsoredProductsProductAds`) and the confirmed campaigns/ad-groups pattern, not itself extracted from an official page |
+  | Keyword | `/sp/keywords/list` | `application/vnd.spKeyword.v3+json` — **officially documented** (§11.5) | `keywords` — **UNCONFIRMED**, same inference basis; §11.5 does not document a response schema at all |
+  | Product target | `/sp/targets/list` | `application/vnd.spTargetingClause.v3+json` — **officially documented** (§11.6) | `targetingClauses` — **UNCONFIRMED**, same basis (operation name `ListSponsoredProductsTargetingClauses`); §11.6 documents no response schema either |
+
+  Only the campaign media type/envelope is live-confirmed; the other
+  four media types are now taken directly from the blueprint's own
+  extracted OpenAPI schema (a materially stronger basis than the prior
+  pass's `application/json` placeholder), but their envelope keys and
+  response item field names remain fixture-tested only — see
+  `docs/AI_HANDOVER/24_AMAZON_ADS_SPONSORED_PRODUCTS_HIERARCHY_CONTRACTS.md`
+  for the full per-endpoint evidence matrix and what still needs a
+  supervised live check before any of this is wired to a real call.
 """
 
 from __future__ import annotations
@@ -42,10 +61,10 @@ from __future__ import annotations
 import logging
 import zlib
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Generic, Protocol, TypeVar
 
 import httpx
-from pydantic import SecretStr, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from app.amazon.ads_models import (
     AdsAdGroupResponse,
@@ -56,6 +75,8 @@ from app.amazon.ads_models import (
     AdsProfileResponse,
     AdsReportRequestConfiguration,
     AdsReportStatusResponse,
+    CAMPAIGN_STATES,
+    SIBLING_ENTITY_STATES,
 )
 from app.core.exceptions import (
     AdsApiAuthenticationError,
@@ -114,6 +135,145 @@ class AdsPage:
     next_token: str | None = None
 
 
+T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class EntityParseResult(Generic[T]):
+    """Result of independently validating every item in one page of a
+    Sponsored Products v3 entity-list response — the reusable, offline
+    parsing behavior PR B1 was asked to build for PR B2's orchestration
+    to consume. Never raised for an individual bad item; see
+    `parse_entity_list_envelope`'s own docstring for the one thing that
+    *does* raise (a genuinely malformed top-level envelope)."""
+
+    items: list[T]
+    total_items: int
+    accepted_items: int
+    schema_rejected_items: int
+    unsupported_state_items: int
+    next_token: str | None
+
+    @property
+    def is_contract_mismatch(self) -> bool:
+        """True for a nonempty response where nothing was accepted — must
+        never be treated as an ordinary empty page by a caller. Mirrors
+        `ads_report_service.py`'s identical `report_row_contract_mismatch`
+        guard for Reporting v3 rows; this is the entity-list analogue."""
+        return self.total_items > 0 and self.accepted_items == 0
+
+
+def _parse_next_token(value: object, *, token_present: bool) -> str | None:
+    """Validates `payload.get("nextToken")` per `parse_entity_list_envelope`'s
+    own pagination-token contract table. `token_present` distinguishes a
+    genuinely absent key from a present key whose value happens to be
+    `None` — both currently resolve to "pagination complete", but they
+    are evaluated as two named, disclosed cases (see the docstring
+    table), not one silently-merged default."""
+    if not token_present:
+        return None
+    if value is None:
+        # Production-observed (live-confirmed POST /sp/campaigns/list
+        # terminal page), not stated by document 23's own prose — see
+        # parse_entity_list_envelope's docstring table for the full
+        # disclosure of this decision's basis.
+        return None
+    if not isinstance(value, str):
+        raise AdsApiParseFailedError("Amazon Ads API entity-list response's nextToken field had an unsupported type.")
+    if not value.strip():
+        raise AdsApiParseFailedError("Amazon Ads API entity-list response's nextToken field was blank.")
+    return value
+
+
+def parse_entity_list_envelope(
+    payload: dict,
+    *,
+    response_key: str,
+    model: type[T],
+    allowed_states: frozenset[str] | None = None,
+) -> EntityParseResult[T]:
+    """Offline, reusable parsing for one page of a Sponsored Products v3
+    entity-list response — no HTTP involved, callable directly against a
+    synthetic fixture dict (see the PR B1 contract tests) or a live
+    `httpx` response body already decoded to JSON.
+
+    Each item is validated INDEPENDENTLY: one schema-invalid or
+    unsupported-state item never discards its valid siblings, and the
+    result reports total/accepted/schema-rejected/unsupported-state
+    counts rather than an opaque yes/no. `unsupported_state_items` is
+    counted only when `allowed_states` is given and a structurally valid
+    item's `state` falls outside it — distinct from `schema_rejected_items`
+    (the item failed Pydantic validation entirely, e.g. a missing
+    required field or a non-losslessly-convertible id).
+
+    Fail-closed envelope contract (second review — a missing or null
+    entity key must NEVER be silently read as "zero entities", since the
+    envelope key itself is an unconfirmed inference for three of the
+    five endpoints; if that inference is wrong, silently returning an
+    empty page would hide the mismatch instead of surfacing it):
+
+    | `payload[response_key]` | Result |
+    |---|---|
+    | key absent | raises `AdsApiParseFailedError` |
+    | `null` | raises `AdsApiParseFailedError` |
+    | present, not a JSON array | raises `AdsApiParseFailedError` |
+    | `[]` | valid, genuinely empty page |
+
+    Every raised message is a fixed, sanitized string naming only
+    `response_key` (a constant this module already knows, never
+    attacker- or seller-controlled) — never the response body, never any
+    entity data.
+
+    Pagination-token contract (also second review):
+
+    | `payload["nextToken"]` | Result |
+    |---|---|
+    | absent | pagination complete (`next_token=None`) |
+    | non-empty string | returned exactly as received — never trimmed or transformed, since no official source states this opaque token has trim-safe whitespace |
+    | `null` | pagination complete (`next_token=None`) — **not** stated by document 23's own prose (which only ever says "follow nextToken until absent"); this is a deliberate, disclosed extension based on this codebase's own live-confirmed `POST /sp/campaigns/list` response, whose observed terminal page sends `"nextToken": null` rather than omitting the key. Labeled **Production-observed but not contract authority** per the blueprint's own §0.1 confidence tier — never asserted as something document 23 itself permits |
+    | blank/whitespace-only string | raises `AdsApiParseFailedError` — cannot function as a continuation token |
+    | any other type (number, bool, array, object) | raises `AdsApiParseFailedError` |
+    """
+    if response_key not in payload:
+        raise AdsApiParseFailedError(
+            f"Amazon Ads API entity-list response was missing the {response_key!r} field."
+        )
+    raw_items = payload[response_key]
+    if raw_items is None:
+        raise AdsApiParseFailedError(
+            f"Amazon Ads API entity-list response's {response_key!r} field was null, not an array."
+        )
+    if not isinstance(raw_items, list):
+        raise AdsApiParseFailedError(
+            f"Amazon Ads API entity-list response's {response_key!r} field was not a JSON array."
+        )
+
+    accepted: list[T] = []
+    schema_rejected = 0
+    unsupported_state = 0
+    for raw_item in raw_items:
+        try:
+            parsed = model.model_validate(raw_item)
+        except ValidationError:
+            schema_rejected += 1
+            continue
+        if allowed_states is not None and getattr(parsed, "state", None) not in allowed_states:
+            unsupported_state += 1
+            continue
+        accepted.append(parsed)
+
+    next_token = _parse_next_token(payload.get("nextToken", None), token_present="nextToken" in payload)
+
+    return EntityParseResult(
+        items=accepted,
+        total_items=len(raw_items),
+        accepted_items=len(accepted),
+        schema_rejected_items=schema_rejected,
+        unsupported_state_items=unsupported_state,
+        next_token=next_token,
+    )
+
+
 class AmazonAdsApiClient(Protocol):
     """Injectable Ads REST boundary. Every method is profile-scoped except
     `list_profiles` (profiles are discovered before any profile is
@@ -123,23 +283,23 @@ class AmazonAdsApiClient(Protocol):
 
     async def list_campaigns(
         self, ctx: AdsRequestContext, *, next_token: str | None, page_size: int
-    ) -> tuple[list[AdsCampaignResponse], str | None]: ...
+    ) -> EntityParseResult[AdsCampaignResponse]: ...
 
     async def list_ad_groups(
         self, ctx: AdsRequestContext, *, next_token: str | None, page_size: int
-    ) -> tuple[list[AdsAdGroupResponse], str | None]: ...
+    ) -> EntityParseResult[AdsAdGroupResponse]: ...
 
     async def list_product_ads(
         self, ctx: AdsRequestContext, *, next_token: str | None, page_size: int
-    ) -> tuple[list[AdsProductAdResponse], str | None]: ...
+    ) -> EntityParseResult[AdsProductAdResponse]: ...
 
     async def list_keywords(
         self, ctx: AdsRequestContext, *, next_token: str | None, page_size: int
-    ) -> tuple[list[AdsKeywordResponse], str | None]: ...
+    ) -> EntityParseResult[AdsKeywordResponse]: ...
 
     async def list_product_targets(
         self, ctx: AdsRequestContext, *, next_token: str | None, page_size: int
-    ) -> tuple[list[AdsProductTargetResponse], str | None]: ...
+    ) -> EntityParseResult[AdsProductTargetResponse]: ...
 
     async def create_report(
         self, ctx: AdsRequestContext, configuration: AdsReportRequestConfiguration
@@ -207,35 +367,50 @@ class MockAmazonAdsApiClient:
 
     async def _paged(
         self, name: str, pages: list[tuple[list, str | None]], *, next_token: str | None
-    ) -> tuple[list, str | None]:
+    ) -> EntityParseResult:
         self.calls.append(name)
         self._maybe_raise(name)
         if not pages:
-            return [], None
-        if next_token is None:
-            return pages[0]
-        # `next_token` is the token the PREVIOUS page handed back — find
-        # that page and return the one immediately after it, not the page
-        # whose own token happens to equal it (that would return the same
-        # page again instead of advancing).
-        previous_index = next((i for i, (_, t) in enumerate(pages) if t == next_token), None)
-        if previous_index is None or previous_index + 1 >= len(pages):
-            return [], None
-        return pages[previous_index + 1]
+            items, page_next_token = [], None
+        elif next_token is None:
+            items, page_next_token = pages[0]
+        else:
+            # `next_token` is the token the PREVIOUS page handed back —
+            # find that page and return the one immediately after it,
+            # not the page whose own token happens to equal it (that
+            # would return the same page again instead of advancing).
+            previous_index = next((i for i, (_, t) in enumerate(pages) if t == next_token), None)
+            if previous_index is None or previous_index + 1 >= len(pages):
+                items, page_next_token = [], None
+            else:
+                items, page_next_token = pages[previous_index + 1]
+        # The mock hands back already-accepted items — a test that wants
+        # to exercise rejection/contract-mismatch accounting constructs
+        # an EntityParseResult directly and feeds it through
+        # parse_entity_list_envelope's own tests instead (that function
+        # needs no client at all).
+        return EntityParseResult(
+            items=list(items),
+            total_items=len(items),
+            accepted_items=len(items),
+            schema_rejected_items=0,
+            unsupported_state_items=0,
+            next_token=page_next_token,
+        )
 
-    async def list_campaigns(self, ctx, *, next_token=None, page_size=50):
+    async def list_campaigns(self, ctx, *, next_token=None, page_size=100):
         return await self._paged("list_campaigns", self.campaigns_pages, next_token=next_token)
 
-    async def list_ad_groups(self, ctx, *, next_token=None, page_size=50):
+    async def list_ad_groups(self, ctx, *, next_token=None, page_size=100):
         return await self._paged("list_ad_groups", self.ad_groups_pages, next_token=next_token)
 
-    async def list_product_ads(self, ctx, *, next_token=None, page_size=50):
+    async def list_product_ads(self, ctx, *, next_token=None, page_size=100):
         return await self._paged("list_product_ads", self.product_ads_pages, next_token=next_token)
 
-    async def list_keywords(self, ctx, *, next_token=None, page_size=50):
+    async def list_keywords(self, ctx, *, next_token=None, page_size=100):
         return await self._paged("list_keywords", self.keywords_pages, next_token=next_token)
 
-    async def list_product_targets(self, ctx, *, next_token=None, page_size=50):
+    async def list_product_targets(self, ctx, *, next_token=None, page_size=100):
         return await self._paged("list_product_targets", self.product_targets_pages, next_token=next_token)
 
     async def create_report(self, ctx, configuration):
@@ -396,7 +571,25 @@ class HttpAmazonAdsApiClient:
         except ValidationError:
             raise AdsApiParseFailedError("Amazon Ads API profiles response was malformed.") from None
 
-    async def _list_entities(self, ctx, path, model, *, media_type, response_key, next_token, page_size):
+    async def _list_entities(
+        self, ctx, path, model, *, media_type, response_key, next_token, page_size, allowed_states
+    ) -> EntityParseResult:
+        # Rejects an out-of-range page_size rather than silently
+        # clamping it (second review): silent clamping could paper over
+        # a caller-side configuration error (e.g. Settings.
+        # ads_entity_list_page_size misconfigured, or an integer
+        # overflow/typo upstream) instead of surfacing it. The bound
+        # itself (1-1000) mirrors ads_entity_list_page_size's own Field
+        # constraint — see that setting's docstring for why 1000: SP v3's
+        # own exact maxResults ceiling is "Not documented" (blueprint
+        # §13.4), so this is a conservative number borrowed from Ads API
+        # v1's sibling SPQueryCampaign operation, not an SP v3 fact. This
+        # client never reads Settings itself — page_size is always an
+        # explicit argument from the caller (PR B2's orchestration is
+        # expected to read ads_entity_list_page_size and pass it
+        # through).
+        if not isinstance(page_size, int) or isinstance(page_size, bool) or not (1 <= page_size <= 1000):
+            raise ValueError(f"page_size must be an integer between 1 and 1000, got {page_size!r}.")
         payload = await self._request_json(
             ctx,
             "POST",
@@ -405,19 +598,17 @@ class HttpAmazonAdsApiClient:
             media_type=media_type,
             json_body={"maxResults": page_size, **({"nextToken": next_token} if next_token else {})},
         )
-        raw_items = payload.get(response_key) or []
-        try:
-            items = [model.model_validate(item) for item in raw_items]
-        except ValidationError:
-            raise AdsApiParseFailedError("Amazon Ads API list response was malformed.") from None
-        return items, payload.get("nextToken")
+        return parse_entity_list_envelope(
+            payload, response_key=response_key, model=model, allowed_states=allowed_states
+        )
 
-    async def list_campaigns(self, ctx, *, next_token=None, page_size=50):
+    async def list_campaigns(self, ctx, *, next_token=None, page_size=100) -> EntityParseResult[AdsCampaignResponse]:
         # CONFIRMED against a real production POST /sp/campaigns/list
         # response on 2026-09-13: requires this exact versioned
         # Content-Type/Accept media type (a generic application/json
         # request is rejected with 415), and the response envelope key
-        # is "campaigns", not the previously-assumed "items".
+        # is "campaigns", not the previously-assumed "items". See
+        # docs/AI_HANDOVER/23_..._BLUEPRINT.md §10.2.
         return await self._list_entities(
             ctx,
             "/sp/campaigns/list",
@@ -426,38 +617,56 @@ class HttpAmazonAdsApiClient:
             response_key="campaigns",
             next_token=next_token,
             page_size=page_size,
+            allowed_states=CAMPAIGN_STATES,
         )
 
-    async def list_ad_groups(self, ctx, *, next_token=None, page_size=50):
-        # UNCONFIRMED — not yet tested against a real response. Known to
-        # be wrong in the same way list_campaigns was before its 2026-09-13
-        # fix (a generic application/json request will very likely be
-        # rejected with 415); do not wire this to a live path until it is
-        # independently verified the same way list_campaigns was.
+    async def list_ad_groups(self, ctx, *, next_token=None, page_size=100) -> EntityParseResult[AdsAdGroupResponse]:
+        # Media type and envelope key ("adGroups") now taken directly
+        # from the blueprint's officially documented SP v3 OpenAPI
+        # schema (§10.3) — a materially stronger basis than the prior
+        # generic application/json placeholder, but NOT yet independently
+        # live-verified the way list_campaigns was on 2026-09-13. Do not
+        # wire this to a live path until it is.
         return await self._list_entities(
-            ctx, "/sp/adGroups/list", AdsAdGroupResponse, media_type="application/json", response_key="items",
-            next_token=next_token, page_size=page_size,
+            ctx, "/sp/adGroups/list", AdsAdGroupResponse,
+            media_type="application/vnd.spAdGroup.v3+json", response_key="adGroups",
+            next_token=next_token, page_size=page_size, allowed_states=SIBLING_ENTITY_STATES,
         )
 
-    async def list_product_ads(self, ctx, *, next_token=None, page_size=50):
-        # UNCONFIRMED — see list_ad_groups.
+    async def list_product_ads(self, ctx, *, next_token=None, page_size=100) -> EntityParseResult[AdsProductAdResponse]:
+        # Media type is officially documented (blueprint §10.4). The
+        # envelope key ("productAds") is UNCONFIRMED — §10.4 documents
+        # the response item schema but never states the envelope key;
+        # inferred from the confirmed campaigns/adGroups pattern and the
+        # operation name (ListSponsoredProductsProductAds). See the
+        # module docstring's evidence table.
         return await self._list_entities(
-            ctx, "/sp/productAds/list", AdsProductAdResponse, media_type="application/json", response_key="items",
-            next_token=next_token, page_size=page_size,
+            ctx, "/sp/productAds/list", AdsProductAdResponse,
+            media_type="application/vnd.spProductAd.v3+json", response_key="productAds",
+            next_token=next_token, page_size=page_size, allowed_states=SIBLING_ENTITY_STATES,
         )
 
-    async def list_keywords(self, ctx, *, next_token=None, page_size=50):
-        # UNCONFIRMED — see list_ad_groups.
+    async def list_keywords(self, ctx, *, next_token=None, page_size=100) -> EntityParseResult[AdsKeywordResponse]:
+        # Media type is officially documented (blueprint §11.5). §11.5
+        # documents no response schema at all — both the envelope key
+        # ("keywords") and AdsKeywordResponse's own field names are
+        # UNCONFIRMED. See the module docstring's evidence table.
         return await self._list_entities(
-            ctx, "/sp/keywords/list", AdsKeywordResponse, media_type="application/json", response_key="items",
-            next_token=next_token, page_size=page_size,
+            ctx, "/sp/keywords/list", AdsKeywordResponse,
+            media_type="application/vnd.spKeyword.v3+json", response_key="keywords",
+            next_token=next_token, page_size=page_size, allowed_states=SIBLING_ENTITY_STATES,
         )
 
-    async def list_product_targets(self, ctx, *, next_token=None, page_size=50):
-        # UNCONFIRMED — see list_ad_groups.
+    async def list_product_targets(self, ctx, *, next_token=None, page_size=100) -> EntityParseResult[AdsProductTargetResponse]:
+        # Media type is officially documented (blueprint §11.6). Same
+        # UNCONFIRMED envelope-key/response-schema caveat as list_keywords
+        # — §11.6 documents no response schema either. Envelope key
+        # inferred as "targetingClauses" from the operation name
+        # (ListSponsoredProductsTargetingClauses).
         return await self._list_entities(
-            ctx, "/sp/targets/list", AdsProductTargetResponse, media_type="application/json", response_key="items",
-            next_token=next_token, page_size=page_size,
+            ctx, "/sp/targets/list", AdsProductTargetResponse,
+            media_type="application/vnd.spTargetingClause.v3+json", response_key="targetingClauses",
+            next_token=next_token, page_size=page_size, allowed_states=SIBLING_ENTITY_STATES,
         )
 
     async def create_report(self, ctx: AdsRequestContext, configuration: AdsReportRequestConfiguration) -> AdsReportStatusResponse:
@@ -584,19 +793,19 @@ class DisabledAmazonAdsApiClient:
     async def list_profiles(self, ctx: AdsRequestContext) -> list:
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
-    async def list_campaigns(self, ctx, *, next_token=None, page_size=50):
+    async def list_campaigns(self, ctx, *, next_token=None, page_size=100):
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
-    async def list_ad_groups(self, ctx, *, next_token=None, page_size=50):
+    async def list_ad_groups(self, ctx, *, next_token=None, page_size=100):
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
-    async def list_product_ads(self, ctx, *, next_token=None, page_size=50):
+    async def list_product_ads(self, ctx, *, next_token=None, page_size=100):
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
-    async def list_keywords(self, ctx, *, next_token=None, page_size=50):
+    async def list_keywords(self, ctx, *, next_token=None, page_size=100):
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
-    async def list_product_targets(self, ctx, *, next_token=None, page_size=50):
+    async def list_product_targets(self, ctx, *, next_token=None, page_size=100):
         raise AdsConfigurationError(_DISABLED_MESSAGE)
 
     async def create_report(self, ctx, configuration):

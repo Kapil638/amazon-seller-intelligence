@@ -2468,7 +2468,15 @@ class AmazonAdsCampaign(Base):
         ),
         Index("ix_amazon_ads_campaigns_org", "organization_id"),
         Index("ix_amazon_ads_campaigns_profile", "ads_profile_id"),
-        CheckConstraint("state IN ('ENABLED', 'PAUSED', 'ARCHIVED')", name="ck_amazon_ads_campaigns_state"),
+        # Widened by migration 0020_ads_campaign_state_enum to the full
+        # officially documented SponsoredProductsCampaign.state enum —
+        # see docs/AI_HANDOVER/23_..._BLUEPRINT.md §10.2. Deliberately
+        # NOT applied to the sibling entity tables below (their own
+        # state enums remain UNCONFIRMED by that same document).
+        CheckConstraint(
+            "state IN ('ENABLED', 'PAUSED', 'ARCHIVED', 'PROPOSED', 'ENABLING', 'USER_DELETED', 'OTHER')",
+            name="ck_amazon_ads_campaigns_state",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)

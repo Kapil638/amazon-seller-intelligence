@@ -92,10 +92,10 @@ def test_alembic_has_a_single_head() -> None:
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0019_amazon_ads_foundation"
-    revision = script.get_revision("0019_amazon_ads_foundation")
+    assert heads[0] == "0020_ads_campaign_state_enum"
+    revision = script.get_revision("0020_ads_campaign_state_enum")
     assert revision is not None
-    assert revision.down_revision == "0018_amazon_encrypted_secrets"
+    assert revision.down_revision == "0019_amazon_ads_foundation"
 
 
 # Alembic's own bookkeeping table, `alembic_version`, stores the revision
