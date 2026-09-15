@@ -124,6 +124,8 @@ def test_full_migration_chain_compiles_for_postgresql_with_no_collisions() -> No
     assert "amazon_ads_daily_performance_facts" in tables
     assert "amazon_ads_sync_checkpoints" in tables
     assert "amazon_ads_sync_errors" in tables
+    assert "amazon_ads_entity_sync_runs" in tables
+    assert "amazon_ads_entity_sync_checkpoints" in tables
     # 37 application tables through migration 0018 (12B.4B added
     # amazon_ingestion_run_marketplace_participations, amazon_seller_orders,
     # amazon_seller_order_items, amazon_orders_sync_checkpoints; 12B.6A
@@ -134,8 +136,9 @@ def test_full_migration_chain_compiles_for_postgresql_with_no_collisions() -> No
     # observations (renumbered to migration 0016 after that fix landed);
     # pilot-deployment-ewise correction 1 added amazon_encrypted_secrets
     # (migration 0018)) + alembic's own bookkeeping table, plus 12 new 12C
-    # Amazon Ads foundation tables (migration 0019, this pass).
-    assert len(tables) == 49, sorted(tables)
+    # Amazon Ads foundation tables (migration 0019) + 2 new PR B2 entity
+    # sync ledger/checkpoint tables (migration 0021).
+    assert len(tables) == 51, sorted(tables)
 
 
 def test_migration_chain_table_set_matches_orm_metadata() -> None:

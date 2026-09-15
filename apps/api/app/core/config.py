@@ -809,6 +809,80 @@ class Settings(BaseSettings):
             "settings.ads_entity_list_page_size as page_size on each list call."
         ),
     )
+    # PR B2: entity-hierarchy synchronization orchestration tuning.
+    # Deliberately its own lease/retry/attempt budget, independent of
+    # ads_report_* — see AmazonAdsEntitySyncRunRepository's own docstring
+    # for why entity sync's run model (bounded-page GET snapshot) does not
+    # share Reporting v3's async create/poll/download ledger.
+    ads_entity_sync_max_pages: int = Field(
+        default=200, ge=1, le=10_000,
+        description=(
+            "Hard cap on pages followed for one entity-type sync run, regardless of how many "
+            "nextToken values Amazon returns. Exists so a cyclic or endlessly-paginating response "
+            "fails visibly (failure_class=page_limit_exceeded) rather than looping forever."
+        ),
+    )
+    ads_entity_sync_lease_duration_seconds: int = Field(
+        default=600, ge=30, le=3600,
+        description="How long a claimed entity-sync run's lease is valid before stale-lease recovery reclaims it as timed_out.",
+    )
+    ads_entity_sync_max_attempts: int = Field(
+        default=5, ge=1, le=50,
+        description="Bounded retry attempts for one entity-sync run before it terminalizes as failed rather than retrying forever.",
+    )
+    ads_entity_sync_retry_base_seconds: float = Field(
+        default=5.0, gt=0, le=600,
+        description="Base delay for bounded exponential backoff with full jitter between entity-sync retry attempts.",
+    )
+    ads_entity_sync_retry_max_seconds: float = Field(
+        default=600.0, gt=0, le=3600,
+        description="Cap on the exponential backoff delay between entity-sync retry attempts, regardless of attempt count.",
+    )
+    ads_entity_sync_max_global_concurrent_runs: int = Field(
+        default=4, ge=1, le=100,
+        description="Maximum number of entity-sync runs any future worker fleet may run simultaneously, across all organizations, profiles, and entity types.",
+    )
+    # Per-entity-type confidence/activation gates (blueprint §0.1
+    # classification). Campaigns are the only endpoint whose contract is
+    # officially documented AND production-observed (blueprint §10.2,
+    # confirmed against a real response in PR #32/#34) — every sibling
+    # endpoint's envelope key and/or field shape remains at least
+    # partially inferred (see docs/AI_HANDOVER/24_..._CONTRACTS.md §9),
+    # so each defaults disabled until independently confirmed. Checked
+    # immediately after a run is claimed, before any HTTP call is made
+    # for that entity type.
+    ads_entity_sync_campaigns_enabled: bool = Field(
+        default=True, description="Enables Sponsored Products campaign hierarchy sync. Officially documented and production-confirmed."
+    )
+    ads_entity_sync_ad_groups_enabled: bool = Field(
+        default=False, description="Enables Sponsored Products ad-group hierarchy sync. Contract officially documented but not yet production-confirmed."
+    )
+    ads_entity_sync_product_ads_enabled: bool = Field(
+        default=False, description="Enables Sponsored Products product-ad hierarchy sync. Envelope key is this codebase's own unconfirmed inference."
+    )
+    ads_entity_sync_keywords_enabled: bool = Field(
+        default=False, description="Enables Sponsored Products keyword hierarchy sync. Envelope key and field shape are this codebase's own unconfirmed inference."
+    )
+    ads_entity_sync_product_targets_enabled: bool = Field(
+        default=False, description="Enables Sponsored Products product-target hierarchy sync. Envelope key and field shape are this codebase's own unconfirmed inference."
+    )
+
+    @model_validator(mode="after")
+    def _validate_ads_entity_sync_timeout_within_lease_duration(self) -> "Settings":
+        """Mirrors _validate_ads_report_timeout_within_lease_duration's
+        margin guarantee for the entity-sync lease: a single Ads API HTTP
+        call must fit safely inside one page-fetch's fenced lease
+        renewal, with real margin left over, so the renewal immediately
+        before each page's call is a meaningful guarantee rather than a
+        coin flip. Required: at most half the lease duration may be
+        spent on any single call."""
+        if self.ads_api_timeout_seconds * 2 > self.ads_entity_sync_lease_duration_seconds:
+            raise ValueError(
+                "ads_api_timeout_seconds must be safely below ads_entity_sync_lease_duration_seconds "
+                f"(at most half of it): got ads_api_timeout_seconds={self.ads_api_timeout_seconds}, "
+                f"ads_entity_sync_lease_duration_seconds={self.ads_entity_sync_lease_duration_seconds}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_ads_report_timeout_within_lease_duration(self) -> "Settings":

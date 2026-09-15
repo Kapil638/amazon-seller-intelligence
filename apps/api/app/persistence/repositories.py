@@ -54,6 +54,8 @@ from app.persistence.models import (
     AmazonAdsCampaign,
     AmazonAdsConnection,
     AmazonAdsDailyPerformanceFact,
+    AmazonAdsEntitySyncCheckpoint,
+    AmazonAdsEntitySyncRun,
     AmazonAdsKeyword,
     AmazonAdsOAuthState,
     AmazonAdsProductTarget,
@@ -7474,6 +7476,378 @@ class AmazonAdsSyncErrorRepository:
                 .limit(limit)
             ).all()
         )
+
+
+class AmazonAdsEntitySyncRunRepository:
+    """Sponsored Products entity-hierarchy sync lease/claim ledger — PR
+    B2 (`migrations/versions/0021_ads_entity_sync_runs.py`). Lease
+    fencing mirrors `AmazonAdsReportRunRepository` exactly (see that
+    class's own comments for the CAS rationale), with one deliberate
+    simplification: stale-lease recovery here has only ONE branch, not
+    two. Reporting v3 must distinguish "Amazon already created a report"
+    (resumable) from "nothing happened yet" (terminal) because re-
+    creating a report Amazon already accepted risks a duplicate. Entity-
+    list sync has no equivalent Amazon-side side effect to protect —
+    restarting a paginated, read-only POST-based list fetch from page 1
+    is always safe and idempotent — so every stale `started` row here
+    always terminalizes to `timed_out`, never auto-resumed.
+
+    Full run scope is `(organization_id, ads_connection_id,
+    ads_profile_id, entity_type)` — `ads_connection_id` was added in
+    final review so `AmazonAdsEntitySyncCheckpointRepository.advance`'s
+    guarded finalization can verify a run's complete identity, not just
+    its profile."""
+
+    _CLAIM_ADVISORY_LOCK_KEY = 991_004_005
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def enqueue(
+        self, organization_id: UUID, ads_connection_id: UUID, ads_profile_id: UUID, *, entity_type: str
+    ) -> AmazonAdsEntitySyncRun:
+        """Idempotent: returns the existing row if one is already
+        queued/started/waiting_to_retry for this (profile, entity_type)
+        rather than creating a duplicate that could race it. Does not
+        itself verify that `ads_profile_id` belongs to `organization_id`/
+        `ads_connection_id` — that ownership check is the caller's
+        responsibility (see `AmazonAdsEntitySyncService.enqueue_sync_request`,
+        which resolves and validates the profile before calling this)."""
+        existing = self.session.scalars(
+            select(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.ads_profile_id == ads_profile_id,
+                AmazonAdsEntitySyncRun.entity_type == entity_type,
+                AmazonAdsEntitySyncRun.status.in_(("queued", "started", "waiting_to_retry")),
+            )
+            .order_by(AmazonAdsEntitySyncRun.created_at.desc())
+        ).first()
+        if existing is not None:
+            return existing
+        row = AmazonAdsEntitySyncRun(
+            organization_id=organization_id,
+            ads_connection_id=ads_connection_id,
+            ads_profile_id=ads_profile_id,
+            entity_type=entity_type,
+            status="queued",
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_owned(self, organization_id: UUID, run_id: UUID) -> AmazonAdsEntitySyncRun | None:
+        return self.session.scalars(
+            select(AmazonAdsEntitySyncRun).where(
+                AmazonAdsEntitySyncRun.organization_id == organization_id, AmazonAdsEntitySyncRun.id == run_id
+            )
+        ).first()
+
+    def claim_next_sync_run(
+        self, *, lease_owner: str, lease_duration_seconds: int, max_global_active: int
+    ) -> AmazonAdsEntitySyncRun | None:
+        if self.session.get_bind().dialect.name == "postgresql":
+            self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": self._CLAIM_ADVISORY_LOCK_KEY}
+            )
+
+        self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at.is_not(None),
+                AmazonAdsEntitySyncRun.lease_expires_at < func.now(),
+            )
+            .values(status="timed_out", completed_at=func.now(), failure_class="lease_expired", lease_owner=None)
+        )
+        self.session.flush()
+
+        _Global = aliased(AmazonAdsEntitySyncRun)
+        global_active_count = (
+            select(func.count()).select_from(_Global).where(_Global.status == "started").scalar_subquery()
+        )
+        candidate_id = (
+            select(AmazonAdsEntitySyncRun.id)
+            .where(
+                or_(
+                    AmazonAdsEntitySyncRun.status == "queued",
+                    and_(
+                        AmazonAdsEntitySyncRun.status == "waiting_to_retry",
+                        AmazonAdsEntitySyncRun.next_retry_at.is_not(None),
+                        AmazonAdsEntitySyncRun.next_retry_at <= func.now(),
+                    ),
+                ),
+                global_active_count < max_global_active,
+            )
+            .order_by(
+                func.coalesce(AmazonAdsEntitySyncRun.next_retry_at, AmazonAdsEntitySyncRun.created_at).asc(),
+                AmazonAdsEntitySyncRun.id.asc(),
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+        claimed = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(AmazonAdsEntitySyncRun.id == candidate_id)
+            .values(
+                status="started",
+                lease_owner=lease_owner,
+                lease_expires_at=self._lease_expiry(lease_duration_seconds),
+                next_retry_at=None,
+                started_at=func.coalesce(AmazonAdsEntitySyncRun.started_at, func.now()),
+                attempt_count=AmazonAdsEntitySyncRun.attempt_count + 1,
+            )
+            .returning(AmazonAdsEntitySyncRun)
+        ).scalar_one_or_none()
+        self.session.flush()
+        return claimed
+
+    def _lease_expiry(self, duration_seconds: int):
+        if self.session.get_bind().dialect.name == "postgresql":
+            return func.now() + text(f"interval '{int(duration_seconds)} seconds'")
+        return datetime.now(UTC) + timedelta(seconds=duration_seconds)
+
+    # --- Worker-mutation fencing ----------------------------------------
+    # Every method below is called only while a worker believes it still
+    # holds this run's lease. Each is a compare-and-set keyed on
+    # `(id, lease_owner, status='started', lease_expires_at > now())`,
+    # identical in shape to `AmazonAdsReportRunRepository`'s own fencing.
+    # A `False` return means this caller's lease was already reclaimed by
+    # another worker and nothing was written — the caller must treat that
+    # as `_LeaseLost` and abort the current attempt without making any
+    # further external call or persisting any further progress.
+
+    def heartbeat(self, run_id: UUID, *, lease_owner: str, lease_duration_seconds: int) -> bool:
+        result = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.lease_owner == lease_owner,
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at > func.now(),
+            )
+            .values(lease_expires_at=self._lease_expiry(lease_duration_seconds))
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def mark_succeeded(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        pages_processed: int,
+        items_observed: int,
+        items_accepted: int,
+        items_schema_rejected: int,
+        items_unsupported_state: int,
+        items_missing_parent: int,
+        items_mismatched_parent: int,
+        items_deactivated: int | None,
+        items_reactivated: int | None,
+    ) -> bool:
+        """Clean success ONLY — the caller (`AmazonAdsEntitySyncService
+        ._persist_snapshot`) must never call this when
+        `items_schema_rejected`, `items_unsupported_state`,
+        `items_missing_parent`, or `items_mismatched_parent` is nonzero;
+        see `mark_partial` for that case. This is what makes
+        `AmazonAdsEntitySyncCheckpointRepository.advance`'s guard
+        (`status == 'succeeded'`) a meaningful "every observed item was
+        accepted" guarantee rather than a label."""
+        result = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.lease_owner == lease_owner,
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="succeeded",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                pages_processed=pages_processed,
+                items_observed=items_observed,
+                items_accepted=items_accepted,
+                items_schema_rejected=items_schema_rejected,
+                items_unsupported_state=items_unsupported_state,
+                items_missing_parent=items_missing_parent,
+                items_mismatched_parent=items_mismatched_parent,
+                items_deactivated=items_deactivated,
+                items_reactivated=items_reactivated,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def mark_partial(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        pages_processed: int,
+        items_observed: int,
+        items_accepted: int,
+        items_schema_rejected: int,
+        items_unsupported_state: int,
+        items_missing_parent: int,
+        items_mismatched_parent: int,
+    ) -> bool:
+        """A terminal, but never-clean, outcome: some items were
+        accepted and persisted (if `items_accepted > 0` — a fully-
+        rejected snapshot is instead a permanent `entity_sync_contract_mismatch`
+        failure, never `'partial'`), but at least one item was schema-
+        rejected, in an unsupported state, missing a parent, or had a
+        mismatched parent. Never advances the checkpoint and never
+        triggers reconciliation — `items_deactivated`/`items_reactivated`
+        stay `NULL`, identically to `mark_failed`."""
+        result = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.lease_owner == lease_owner,
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="partial",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                pages_processed=pages_processed,
+                items_observed=items_observed,
+                items_accepted=items_accepted,
+                items_schema_rejected=items_schema_rejected,
+                items_unsupported_state=items_unsupported_state,
+                items_missing_parent=items_missing_parent,
+                items_mismatched_parent=items_mismatched_parent,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def mark_retry(
+        self, run_id: UUID, *, lease_owner: str, next_retry_at: datetime, failure_class: str, failure_detail: str
+    ) -> bool:
+        result = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.lease_owner == lease_owner,
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="waiting_to_retry",
+                lease_owner=None,
+                lease_expires_at=None,
+                next_retry_at=next_retry_at,
+                failure_class=failure_class,
+                failure_detail=failure_detail,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+    def mark_failed(self, run_id: UUID, *, lease_owner: str, failure_class: str, failure_detail: str) -> bool:
+        result = self.session.execute(
+            update(AmazonAdsEntitySyncRun)
+            .where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.lease_owner == lease_owner,
+                AmazonAdsEntitySyncRun.status == "started",
+                AmazonAdsEntitySyncRun.lease_expires_at > func.now(),
+            )
+            .values(
+                status="failed",
+                completed_at=func.now(),
+                lease_owner=None,
+                lease_expires_at=None,
+                failure_class=failure_class,
+                failure_detail=failure_detail,
+            )
+        )
+        self.session.flush()
+        return result.rowcount == 1
+
+
+class AmazonAdsEntitySyncCheckpointRepository:
+    """One row per (profile, entity_type) — the timestamp of the last
+    COMPLETE, clean-success full-snapshot sync."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, ads_profile_id: UUID, entity_type: str) -> AmazonAdsEntitySyncCheckpoint | None:
+        return self.session.scalars(
+            select(AmazonAdsEntitySyncCheckpoint).where(
+                AmazonAdsEntitySyncCheckpoint.ads_profile_id == ads_profile_id,
+                AmazonAdsEntitySyncCheckpoint.entity_type == entity_type,
+            )
+        ).first()
+
+    def advance(
+        self,
+        organization_id: UUID,
+        ads_connection_id: UUID,
+        ads_profile_id: UUID,
+        *,
+        entity_type: str,
+        synced_at: datetime,
+        run_id: UUID,
+    ) -> AmazonAdsEntitySyncCheckpoint:
+        """Guarded finalization — final review found the original
+        version trusted its caller unconditionally, so a queued,
+        started, retrying, partial, failed, timed-out, or foreign-scope
+        run could in principle advance a checkpoint if this method were
+        ever called directly with the wrong arguments. Every condition
+        is now expressed as a SQL `WHERE` clause evaluated inside the
+        SAME transaction the caller's fenced `mark_succeeded` ran in
+        (so it sees that just-written, still-uncommitted row): the run
+        must exist, and must match `run_id` AND `organization_id` AND
+        `ads_connection_id` AND `ads_profile_id` AND `entity_type`
+        exactly, AND its `status` must be `'succeeded'` (never
+        `'partial'` or anything else). Any mismatch — wrong run id,
+        wrong scope, or a status other than `'succeeded'` — raises
+        `ValueError` rather than silently no-op'ing or advancing
+        anyway, so a bug that got this far cannot masquerade as a
+        successful checkpoint advance."""
+        verified_run = self.session.scalars(
+            select(AmazonAdsEntitySyncRun).where(
+                AmazonAdsEntitySyncRun.id == run_id,
+                AmazonAdsEntitySyncRun.organization_id == organization_id,
+                AmazonAdsEntitySyncRun.ads_connection_id == ads_connection_id,
+                AmazonAdsEntitySyncRun.ads_profile_id == ads_profile_id,
+                AmazonAdsEntitySyncRun.entity_type == entity_type,
+                AmazonAdsEntitySyncRun.status == "succeeded",
+            )
+        ).first()
+        if verified_run is None:
+            raise ValueError(
+                "Refusing to advance the entity-sync checkpoint: no run matching "
+                f"run_id={run_id} in the given organization/connection/profile/entity_type "
+                "scope was found in the clean 'succeeded' state."
+            )
+
+        existing = self.get(ads_profile_id, entity_type)
+        if existing is not None:
+            existing.ads_connection_id = ads_connection_id
+            existing.last_successful_sync_at = synced_at
+            existing.last_successful_run_id = run_id
+            self.session.flush()
+            return existing
+        row = AmazonAdsEntitySyncCheckpoint(
+            organization_id=organization_id,
+            ads_connection_id=ads_connection_id,
+            ads_profile_id=ads_profile_id,
+            entity_type=entity_type,
+            last_successful_sync_at=synced_at,
+            last_successful_run_id=run_id,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
 
 
 def file_sha256(data: bytes) -> str:
