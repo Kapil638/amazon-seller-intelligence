@@ -1,4 +1,4 @@
-# Amazon Ads API Official Research and Ingestion Blueprin
+# Amazon Ads API Official Research and Ingestion Blueprint
 
 **Completeness gate:** **Research complete — ready for operator review**
 
@@ -212,11 +212,11 @@ EWise already calls `POST /sp/campaigns/list`. That is **implementation status**
 
 ---
 
-## 6. Authorization and account managemen
+## 6. Authorization and account management
 
 Compare official contracts with EWise **without changing code**.
 
-### 6.1 Login with Amazon and consen
+### 6.1 Login with Amazon and consent
 
 Official: [Authorization overview](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/overview), [Authorization grants](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/authorization-grants). Confidence: **Officially verified**.
 
@@ -309,7 +309,7 @@ v1 getting started uses **`Amazon-Ads-ClientId`** as the required client header 
 
 EWise sends `Amazon-Advertising-API-ClientId`, Bearer, `Amazon-Advertising-API-Scope`. Matches authorization overview and SP v3 OpenAPI. Does not send `Amazon-Ads-AccountId` or `Amazon-Ads-ClientId`.
 
-### 6.7 Global / multi-accoun
+### 6.7 Global / multi-account
 
 Official: tokens from any regional LWA token host are globally valid; **API data hosts are regional**. Profile IDs are not valid as Scope on the wrong regional host (4XX Unauthorized). Manager-account multi-advertiser listing is region-filtered.
 
@@ -426,7 +426,7 @@ A visible OpenAPI tag is not a contract. The following are extracted operations.
 
 Unless noted, marketplace availability is the three regional advertising-api hosts; profile marketplace must match host region ([Profiles](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/profiles)). Rate-limit guidance: HTTP 429 / ThrottlingException; Reporting FAQ plus get-started backoff. Retry: bounded exponential backoff; honor `Retry-After` if present (**Not documented** whether Reporting always sends it).
 
-### 10.1 Profiles / account contex
+### 10.1 Profiles / account context
 
 | Field | Contract |
 |---|---|
@@ -870,8 +870,8 @@ Persist only fields named on the official SP v3 list schemas (§10.2–10.4). Ad
 - `state` (`ENABLED` / `PAUSED` / `ARCHIVED` for live entities; other OpenAPI enum values stored if present)
 - `targetingType` required `AUTO` / `MANUAL`
 - `startDate` (`YYYY-MM-DD`); `endDate` when present (nullable)
-- `budget.budget`, `budget.budgetType` (`DAILY` / `OTHER`), `budget.effectiveBudget` when presen
-- `dynamicBidding.strategy` and `dynamicBidding.placementBidding[]` when presen
+- `budget.budget`, `budget.budgetType` (`DAILY` / `OTHER`), `budget.effectiveBudget` when present
+- `dynamicBidding.strategy` and `dynamicBidding.placementBidding[]` when present
 - `portfolioId` when present (opaque; no name join in Phase A)
 - `includeExtendedDataFields=true` → persist `extendedData.creationDateTime`, `extendedData.lastUpdateDateTime`, `extendedData.servingStatus`
 - Optional opaque: `globalCampaignId`, `tags`, `autoManageCampaign` — not Copilot metrics
