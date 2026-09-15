@@ -1,4 +1,4 @@
-# Amazon Ads API Official Research and Ingestion Blueprint
+# Amazon Ads API Official Research and Ingestion Blueprin
 
 **Completeness gate:** **Research complete — ready for operator review**
 
@@ -9,9 +9,8 @@ Date of official-docs review: **14 September 2026** (first pass, completion pass
 Related internal documents (implementation status only, never Amazon contract authority):
 
 - `docs/AI_HANDOVER/21_AMAZON_ADS_READONLY_FOUNDATION.md`
-- `docs/AI_HANDOVER/22_AMAZON_ADS_COVERAGE_ROADMAP.md`
 
-`22_AMAZON_ADS_COVERAGE_ROADMAP.md` was written when the official Advanced Tools Center SPA did not render to this environment's HTTP fetch tool. This blueprint supersedes that document **as Amazon contract authority**. Document 22 remains useful only as a record of EWise's then-current implementation status and third-party hypotheses.
+This blueprint is the Amazon contract authority for Ads API work.
 
 ---
 
@@ -213,11 +212,11 @@ EWise already calls `POST /sp/campaigns/list`. That is **implementation status**
 
 ---
 
-## 6. Authorization and account management
+## 6. Authorization and account managemen
 
 Compare official contracts with EWise **without changing code**.
 
-### 6.1 Login with Amazon and consent
+### 6.1 Login with Amazon and consen
 
 Official: [Authorization overview](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/overview), [Authorization grants](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/authorization-grants). Confidence: **Officially verified**.
 
@@ -310,7 +309,7 @@ v1 getting started uses **`Amazon-Ads-ClientId`** as the required client header 
 
 EWise sends `Amazon-Advertising-API-ClientId`, Bearer, `Amazon-Advertising-API-Scope`. Matches authorization overview and SP v3 OpenAPI. Does not send `Amazon-Ads-AccountId` or `Amazon-Ads-ClientId`.
 
-### 6.7 Global / multi-account
+### 6.7 Global / multi-accoun
 
 Official: tokens from any regional LWA token host are globally valid; **API data hosts are regional**. Profile IDs are not valid as Scope on the wrong regional host (4XX Unauthorized). Manager-account multi-advertiser listing is region-filtered.
 
@@ -427,7 +426,7 @@ A visible OpenAPI tag is not a contract. The following are extracted operations.
 
 Unless noted, marketplace availability is the three regional advertising-api hosts; profile marketplace must match host region ([Profiles](https://advertising.amazon.com/API/docs/en-us/guides/account-management/authorization/profiles)). Rate-limit guidance: HTTP 429 / ThrottlingException; Reporting FAQ plus get-started backoff. Retry: bounded exponential backoff; honor `Retry-After` if present (**Not documented** whether Reporting always sends it).
 
-### 10.1 Profiles / account context
+### 10.1 Profiles / account contex
 
 | Field | Contract |
 |---|---|
@@ -565,7 +564,7 @@ Shared create/status/download: §9.
 
 `adProduct`: `SPONSORED_PRODUCTS`. `reportTypeId`: `spCampaigns`. `format`: `GZIP_JSON`. Filters only when a **single** groupBy is used. `campaignStatus`: ENABLED, PAUSED, ARCHIVED. `adStatus` when grouped by adGroup. `campaignSite=AmazonBusiness` when grouped by campaignPlacement.
 
-Official SP campaign **base metrics**:  
+Official SP campaign **base metrics**:
 `impressions, addToList, qualifiedBorrows, royaltyQualifiedBorrows, clicks, cost, purchases1d, purchases7d, purchases14d, purchases30d, purchasesSameSku1d, purchasesSameSku7d, purchasesSameSku14d, purchasesSameSku30d, unitsSoldClicks1d, unitsSoldClicks7d, unitsSoldClicks14d, unitsSoldClicks30d, sales1d, sales7d, sales14d, sales30d, attributedSalesSameSku1d, attributedSalesSameSku7d, attributedSalesSameSku14d, attributedSalesSameSku30d, unitsSoldSameSku1d, unitsSoldSameSku7d, unitsSoldSameSku14d, unitsSoldSameSku30d, kindleEditionNormalizedPagesRead14d, kindleEditionNormalizedPagesRoyalties14d, date, startDate, endDate, campaignBiddingStrategy, costPerClick, clickThroughRate, spend`
 
 Request `date` iff `timeUnit=DAILY`; `startDate`/`endDate` iff `SUMMARY`.
@@ -871,8 +870,8 @@ Persist only fields named on the official SP v3 list schemas (§10.2–10.4). Ad
 - `state` (`ENABLED` / `PAUSED` / `ARCHIVED` for live entities; other OpenAPI enum values stored if present)
 - `targetingType` required `AUTO` / `MANUAL`
 - `startDate` (`YYYY-MM-DD`); `endDate` when present (nullable)
-- `budget.budget`, `budget.budgetType` (`DAILY` / `OTHER`), `budget.effectiveBudget` when present
-- `dynamicBidding.strategy` and `dynamicBidding.placementBidding[]` when present
+- `budget.budget`, `budget.budgetType` (`DAILY` / `OTHER`), `budget.effectiveBudget` when presen
+- `dynamicBidding.strategy` and `dynamicBidding.placementBidding[]` when presen
 - `portfolioId` when present (opaque; no name join in Phase A)
 - `includeExtendedDataFields=true` → persist `extendedData.creationDateTime`, `extendedData.lastUpdateDateTime`, `extendedData.servingStatus`
 - Optional opaque: `globalCampaignId`, `tags`, `autoManageCampaign` — not Copilot metrics
@@ -890,15 +889,15 @@ Three separate report-run types; never one checkpoint for all three.
 
 Common: `adProduct=SPONSORED_PRODUCTS`, `reportTypeId=spCampaigns`, `timeUnit=DAILY`, `format=GZIP_JSON`, max 31-day `startDate`/`endDate` slices, lookback capped at **95 days**.
 
-**Campaign grain** `groupBy: ["campaign"]`  
-Required columns: `date, campaignId, campaignName, campaignStatus, campaignBudgetAmount, campaignBudgetType, campaignBudgetCurrencyCode, campaignBiddingStrategy, impressions, clicks, cost, spend, costPerClick, clickThroughRate, purchases1d, purchases7d, purchases14d, purchases30d, sales1d, sales7d, sales14d, sales30d, purchasesSameSku1d, purchasesSameSku7d, purchasesSameSku14d, purchasesSameSku30d, attributedSalesSameSku1d, attributedSalesSameSku7d, attributedSalesSameSku14d, attributedSalesSameSku30d, unitsSoldClicks1d, unitsSoldClicks7d, unitsSoldClicks14d, unitsSoldClicks30d, unitsSoldSameSku1d, unitsSoldSameSku7d, unitsSoldSameSku14d, unitsSoldSameSku30d, topOfSearchImpressionShare`  
-Optional (include if still under payload/time budget): Kindle and addToList/borrow columns from the official base list.  
+**Campaign grain** `groupBy: ["campaign"]`
+Required columns: `date, campaignId, campaignName, campaignStatus, campaignBudgetAmount, campaignBudgetType, campaignBudgetCurrencyCode, campaignBiddingStrategy, impressions, clicks, cost, spend, costPerClick, clickThroughRate, purchases1d, purchases7d, purchases14d, purchases30d, sales1d, sales7d, sales14d, sales30d, purchasesSameSku1d, purchasesSameSku7d, purchasesSameSku14d, purchasesSameSku30d, attributedSalesSameSku1d, attributedSalesSameSku7d, attributedSalesSameSku14d, attributedSalesSameSku30d, unitsSoldClicks1d, unitsSoldClicks7d, unitsSoldClicks14d, unitsSoldClicks30d, unitsSoldSameSku1d, unitsSoldSameSku7d, unitsSoldSameSku14d, unitsSoldSameSku30d, topOfSearchImpressionShare`
+Optional (include if still under payload/time budget): Kindle and addToList/borrow columns from the official base list.
 Do not include SB/SD-only metrics.
 
-**Ad-group grain** `groupBy: ["adGroup"]`  
+**Ad-group grain** `groupBy: ["adGroup"]`
 Same traffic/conversion base + `adGroupName, adGroupId, adStatus`. Do not assume campaign budget columns are valid at this grain unless they appear on the official adGroup additional list (they do not).
 
-**Placement grain** `groupBy: ["campaignPlacement"]`  
+**Placement grain** `groupBy: ["campaignPlacement"]`
 Base + `placementClassification` + campaign metadata / ToS share as documented. Single groupBy if filters are used.
 
 ### 13.7 Database grains and natural keys
