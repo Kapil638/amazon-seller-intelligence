@@ -41,6 +41,7 @@ from app.amazon.ads_models import AdsReportConfigurationBody, AdsReportRequestCo
 from app.amazon.secrets import SecretNotFoundError, SecretProvider
 from app.core.config import Settings
 from app.core.exceptions import (
+    AdsApiDuplicateReportError,
     AdsApiRateLimitedError,
     AdsApiRequestFailedError,
     AdsReportFailedError,
@@ -224,6 +225,33 @@ class AmazonAdsReportService:
                     return await self._download_and_ingest(
                         run_id, organization_id, ads_profile_id, ctx, created.url
                     )
+        except AdsApiDuplicateReportError as exc:
+            # HTTP 425: Amazon has an identical report request already
+            # in flight. Never AdsApiInvalidRequestError, never a
+            # fabricated report id — see AdsApiDuplicateReportError's
+            # own docstring for the official evidence this is based on.
+            if exc.existing_report_id:
+                # Amazon's own response named the existing report —
+                # adopt it exactly like a normal successful create and
+                # fall through to polling below. No second create is
+                # ever issued for it.
+                amazon_report_id = exc.existing_report_id
+                with session_scope() as session:
+                    AmazonAdsReportRunRepository(session).set_amazon_report(
+                        run_id, amazon_report_id=amazon_report_id, amazon_report_status="PENDING"
+                    )
+            else:
+                # No id was discoverable in the response (undocumented
+                # schema — see the exception's docstring). Retry using
+                # the same bounded attempt-count budget as any other
+                # retryable create failure, under a distinct
+                # failure_class so a run stuck here is visible and
+                # auditable, rather than looping forever or hammering
+                # Amazon with identical creates.
+                return await self._retry_or_fail(
+                    run_id, organization_id, ads_profile_id, attempt_count,
+                    failure_class="report_create_duplicate_unresolved", detail=str(exc),
+                )
         except (AdsApiRateLimitedError, AdsApiRequestFailedError) as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,

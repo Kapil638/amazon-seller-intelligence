@@ -435,10 +435,39 @@ class AdsApiRequestFailedError(Exception):
 
 
 class AdsApiInvalidRequestError(Exception):
-    """A non-transient 4xx response. Never retried — see SpApiInvalidRequestError."""
+    """A non-transient 4xx response. Never retried — see SpApiInvalidRequestError.
+
+    Does NOT cover HTTP 425 — see `AdsApiDuplicateReportError`. A 425
+    means "an identical report request is already in flight," which is
+    the opposite of a permanently-wrong request."""
 
     def __init__(self, message: str = "Amazon Ads API rejected the request.") -> None:
         super().__init__(message)
+
+
+class AdsApiDuplicateReportError(Exception):
+    """HTTP 425 on `POST /reporting/reports`: Amazon reports that an
+    identical report request (same parameters) was already made too
+    soon. Confirmed to occur per the official Reporting v3 get-started
+    guide (see `docs/AI_HANDOVER/23_AMAZON_ADS_API_OFFICIAL_RESEARCH_AND_INGESTION_BLUEPRINT.md`
+    §9/§13.9: "wait and poll the in-flight identical report; do not
+    treat as malformed body"). The exact 425 response body schema —
+    specifically, whether/how it names the existing report's id — is
+    NOT documented in any source consulted. `existing_report_id` is
+    populated only when the response body actually contained a
+    plausible, well-formed `reportId` field (the same field name
+    Amazon's own documented 200 create/status response uses); it is
+    never invented or guessed when absent. Never treated as
+    `AdsApiInvalidRequestError` — retrying this is not the same as
+    retrying a permanently malformed request."""
+
+    def __init__(
+        self,
+        message: str = "Amazon Ads API reported a duplicate/in-flight report request (HTTP 425).",
+        existing_report_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.existing_report_id = existing_report_id
 
 
 class AdsApiParseFailedError(Exception):

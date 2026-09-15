@@ -59,6 +59,7 @@ from app.amazon.ads_models import (
 )
 from app.core.exceptions import (
     AdsApiAuthenticationError,
+    AdsApiDuplicateReportError,
     AdsApiInvalidRequestError,
     AdsApiParseFailedError,
     AdsApiRateLimitedError,
@@ -291,6 +292,27 @@ class HttpAmazonAdsApiClient:
             retry_after = response.headers.get("Retry-After")
             retry_seconds = float(retry_after) if retry_after and retry_after.strip().isdigit() else None
             raise AdsApiRateLimitedError("Amazon Ads API rate limit reached.", retry_after_seconds=retry_seconds)
+        if status == 425:
+            # Amazon's documented duplicate/in-flight-report response
+            # (see AdsApiDuplicateReportError's docstring). The response
+            # body schema is not documented — defensively check for the
+            # single field name Amazon's own 200 create/status response
+            # is confirmed to use (`reportId`); never invent one when
+            # absent. response.json() is safe to call here: httpx has
+            # already fully read the body for this non-streaming request.
+            existing_report_id: str | None = None
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                candidate = body.get("reportId")
+                if isinstance(candidate, str) and candidate:
+                    existing_report_id = candidate
+            raise AdsApiDuplicateReportError(
+                "Amazon Ads API reported a duplicate/in-flight report request (HTTP 425).",
+                existing_report_id=existing_report_id,
+            )
         if 400 <= status < 500:
             raise AdsApiInvalidRequestError("Amazon Ads API rejected the request.")
         raise AdsApiRequestFailedError("Amazon Ads API request failed.")
@@ -420,8 +442,20 @@ class HttpAmazonAdsApiClient:
         )
 
     async def create_report(self, ctx: AdsRequestContext, configuration: AdsReportRequestConfiguration) -> AdsReportStatusResponse:
+        # Media type per the Reporting v3 get-started guide (see
+        # docs/AI_HANDOVER/23_AMAZON_ADS_API_OFFICIAL_RESEARCH_AND_INGESTION_BLUEPRINT.md
+        # §9). Previously sent generic application/json — that succeeded
+        # live twice (PR #33/#34) despite not matching the documented
+        # contract; this brings the request in line with the documented
+        # media type. Not yet independently live-verified with this
+        # exact header — flagged for the next authorized live check.
         payload = await self._request_json(
-            ctx, "POST", "/reporting/reports", with_scope=True, json_body=configuration.model_dump(by_alias=True, mode="json")
+            ctx,
+            "POST",
+            "/reporting/reports",
+            with_scope=True,
+            media_type="application/vnd.createasyncreportrequest.v3+json",
+            json_body=configuration.model_dump(by_alias=True, mode="json"),
         )
         try:
             return AdsReportStatusResponse.model_validate(payload)
