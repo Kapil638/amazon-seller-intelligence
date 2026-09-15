@@ -770,6 +770,16 @@ class Settings(BaseSettings):
         default=600.0, gt=0, le=3600,
         description="Cap on the exponential backoff delay between retry attempts, regardless of attempt count.",
     )
+    ads_report_retry_after_max_seconds: float = Field(
+        default=900.0, gt=0, le=3600,
+        description=(
+            "Hard operational cap applied to any Amazon-supplied Retry-After value (create, poll, "
+            "download, and unresolved-425 duplicate-create handling alike) before it is ever used as "
+            "a retry delay. Retry-After is untrusted external input — a non-finite, negative, "
+            "non-numeric, or excessively large value is never allowed to postpone work indefinitely; "
+            "it falls back to computed backoff instead."
+        ),
+    )
     ads_sync_max_global_concurrent_jobs: int = Field(
         default=4, ge=1, le=100,
         description="Maximum number of Ads report jobs any future worker fleet may run simultaneously, across all organizations and profiles.",

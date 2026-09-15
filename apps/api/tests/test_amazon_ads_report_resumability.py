@@ -31,11 +31,17 @@ from pydantic import SecretStr
 
 from app.amazon.ads_client import MockAmazonAdsApiClient
 from app.amazon.ads_models import AdsReportStatusResponse
-from app.amazon.ads_report_service import AmazonAdsReportService, compute_backoff_delay
+from app.amazon.ads_report_service import (
+    AmazonAdsReportService,
+    _LeaseLost,
+    _validate_retry_after,
+    compute_backoff_delay,
+)
 from app.amazon.secrets import DevelopmentSecretProvider, build_asi_secret_reference
 from app.core.config import DEFAULT_DEVELOPMENT_ORGANIZATION_ID, Settings
 from app.core.exceptions import (
     AdsApiAuthenticationError,
+    AdsApiDuplicateReportError,
     AdsApiInvalidRequestError,
     AdsApiParseFailedError,
     AdsApiRateLimitedError,
@@ -230,7 +236,7 @@ def test_stale_lease_with_an_amazon_report_id_becomes_immediately_reclaimable() 
         repo = AmazonAdsReportRunRepository(session)
         run = repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2026, 9, 1), end_date=date(2026, 9, 1))
         repo.claim_next_report_job(lease_owner="worker-a", lease_duration_seconds=1, max_global_active=10, max_active_per_profile=10)
-        repo.set_amazon_report(run.id, amazon_report_id="r-crash-1", amazon_report_status="PENDING")
+        repo.set_amazon_report(run.id, lease_owner="worker-a", amazon_report_id="r-crash-1", amazon_report_status="PENDING")
         session.execute(
             sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run.id).values(
                 lease_expires_at=datetime.now(UTC) - timedelta(seconds=5)
@@ -267,7 +273,7 @@ async def test_crash_after_create_then_resume_never_issues_a_second_create(monke
         run_repo = AmazonAdsReportRunRepository(session)
         run = run_repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2026, 9, 1), end_date=date(2026, 9, 1))
         run_repo.claim_next_report_job(lease_owner="dead-worker", lease_duration_seconds=1, max_global_active=10, max_active_per_profile=10)
-        run_repo.set_amazon_report(run.id, amazon_report_id="r-crash-2", amazon_report_status="PENDING")
+        run_repo.set_amazon_report(run.id, lease_owner="dead-worker", amazon_report_id="r-crash-2", amazon_report_status="PENDING")
         session.execute(
             sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run.id).values(
                 lease_expires_at=datetime.now(UTC) - timedelta(seconds=5)
@@ -664,3 +670,347 @@ async def test_poll_invalid_request_failure_does_not_log_secrets_or_report_id_pa
     log_text = "\n".join(r.getMessage() for r in caplog.records)
     assert "Atza|" not in log_text
     assert "Atzr|" not in log_text
+
+
+# --------------------------------------------------------------------
+# Blocker 1 (second review) — never sleep in-process through a poll
+# rate limit while holding the lease.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_rate_limit_exceeding_lease_duration_releases_lease_and_returns(monkeypatch) -> None:
+    """Retry-After (300s) deliberately exceeds the configured lease
+    duration (30s, the minimum allowed value) — proves the invocation
+    releases the lease and returns immediately rather than sleeping
+    past its own lease, which would let another worker reclaim the row
+    while this one is still alive."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        report_status_sequence=[AdsReportStatusResponse(reportId="r-1", status="PENDING")],
+        raise_on={"get_report_status": AdsApiRateLimitedError("slow down", retry_after_seconds=300.0)},
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_lease_duration_seconds=30), secret_provider=secrets, ads_client=client, lease_owner="w1"
+    )
+    run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+    before = datetime.now(UTC)
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "retrying"
+    assert client.calls.count("get_report_status") == 1  # exactly one poll attempt — no in-process retry loop
+    assert client.calls.count("download_report") == 0
+    assert client.calls.count("create_report") == 1  # never a second create
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run.status == "waiting_to_retry"
+        assert run.lease_owner is None  # released, not held through the 300s delay
+        assert run.lease_expires_at is None
+        assert run.amazon_report_id == "r-1"  # preserved so the next claim resumes polling it
+        delta = (run.next_retry_at.replace(tzinfo=UTC) - before).total_seconds()
+        # 300s vastly exceeds the 30s lease duration — only possible if
+        # Retry-After was honored directly rather than clipped to fit
+        # inside the lease window (there is no such clipping; the point
+        # is that the lease is released instead, not that the delay is
+        # shortened).
+        assert 290 < delta < 310
+
+
+# --------------------------------------------------------------------
+# Blocker 2 (second review) — lease-owner fencing at the repository
+# and service layers (the full multi-worker PostgreSQL proof lives in
+# tests/postgres/test_disposable_postgres_ads_report_run_lease_fencing.py).
+# --------------------------------------------------------------------
+
+
+def _claim_then_hijack_lease_owner(profile_id) -> UUID:
+    """Creates and claims a run as 'worker-a', then simulates another
+    worker having since reclaimed it by directly overwriting
+    lease_owner to 'worker-b' — cheaper and more deterministic on
+    SQLite than driving a real expiry-based reclaim race."""
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run = repo.create(
+            ORG_ID, profile_id, report_type="sponsored_products_daily",
+            start_date=date(2026, 9, 1), end_date=date(2026, 9, 1),
+        )
+        repo.claim_next_report_job(
+            lease_owner="worker-a", lease_duration_seconds=300, max_global_active=10, max_active_per_profile=10
+        )
+        session.execute(sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run.id).values(lease_owner="worker-b"))
+    return run.id
+
+
+def test_heartbeat_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        ok = AmazonAdsReportRunRepository(session).heartbeat(run_id, lease_owner="worker-a", lease_duration_seconds=300)
+        assert ok is False
+
+
+def test_set_amazon_report_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        ok = repo.set_amazon_report(run_id, lease_owner="worker-a", amazon_report_id="r-hijack", amazon_report_status="PENDING")
+        assert ok is False
+        assert repo.get_owned(ORG_ID, run_id).amazon_report_id is None
+
+
+def test_update_amazon_status_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        ok = repo.update_amazon_status(run_id, lease_owner="worker-a", amazon_report_status="COMPLETED")
+        assert ok is False
+        assert repo.get_owned(ORG_ID, run_id).amazon_report_status is None
+
+
+def test_mark_retry_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        ok = repo.mark_retry(
+            run_id, lease_owner="worker-a", next_retry_at=datetime.now(UTC) + timedelta(seconds=30),
+            failure_class="stale", failure_detail="should never apply",
+        )
+        assert ok is False
+        current = repo.get_owned(ORG_ID, run_id)
+        assert current.status == "started"
+        assert current.failure_class is None
+
+
+def test_mark_failed_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        ok = repo.mark_failed(run_id, lease_owner="worker-a", failure_class="stale", failure_detail="should never apply")
+        assert ok is False
+        assert repo.get_owned(ORG_ID, run_id).status == "started"
+
+
+def test_mark_succeeded_rejects_a_stale_lease_owner() -> None:
+    _connection_id, profile_id, _secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        ok = repo.mark_succeeded(run_id, lease_owner="worker-a", records_ingested=999)
+        assert ok is False
+        current = repo.get_owned(ORG_ID, run_id)
+        assert current.status == "started"
+        assert current.records_ingested == 0
+
+
+@pytest.mark.asyncio
+async def test_service_fail_permanently_raises_lease_lost_for_a_stale_worker() -> None:
+    _connection_id, profile_id, secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    stale_service = AmazonAdsReportService(
+        settings=_settings(), secret_provider=secrets, ads_client=MockAmazonAdsApiClient(), lease_owner="worker-a"
+    )
+    with pytest.raises(_LeaseLost):
+        await stale_service._fail_permanently(run_id, ORG_ID, profile_id, failure_class="x", detail="y")
+
+    with session_scope() as session:
+        current = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert current.status == "started"  # untouched — the stale worker's write never applied
+        assert current.lease_owner == "worker-b"  # new owner's claim intact
+
+
+@pytest.mark.asyncio
+async def test_service_retry_or_fail_raises_lease_lost_for_a_stale_worker() -> None:
+    _connection_id, profile_id, secrets = _connected_profile()
+    run_id = _claim_then_hijack_lease_owner(profile_id)
+    stale_service = AmazonAdsReportService(
+        settings=_settings(), secret_provider=secrets, ads_client=MockAmazonAdsApiClient(), lease_owner="worker-a"
+    )
+    with pytest.raises(_LeaseLost):
+        await stale_service._retry_or_fail(run_id, ORG_ID, profile_id, attempt_count=0, failure_class="x", detail="y")
+
+    with session_scope() as session:
+        current = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert current.status == "started"
+        assert current.lease_owner == "worker-b"
+
+
+@pytest.mark.asyncio
+async def test_process_one_claimed_job_surfaces_lease_lost_end_to_end(monkeypatch) -> None:
+    """Full end-to-end proof at the service's public entrypoint: a
+    worker that claims a job, then loses its lease before it can create
+    the report, gets outcome='lease_lost' — not a crash, not a silent
+    overwrite of the new owner's state."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+
+    with session_scope() as session:
+        repo = AmazonAdsReportRunRepository(session)
+        run = repo.create(ORG_ID, profile_id, report_type="sponsored_products_daily", start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+        run_id = run.id
+
+    client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiInvalidRequestError("bad request")})
+    stale_service = AmazonAdsReportService(settings=_settings(), secret_provider=secrets, ads_client=client, lease_owner="worker-a")
+
+    # Simulate the race directly: hijack the lease right as worker-a is
+    # mid-flight (after LWA/profile resolution, before its first fenced
+    # write), by monkeypatching AmazonAdsProfileRepository.get_owned to
+    # flip lease ownership as a side effect the moment it's called —
+    # this deterministically reproduces "another worker reclaimed the
+    # row between this worker's claim and its first write" without
+    # relying on real timing.
+    from app.persistence.repositories import AmazonAdsProfileRepository
+
+    original_get_owned = AmazonAdsProfileRepository.get_owned
+
+    def _hijack_then_delegate(self, organization_id, ads_profile_id):
+        with session_scope() as hijack_session:
+            hijack_session.execute(
+                sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run_id).values(lease_owner="worker-b")
+            )
+        return original_get_owned(self, organization_id, ads_profile_id)
+
+    monkeypatch.setattr(AmazonAdsProfileRepository, "get_owned", _hijack_then_delegate)
+
+    outcome = await stale_service.process_one_claimed_job()
+
+    # The Amazon call itself isn't gated on ownership (fencing happens at
+    # the database write boundary, not before every external call) —
+    # what matters is that its result never got written under a lease
+    # this worker no longer held.
+    assert outcome.outcome == "lease_lost"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run.status == "started"  # worker-a's mark_failed(report_create_invalid_request) never applied
+        assert run.failure_class is None
+        assert run.lease_owner == "worker-b"  # worker-b's claim intact, never overwritten
+
+
+# --------------------------------------------------------------------
+# Blocker 3 (second review) — bound external Retry-After delays.
+# --------------------------------------------------------------------
+
+
+def test_validate_retry_after_accepts_a_normal_value() -> None:
+    assert _validate_retry_after(10.0, max_seconds=900.0) == 10.0
+
+
+def test_validate_retry_after_accepts_zero() -> None:
+    assert _validate_retry_after(0.0, max_seconds=900.0) == 0.0
+
+
+def test_validate_retry_after_returns_none_for_a_missing_value() -> None:
+    assert _validate_retry_after(None, max_seconds=900.0) is None
+
+
+def test_validate_retry_after_rejects_a_negative_value() -> None:
+    assert _validate_retry_after(-1.0, max_seconds=900.0) is None
+
+
+def test_validate_retry_after_rejects_non_finite_values() -> None:
+    assert _validate_retry_after(float("inf"), max_seconds=900.0) is None
+    assert _validate_retry_after(float("-inf"), max_seconds=900.0) is None
+    assert _validate_retry_after(float("nan"), max_seconds=900.0) is None
+
+
+def test_validate_retry_after_rejects_a_non_numeric_value() -> None:
+    assert _validate_retry_after("not-a-number", max_seconds=900.0) is None  # type: ignore[arg-type]
+    assert _validate_retry_after(object(), max_seconds=900.0) is None  # type: ignore[arg-type]
+
+
+def test_validate_retry_after_caps_an_extremely_large_value() -> None:
+    assert _validate_retry_after(10_000_000.0, max_seconds=900.0) == 900.0
+
+
+@pytest.mark.asyncio
+async def test_extremely_large_retry_after_is_capped_not_honored_verbatim(monkeypatch) -> None:
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        raise_on={"create_report": AdsApiRateLimitedError("slow down", retry_after_seconds=10_000_000.0)}
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_retry_after_max_seconds=120.0),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+    before = datetime.now(UTC)
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "retrying"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        delta = (run.next_retry_at.replace(tzinfo=UTC) - before).total_seconds()
+        assert delta <= 130  # capped near the configured 120s max, not ~10,000,000s
+        assert "retry_delay_source=retry_after" in run.failure_detail
+
+
+@pytest.mark.asyncio
+async def test_non_numeric_retry_after_falls_back_to_backoff_without_crashing(monkeypatch) -> None:
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        raise_on={"create_report": AdsApiRateLimitedError("slow down", retry_after_seconds="not-a-number")}
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_retry_base_seconds=0.001, ads_report_retry_max_seconds=1.0),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "retrying"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert "retry_delay_source=backoff" in run.failure_detail
+
+
+@pytest.mark.asyncio
+async def test_negative_retry_after_falls_back_to_backoff(monkeypatch) -> None:
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        raise_on={"create_report": AdsApiRateLimitedError("slow down", retry_after_seconds=-5.0)}
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_retry_base_seconds=0.001, ads_report_retry_max_seconds=1.0),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "retrying"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert "retry_delay_source=backoff" in run.failure_detail
+
+
+@pytest.mark.asyncio
+async def test_unresolved_425_retry_after_is_bounded_by_the_same_policy(monkeypatch) -> None:
+    """The unresolved-425 duplicate-create path uses its own dedicated
+    default delay, but an Amazon-supplied Retry-After there must be
+    bounded by the SAME ads_report_retry_after_max_seconds policy as
+    every other stage — never a separate, unbounded exception."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        raise_on={"create_report": AdsApiDuplicateReportError("duplicate, no id", retry_after_seconds=10_000_000.0)}
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_retry_after_max_seconds=120.0),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1))
+    before = datetime.now(UTC)
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "retrying"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        delta = (run.next_retry_at.replace(tzinfo=UTC) - before).total_seconds()
+        assert delta <= 130
+        assert "retry_delay_source=retry_after" in run.failure_detail

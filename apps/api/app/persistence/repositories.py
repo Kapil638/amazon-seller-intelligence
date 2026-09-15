@@ -7278,34 +7278,74 @@ class AmazonAdsReportRunRepository:
             return func.now() + text(f"interval '{int(duration_seconds)} seconds'")
         return datetime.now(UTC) + timedelta(seconds=duration_seconds)
 
-    def heartbeat(self, report_run_id: UUID, *, lease_owner: str, lease_duration_seconds: int) -> None:
-        self.session.execute(
+    # --- Worker-mutation fencing ----------------------------------------
+    # Every method below is called only while a worker believes it still
+    # holds this run's lease (inside `process_one_claimed_job` or its
+    # helpers) — never as an administrative/pre-claim operation. Each is
+    # therefore a compare-and-set keyed on `(id, lease_owner, status=
+    # 'started', lease_expires_at > now())`, mirroring
+    # `heartbeat_sales_traffic_run`/`complete_sales_traffic_run_terminal`'s
+    # own established fencing exactly: a worker whose lease has since
+    # expired and been reclaimed by another worker affects zero rows here
+    # and gets that signaled back via the `bool` return (True = this
+    # caller still owned the row and the write applied; False = it did
+    # not, and nothing was written) rather than silently overwriting the
+    # new owner's state. The caller (`AmazonAdsReportService`) treats a
+    # `False` return as `_LeaseLost` and aborts the current attempt.
+
+    def heartbeat(self, report_run_id: UUID, *, lease_owner: str, lease_duration_seconds: int) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id, AmazonAdsReportRun.lease_owner == lease_owner)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(lease_expires_at=self._lease_expiry(lease_duration_seconds))
         )
         self.session.flush()
+        return result.rowcount == 1
 
-    def set_amazon_report(self, report_run_id: UUID, *, amazon_report_id: str, amazon_report_status: str) -> None:
-        self.session.execute(
+    def set_amazon_report(
+        self, report_run_id: UUID, *, lease_owner: str, amazon_report_id: str, amazon_report_status: str
+    ) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(amazon_report_id=amazon_report_id, amazon_report_status=amazon_report_status)
         )
         self.session.flush()
+        return result.rowcount == 1
 
-    def update_amazon_status(self, report_run_id: UUID, *, amazon_report_status: str) -> None:
-        self.session.execute(
+    def update_amazon_status(self, report_run_id: UUID, *, lease_owner: str, amazon_report_status: str) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(amazon_report_status=amazon_report_status)
         )
         self.session.flush()
+        return result.rowcount == 1
 
-    def mark_succeeded(self, report_run_id: UUID, *, records_ingested: int) -> None:
-        self.session.execute(
+    def mark_succeeded(self, report_run_id: UUID, *, lease_owner: str, records_ingested: int) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(
                 status="succeeded",
                 completed_at=func.now(),
@@ -7315,11 +7355,19 @@ class AmazonAdsReportRunRepository:
             )
         )
         self.session.flush()
+        return result.rowcount == 1
 
-    def mark_retry(self, report_run_id: UUID, *, next_retry_at: datetime, failure_class: str, failure_detail: str) -> None:
-        self.session.execute(
+    def mark_retry(
+        self, report_run_id: UUID, *, lease_owner: str, next_retry_at: datetime, failure_class: str, failure_detail: str
+    ) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(
                 status="waiting_to_retry",
                 lease_owner=None,
@@ -7330,11 +7378,17 @@ class AmazonAdsReportRunRepository:
             )
         )
         self.session.flush()
+        return result.rowcount == 1
 
-    def mark_failed(self, report_run_id: UUID, *, failure_class: str, failure_detail: str) -> None:
-        self.session.execute(
+    def mark_failed(self, report_run_id: UUID, *, lease_owner: str, failure_class: str, failure_detail: str) -> bool:
+        result = self.session.execute(
             update(AmazonAdsReportRun)
-            .where(AmazonAdsReportRun.id == report_run_id)
+            .where(
+                AmazonAdsReportRun.id == report_run_id,
+                AmazonAdsReportRun.lease_owner == lease_owner,
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at > func.now(),
+            )
             .values(
                 status="failed",
                 completed_at=func.now(),
@@ -7345,6 +7399,7 @@ class AmazonAdsReportRunRepository:
             )
         )
         self.session.flush()
+        return result.rowcount == 1
 
 
 class AmazonAdsSyncCheckpointRepository:
