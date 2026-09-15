@@ -1,5 +1,6 @@
 """Amazon Ads Sponsored Products entity-hierarchy synchronization
-ledger and checkpoint tables (PR B2).
+ledger, checkpoint tables, and reversible snapshot-activity tracking
+(PR B2).
 
 Revision ID: 0021_ads_entity_sync_runs
 Revises: 0020_ads_campaign_state_enum
@@ -8,41 +9,55 @@ Create Date: 2026-09-15
 Two new tables, deliberately separate from `amazon_ads_report_runs` /
 `amazon_ads_sync_checkpoints` (the Reporting v3 ledger — PR #36) rather
 than overloaded onto it: entity-list synchronization is a different run
-model (bounded-page snapshot fetch of a GET-based, idempotent list
-endpoint) from Reporting v3's async create/poll/download lifecycle, and
-the columns that make sense for one make little sense for the other
-(there is no Amazon-side `amazon_report_id` to protect against
-duplication for a paginated GET; there is no `start_date`/`end_date`
-request window for a full-snapshot entity list).
+model (bounded-page snapshot fetch of a POST-based, read-only,
+idempotent list endpoint — see docs/AI_HANDOVER/23's §10/§11 evidence
+tables; these are POST requests carrying only filter/pagination bodies,
+never a write, "GET-based" was an inaccurate shorthand corrected during
+final review) from Reporting v3's async create/poll/download lifecycle.
 
-`amazon_ads_entity_sync_runs`: one row per (organization, profile,
-entity_type) claim attempt. `status` vocabulary and lease columns
-mirror `amazon_ads_report_runs` / `AmazonIngestionRun` exactly so the
-claim/heartbeat/fenced-completion query shapes in
-`app.persistence.repositories` can reuse the same proven pattern.
+`amazon_ads_entity_sync_runs`: one row per (organization, connection,
+profile, entity_type) claim attempt. `status` vocabulary and lease
+columns mirror `amazon_ads_report_runs` / `AmazonIngestionRun` exactly.
 Deliberately simpler resumption than Reporting v3: a stale lease always
 terminalizes to `timed_out` (never auto-resumed) because restarting a
-paginated entity-list fetch from page 1 is always safe and idempotent —
-unlike Reporting v3, there is no already-in-flight Amazon-side report
-whose duplication must be avoided.
+paginated entity-list fetch from page 1 is always safe and idempotent.
+`status` additionally carries a `'partial'` terminal value — final
+review found the first pass of this migration allowed a run with
+schema-rejected, unsupported-state, missing-parent, or mismatched-
+parent items to be marked `'succeeded'` and advance the checkpoint,
+which contradicts the B2 contract. `'partial'` is now a distinct
+terminal outcome: persisted (if transactionally safe) but never
+advances the checkpoint and never triggers reconciliation.
 
 `amazon_ads_entity_sync_checkpoints`: one row per (ads_profile_id,
-entity_type), recording only the timestamp of the last COMPLETE,
-successful full-snapshot sync. No new column is added to the five
-existing entity tables for reconciliation — `first_seen_at`/
-`last_seen_at` (already present since `0019_amazon_ads_foundation`)
-remain each row's own freshness signal for manual/observability
-queries, and are updated by every upsert exactly as before. The
-service's own per-run reconciliation COUNT (see
-`app.amazon.ads_entity_sync_service.AmazonAdsEntitySyncService.
-_persist_snapshot`) does not compare against them, though — it checks
-row-id membership against the exact set this run's own upserts
-touched, which needs no shared "before this run" clock reference
-between the Python process and the database server (or between
-dialects in tests vs. production) and is exact by construction.
-Snapshot reconciliation never deletes or mutates a `state`; it only
-counts which existing rows this run did NOT touch, recording that
-count for observability on the completed run row.
+entity_type), recording the timestamp of the last COMPLETE,
+clean-success (never partial) full-snapshot sync, plus the exact scope
+(`organization_id`, `ads_connection_id`) that produced it — final
+review found the original checkpoint identity omitted the Ads
+connection, and required checkpoint advancement to be guarded by a
+SQL-verified match against a run that is itself in the clean
+`'succeeded'` terminal state, in the same organization/connection/
+profile/entity_type scope, rather than trusting an unguarded caller
+(see `app.persistence.repositories.AmazonAdsEntitySyncCheckpointRepository
+.advance`, revised in the same review pass).
+
+Reversible snapshot-activity tracking (final review, replacing the
+original `reconciliation_stale_count`-only "observability, not
+reconciliation" design): `is_active` and `last_seen_entity_sync_run_id`
+are added to all five existing Sponsored Products entity tables
+(`amazon_ads_campaigns`, `amazon_ads_ad_groups`,
+`amazon_ads_advertised_products`, `amazon_ads_keywords`,
+`amazon_ads_product_targets`). A row touched by a run's upserts is
+marked active and stamped with that run's id; only after a complete,
+rejection-free ('succeeded', never 'partial') snapshot may untouched
+rows in the exact same profile/entity-table scope be marked inactive —
+never hard-deleted, never touched after a disabled gate, partial
+result, pagination failure, lease loss, retry, contract mismatch, or
+database error. A later clean snapshot that observes a currently-
+inactive row reactivates it. Amazon's own entity `state` column is
+left completely untouched by this mechanism — `is_active` is this
+application's own snapshot-membership signal, deliberately independent
+of Amazon's reported lifecycle state.
 """
 
 from alembic import op
@@ -57,7 +72,17 @@ depends_on = None
 _ENTITY_TYPE_CHECK = (
     "entity_type IN ('campaign', 'ad_group', 'product_ad', 'keyword', 'product_target')"
 )
-_STATUS_CHECK = "status IN ('queued', 'started', 'waiting_to_retry', 'succeeded', 'failed', 'timed_out')"
+_STATUS_CHECK = (
+    "status IN ('queued', 'started', 'waiting_to_retry', 'succeeded', 'partial', 'failed', 'timed_out')"
+)
+
+_ENTITY_TABLES = (
+    "amazon_ads_campaigns",
+    "amazon_ads_ad_groups",
+    "amazon_ads_advertised_products",
+    "amazon_ads_keywords",
+    "amazon_ads_product_targets",
+)
 
 
 def upgrade() -> None:
@@ -68,6 +93,12 @@ def upgrade() -> None:
             "organization_id",
             PGUUID(as_uuid=True),
             sa.ForeignKey("organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "ads_connection_id",
+            PGUUID(as_uuid=True),
+            sa.ForeignKey("amazon_ads_connections.id", ondelete="RESTRICT"),
             nullable=False,
         ),
         sa.Column(
@@ -92,7 +123,9 @@ def upgrade() -> None:
         sa.Column("items_schema_rejected", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("items_unsupported_state", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("items_missing_parent", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("reconciliation_stale_count", sa.Integer(), nullable=True),
+        sa.Column("items_mismatched_parent", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("items_deactivated", sa.Integer(), nullable=True),
+        sa.Column("items_reactivated", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column(
             "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(),
@@ -102,6 +135,9 @@ def upgrade() -> None:
         sa.CheckConstraint(_STATUS_CHECK, name="ck_amazon_ads_entity_sync_runs_status"),
     )
     op.create_index("ix_amazon_ads_entity_sync_runs_org", "amazon_ads_entity_sync_runs", ["organization_id"])
+    op.create_index(
+        "ix_amazon_ads_entity_sync_runs_connection", "amazon_ads_entity_sync_runs", ["ads_connection_id"]
+    )
     op.create_index("ix_amazon_ads_entity_sync_runs_profile", "amazon_ads_entity_sync_runs", ["ads_profile_id"])
     op.create_index(
         "ix_amazon_ads_entity_sync_runs_claimable", "amazon_ads_entity_sync_runs", ["status", "next_retry_at"]
@@ -114,6 +150,12 @@ def upgrade() -> None:
             "organization_id",
             PGUUID(as_uuid=True),
             sa.ForeignKey("organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "ads_connection_id",
+            PGUUID(as_uuid=True),
+            sa.ForeignKey("amazon_ads_connections.id", ondelete="RESTRICT"),
             nullable=False,
         ),
         sa.Column(
@@ -143,6 +185,28 @@ def upgrade() -> None:
     op.create_index(
         "ix_amazon_ads_entity_sync_checkpoints_org", "amazon_ads_entity_sync_checkpoints", ["organization_id"]
     )
+    op.create_index(
+        "ix_amazon_ads_entity_sync_checkpoints_connection",
+        "amazon_ads_entity_sync_checkpoints",
+        ["ads_connection_id"],
+    )
+
+    # Reversible snapshot-activity tracking on the five existing entity
+    # tables (all created by 0019). `last_seen_entity_sync_run_id` must
+    # follow `amazon_ads_entity_sync_runs`, hence added only now, after
+    # that table exists.
+    for table in _ENTITY_TABLES:
+        op.add_column(table, sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()))
+        op.add_column(
+            table,
+            sa.Column(
+                "last_seen_entity_sync_run_id",
+                PGUUID(as_uuid=True),
+                sa.ForeignKey("amazon_ads_entity_sync_runs.id", ondelete="SET NULL"),
+                nullable=True,
+            ),
+        )
+        op.create_index(f"ix_{table}_is_active", table, ["ads_profile_id", "is_active"])
 
 
 def downgrade() -> None:
@@ -162,6 +226,11 @@ def downgrade() -> None:
             "sync run/checkpoint history, and downgrading now would silently discard it. "
             f"Non-empty: {populated}. Remove or migrate this data out-of-band before downgrading."
         )
+
+    for table in _ENTITY_TABLES:
+        op.drop_index(f"ix_{table}_is_active", table_name=table)
+        op.drop_column(table, "last_seen_entity_sync_run_id")
+        op.drop_column(table, "is_active")
 
     op.drop_table("amazon_ads_entity_sync_checkpoints")
     op.drop_table("amazon_ads_entity_sync_runs")

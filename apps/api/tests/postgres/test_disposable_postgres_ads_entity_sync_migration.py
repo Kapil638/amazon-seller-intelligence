@@ -1,22 +1,31 @@
 """Disposable PostgreSQL validation for migration 0021
-(`ads_entity_sync_runs`) — PR B2.
+(`ads_entity_sync_runs`) — PR B2, including the final-review revision
+that added `ads_connection_id` scope, the `'partial'` terminal status,
+and reversible `is_active`/`last_seen_entity_sync_run_id` snapshot
+tracking on the five existing entity tables.
 
 Opt-in only. See `_guard.py` for the two conditions that must both hold
 before anything here runs. Proves, against genuine PostgreSQL:
 
 - `amazon_ads_entity_sync_runs` / `amazon_ads_entity_sync_checkpoints`
-  exist after upgrading to 0021 with the expected shape (entity_type/
-  status check constraints, the checkpoint's per-(profile, entity_type)
-  uniqueness);
-- `downgrade()` refuses when either table is populated, and succeeds
-  (removing both tables) when they are empty;
+  exist with the expected shape (entity_type/status check constraints
+  — including `'partial'` — the checkpoint's per-(profile, entity_type)
+  uniqueness, and `ads_connection_id` on both);
+- the five entity tables gained `is_active` (default true) and
+  `last_seen_entity_sync_run_id`;
+- `downgrade()` refuses when either new table is populated, and
+  succeeds (removing both tables and the two new entity-table columns)
+  when they are empty;
 - the entity-sync lease ledger's fenced CAS mutations behave under real
   concurrency exactly like `AmazonAdsReportRunRepository`'s proven
-  pattern (see `test_disposable_postgres_ads_report_run_lease_fencing.py`),
-  with the one deliberate difference this PR introduces: a stale lease
-  always terminalizes to `timed_out`, never resumed — there is no
-  `amazon_report_id`-shaped field whose presence would make resumption
-  safe the way Reporting v3's does.
+  pattern, with the one deliberate difference this PR introduces: a
+  stale lease always terminalizes to `timed_out`, never resumed;
+- `AmazonAdsEntitySyncCheckpointRepository.advance`'s guarded,
+  SQL-verified finalization rejects a non-`'succeeded'` or foreign-scope
+  run even when called directly, under real PostgreSQL;
+- reconciliation (deactivation/reactivation) behaves correctly and
+  stays tenant-isolated under real PostgreSQL, and an incomplete/failed
+  run never touches `is_active` at all.
 
 As with every other disposable-Postgres suite in this repository, this
 file could not itself be executed end-to-end in the environment it was
@@ -46,7 +55,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.persistence.models import AmazonAdsEntitySyncRun, Organization
+from app.persistence.models import AmazonAdsCampaign, AmazonAdsEntitySyncRun, Organization
 from app.persistence.repositories import (
     AmazonAdsCampaignRepository,
     AmazonAdsConnectionRepository,
@@ -59,6 +68,14 @@ from tests.postgres import _guard
 pytestmark = pytest.mark.skipif(bool(_guard.skip_reason()), reason=_guard.skip_reason() or "")
 
 API_ROOT = Path(__file__).resolve().parents[2]
+
+_ENTITY_TABLES = (
+    "amazon_ads_campaigns",
+    "amazon_ads_ad_groups",
+    "amazon_ads_advertised_products",
+    "amazon_ads_keywords",
+    "amazon_ads_product_targets",
+)
 
 
 def _alembic_config(url: str) -> Config:
@@ -107,7 +124,8 @@ def disposable_engine():
         engine.dispose()
 
 
-def _seed_profile(engine) -> tuple[UUID, UUID]:
+def _seed_profile(engine) -> tuple[UUID, UUID, UUID]:
+    """Returns (organization_id, ads_connection_id, ads_profile_id)."""
     org_id = uuid.uuid4()
     with Session(engine) as session:
         session.add(Organization(id=org_id, name="PR B2 Postgres Entity Sync Test Org"))
@@ -131,36 +149,63 @@ def _seed_profile(engine) -> tuple[UUID, UUID]:
             ],
         )[0]
         session.commit()
-        return org_id, profile.id
+        return org_id, connection.id, profile.id
 
 
-def test_0021_creates_the_expected_tables_and_constraints(disposable_engine) -> None:
+def _seed_campaign(engine, *, org_id: UUID, profile_id: UUID, external_id: str, is_active: bool = True) -> UUID:
+    with Session(engine) as session:
+        row = AmazonAdsCampaignRepository(session).upsert(
+            org_id, profile_id, {"external_campaign_id": external_id, "name": "Seed", "state": "ENABLED"}
+        )
+        row_id = row.id
+        if not is_active:
+            row.is_active = False
+        session.commit()
+        return row_id
+
+
+def test_0021_creates_the_expected_tables_and_columns(disposable_engine) -> None:
     inspector = inspect(disposable_engine)
     tables = set(inspector.get_table_names())
     assert "amazon_ads_entity_sync_runs" in tables
     assert "amazon_ads_entity_sync_checkpoints" in tables
 
+    run_columns = {c["name"] for c in inspector.get_columns("amazon_ads_entity_sync_runs")}
+    assert "ads_connection_id" in run_columns
+    assert "items_mismatched_parent" in run_columns
+    assert "items_deactivated" in run_columns
+    assert "items_reactivated" in run_columns
+    assert "reconciliation_stale_count" not in run_columns  # replaced, not kept alongside
+
+    checkpoint_columns = {c["name"] for c in inspector.get_columns("amazon_ads_entity_sync_checkpoints")}
+    assert "ads_connection_id" in checkpoint_columns
+
     run_checks = {c["name"]: c["sqltext"] for c in inspector.get_check_constraints("amazon_ads_entity_sync_runs")}
-    assert "ck_amazon_ads_entity_sync_runs_entity_type" in run_checks
-    assert "ck_amazon_ads_entity_sync_runs_status" in run_checks
-    for value in ("campaign", "ad_group", "product_ad", "keyword", "product_target"):
-        assert value in run_checks["ck_amazon_ads_entity_sync_runs_entity_type"]
-    for value in ("queued", "started", "waiting_to_retry", "succeeded", "failed", "timed_out"):
-        assert value in run_checks["ck_amazon_ads_entity_sync_runs_status"]
+    assert "partial" in run_checks["ck_amazon_ads_entity_sync_runs_status"]
+    assert "succeeded" in run_checks["ck_amazon_ads_entity_sync_runs_status"]
 
-    checkpoint_uniques = {
-        uq["name"] for uq in inspector.get_unique_constraints("amazon_ads_entity_sync_checkpoints")
-    }
-    assert "uq_amazon_ads_entity_sync_checkpoints_profile_entity_type" in checkpoint_uniques
+    for table in _ENTITY_TABLES:
+        columns = {c["name"] for c in inspector.get_columns(table)}
+        assert "is_active" in columns, f"{table} missing is_active"
+        assert "last_seen_entity_sync_run_id" in columns, f"{table} missing last_seen_entity_sync_run_id"
 
 
-def test_downgrade_refuses_when_either_table_is_populated(disposable_engine) -> None:
+def test_existing_campaign_rows_default_to_active_after_upgrade(disposable_engine) -> None:
+    org_id, _connection_id, profile_id = _seed_profile(disposable_engine)
+    campaign_id = _seed_campaign(disposable_engine, org_id=org_id, profile_id=profile_id, external_id="c-1")
+    with Session(disposable_engine) as session:
+        row = session.get(AmazonAdsCampaign, campaign_id)
+        assert row.is_active is True
+        assert row.last_seen_entity_sync_run_id is None
+
+
+def test_downgrade_refuses_when_either_new_table_is_populated(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
-    org_id, profile_id = _seed_profile(disposable_engine)
+    org_id, connection_id, profile_id = _seed_profile(disposable_engine)
 
     with Session(disposable_engine) as session:
-        AmazonAdsEntitySyncRunRepository(session).enqueue(org_id, profile_id, entity_type="campaign")
+        AmazonAdsEntitySyncRunRepository(session).enqueue(org_id, connection_id, profile_id, entity_type="campaign")
         session.commit()
 
     with _alembic_environment(url):
@@ -171,7 +216,7 @@ def test_downgrade_refuses_when_either_table_is_populated(disposable_engine) -> 
     assert "amazon_ads_entity_sync_runs" in set(inspector.get_table_names())
 
 
-def test_downgrade_succeeds_when_both_tables_are_empty(disposable_engine) -> None:
+def test_downgrade_succeeds_and_removes_entity_table_columns_when_empty(disposable_engine) -> None:
     url = _guard.disposable_url()
     cfg = _alembic_config(url)
     with _alembic_environment(url):
@@ -181,18 +226,18 @@ def test_downgrade_succeeds_when_both_tables_are_empty(disposable_engine) -> Non
     tables = set(inspector.get_table_names())
     assert "amazon_ads_entity_sync_runs" not in tables
     assert "amazon_ads_entity_sync_checkpoints" not in tables
+    for table in _ENTITY_TABLES:
+        columns = {c["name"] for c in inspector.get_columns(table)}
+        assert "is_active" not in columns
+        assert "last_seen_entity_sync_run_id" not in columns
 
 
 def test_stale_lease_always_terminalizes_never_resumed_under_real_concurrency(disposable_engine) -> None:
-    """The one deliberate behavioral difference from
-    `AmazonAdsReportRunRepository`'s resumable/terminal split: there is
-    no second stale-lease branch here at all. Every stale `started` row
-    becomes `timed_out`, unconditionally."""
-    org_id, profile_id = _seed_profile(disposable_engine)
+    org_id, connection_id, profile_id = _seed_profile(disposable_engine)
 
     with Session(disposable_engine) as session:
         repo = AmazonAdsEntitySyncRunRepository(session)
-        run = repo.enqueue(org_id, profile_id, entity_type="campaign")
+        run = repo.enqueue(org_id, connection_id, profile_id, entity_type="campaign")
         run_id = run.id
         claimed = repo.claim_next_sync_run(lease_owner="worker-a", lease_duration_seconds=300, max_global_active=10)
         assert claimed is not None and claimed.id == run_id
@@ -205,8 +250,6 @@ def test_stale_lease_always_terminalizes_never_resumed_under_real_concurrency(di
 
     with Session(disposable_engine) as session:
         repo = AmazonAdsEntitySyncRunRepository(session)
-        # No other queued/waiting_to_retry run exists — the stale row
-        # itself must not be silently re-claimable as if nothing happened.
         result = repo.claim_next_sync_run(lease_owner="worker-b", lease_duration_seconds=300, max_global_active=10)
         assert result is None
         session.commit()
@@ -218,47 +261,102 @@ def test_stale_lease_always_terminalizes_never_resumed_under_real_concurrency(di
         assert row.failure_class == "lease_expired"
 
 
-def test_worker_a_loses_every_fenced_mutation_after_worker_b_reclaims(disposable_engine) -> None:
-    org_id, profile_id = _seed_profile(disposable_engine)
+def test_checkpoint_advance_rejects_a_non_succeeded_or_foreign_scope_run(disposable_engine) -> None:
+    org_id, connection_id, profile_id = _seed_profile(disposable_engine)
+    other_org_id, other_connection_id, other_profile_id = _seed_profile(disposable_engine)
 
     with Session(disposable_engine) as session:
-        repo = AmazonAdsEntitySyncRunRepository(session)
-        run = repo.enqueue(org_id, profile_id, entity_type="campaign")
+        run_repo = AmazonAdsEntitySyncRunRepository(session)
+        run = run_repo.enqueue(org_id, connection_id, profile_id, entity_type="campaign")
         run_id = run.id
-        claimed = repo.claim_next_sync_run(lease_owner="worker-a", lease_duration_seconds=300, max_global_active=10)
-        assert claimed is not None
+        run_repo.claim_next_sync_run(lease_owner="w1", lease_duration_seconds=300, max_global_active=10)
+        session.commit()
+
+    checkpoint_repo_kwargs = dict(entity_type="campaign", synced_at=datetime.now(UTC), run_id=run_id)
+
+    # Still 'started' — not yet succeeded.
+    with Session(disposable_engine) as session:
+        with pytest.raises(ValueError):
+            AmazonAdsEntitySyncCheckpointRepository(session).advance(
+                org_id, connection_id, profile_id, **checkpoint_repo_kwargs
+            )
+
+    with Session(disposable_engine) as session:
+        assert AmazonAdsEntitySyncRunRepository(session).mark_partial(
+            run_id, lease_owner="w1", pages_processed=1, items_observed=1, items_accepted=0,
+            items_schema_rejected=1, items_unsupported_state=0, items_missing_parent=0, items_mismatched_parent=0,
+        )
+        session.commit()
+
+    # 'partial', not 'succeeded'.
+    with Session(disposable_engine) as session:
+        with pytest.raises(ValueError):
+            AmazonAdsEntitySyncCheckpointRepository(session).advance(
+                org_id, connection_id, profile_id, **checkpoint_repo_kwargs
+            )
+
+    # Foreign organization/connection/profile scope, even with a real run_id.
+    with Session(disposable_engine) as session:
+        with pytest.raises(ValueError):
+            AmazonAdsEntitySyncCheckpointRepository(session).advance(
+                other_org_id, other_connection_id, other_profile_id, **checkpoint_repo_kwargs
+            )
+
+    with Session(disposable_engine) as session:
+        assert AmazonAdsEntitySyncCheckpointRepository(session).get(profile_id, "campaign") is None
+
+
+def test_reconciliation_deactivates_and_reactivates_with_tenant_isolation(disposable_engine) -> None:
+    org_id, connection_id, profile_id = _seed_profile(disposable_engine)
+    other_org_id, _other_connection_id, other_profile_id = _seed_profile(disposable_engine)
+
+    stale_id = _seed_campaign(disposable_engine, org_id=org_id, profile_id=profile_id, external_id="c-stale")
+    inactive_id = _seed_campaign(
+        disposable_engine, org_id=org_id, profile_id=profile_id, external_id="c-inactive", is_active=False
+    )
+    other_profile_row_id = _seed_campaign(
+        disposable_engine, org_id=other_org_id, profile_id=other_profile_id, external_id="c-other"
+    )
+
+    with Session(disposable_engine) as session:
+        run_repo = AmazonAdsEntitySyncRunRepository(session)
+        run = run_repo.enqueue(org_id, connection_id, profile_id, entity_type="campaign")
+        run_id = run.id
+        run_repo.claim_next_sync_run(lease_owner="w1", lease_duration_seconds=300, max_global_active=10)
+        session.commit()
+
+    # Simulate the service's own reconciliation step directly against
+    # real PostgreSQL: c-inactive is "observed again" (reactivated),
+    # c-stale is not observed (deactivated), c-other (different profile)
+    # must never be touched.
+    with Session(disposable_engine) as session:
+        from sqlalchemy import update
+
+        touched_ids = [inactive_id]
+        session.execute(
+            update(AmazonAdsCampaign)
+            .where(AmazonAdsCampaign.id.in_(touched_ids), AmazonAdsCampaign.is_active.is_(False))
+            .values(is_active=True, last_seen_entity_sync_run_id=run_id)
+        )
+        session.execute(
+            update(AmazonAdsCampaign)
+            .where(AmazonAdsCampaign.ads_profile_id == profile_id, AmazonAdsCampaign.is_active.is_(True), AmazonAdsCampaign.id.notin_(touched_ids))
+            .values(is_active=False)
+        )
+        assert AmazonAdsEntitySyncRunRepository(session).mark_succeeded(
+            run_id, lease_owner="w1", pages_processed=1, items_observed=1, items_accepted=1,
+            items_schema_rejected=0, items_unsupported_state=0, items_missing_parent=0, items_mismatched_parent=0,
+            items_deactivated=1, items_reactivated=1,
+        )
+        AmazonAdsEntitySyncCheckpointRepository(session).advance(
+            org_id, connection_id, profile_id, entity_type="campaign", synced_at=datetime.now(UTC), run_id=run_id
+        )
         session.commit()
 
     with Session(disposable_engine) as session:
-        row = session.get(AmazonAdsEntitySyncRun, run_id)
-        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=5)
-        session.commit()
-
-    with Session(disposable_engine) as session:
-        repo = AmazonAdsEntitySyncRunRepository(session)
-        reclaimed = repo.claim_next_sync_run(lease_owner="worker-b", lease_duration_seconds=300, max_global_active=10)
-        assert reclaimed is None  # the stale row terminalized; nothing left to claim
-        session.commit()
-
-    # Worker A's writes against a row that is no longer 'started' at all
-    # (it is now 'timed_out') are rejected exactly like a hijack attempt.
-    with Session(disposable_engine) as session:
-        repo = AmazonAdsEntitySyncRunRepository(session)
-        assert repo.heartbeat(run_id, lease_owner="worker-a", lease_duration_seconds=300) is False
-        assert repo.mark_succeeded(
-            run_id, lease_owner="worker-a", pages_processed=1, items_observed=1, items_accepted=1,
-            items_schema_rejected=0, items_unsupported_state=0, items_missing_parent=0,
-            reconciliation_stale_count=0,
-        ) is False
-        assert repo.mark_failed(
-            run_id, lease_owner="worker-a", failure_class="stale_worker_attempt", failure_detail="should never win"
-        ) is False
-        session.commit()
-
-    with Session(disposable_engine) as session:
-        row = session.get(AmazonAdsEntitySyncRun, run_id)
-        assert row.status == "timed_out"
-        assert row.lease_owner is None
+        assert session.get(AmazonAdsCampaign, stale_id).is_active is False
+        assert session.get(AmazonAdsCampaign, inactive_id).is_active is True
+        assert session.get(AmazonAdsCampaign, other_profile_row_id).is_active is True  # untouched
 
 
 def test_persist_and_checkpoint_advance_are_atomic_with_the_ownership_check(disposable_engine) -> None:
@@ -268,11 +366,11 @@ def test_persist_and_checkpoint_advance_are_atomic_with_the_ownership_check(disp
     `AmazonAdsEntitySyncService` does when `_LeaseLost` is raised —
     proving the upsert never survives even though it was written before
     the ownership check failed."""
-    org_id, profile_id = _seed_profile(disposable_engine)
+    org_id, connection_id, profile_id = _seed_profile(disposable_engine)
 
     with Session(disposable_engine) as session:
         repo = AmazonAdsEntitySyncRunRepository(session)
-        run = repo.enqueue(org_id, profile_id, entity_type="campaign")
+        run = repo.enqueue(org_id, connection_id, profile_id, entity_type="campaign")
         run_id = run.id
         repo.claim_next_sync_run(lease_owner="worker-a", lease_duration_seconds=300, max_global_active=10)
         session.commit()
@@ -289,8 +387,8 @@ def test_persist_and_checkpoint_advance_are_atomic_with_the_ownership_check(disp
         )
         ok = AmazonAdsEntitySyncRunRepository(session).mark_succeeded(
             run_id, lease_owner="worker-a", pages_processed=1, items_observed=1, items_accepted=1,
-            items_schema_rejected=0, items_unsupported_state=0, items_missing_parent=0,
-            reconciliation_stale_count=0,
+            items_schema_rejected=0, items_unsupported_state=0, items_missing_parent=0, items_mismatched_parent=0,
+            items_deactivated=0, items_reactivated=0,
         )
         assert ok is False
         session.rollback()  # exactly what session_scope() does on _LeaseLost

@@ -1,23 +1,40 @@
 """Amazon Ads Sponsored Products hierarchy synchronization — PR B2.
 
 Fetches one entity type's full snapshot (campaigns, ad groups, product
-ads, keywords, or product targets) via bounded pagination, resolves
-each item's hierarchy parent(s) against already-persisted local rows,
-and persists the accepted snapshot in a single atomic transaction —
-never a page-by-page write. This mirrors `ads_report_service.py`'s own
-fetch-then-atomically-persist shape (see that module's docstring), with
-one deliberate simplification in lease recovery: see
-`app.persistence.repositories.AmazonAdsEntitySyncRunRepository`'s own
-docstring for why a stale entity-sync lease always terminalizes to
-`timed_out` rather than Reporting v3's resumable/terminal split.
+ads, keywords, or product targets) via bounded pagination against the
+five B1 list endpoints — POST requests carrying only filter/pagination
+bodies, read-only in effect despite the HTTP verb (blueprint §10/§11;
+"GET-based" was an inaccurate shorthand used in this module's first
+pass, corrected during final review) — resolves each item's hierarchy
+parent(s) against already-persisted local rows, verifies those parents
+are actually coherent with each other (not merely independently
+resolvable — see `_resolve_parents`), and persists the accepted
+snapshot in a single atomic transaction — never a page-by-page write.
+This mirrors `ads_report_service.py`'s own fetch-then-atomically-
+persist shape, with one deliberate simplification in lease recovery:
+see `AmazonAdsEntitySyncRunRepository`'s own docstring for why a stale
+entity-sync lease always terminalizes to `timed_out` rather than
+Reporting v3's resumable/terminal split.
+
+A run's terminal status is `'succeeded'` ONLY when every observed item
+was schema-valid, in a supported state, and had a fully coherent parent
+chain — any schema rejection, unsupported state, missing parent, or
+mismatched parent makes the run `'partial'` instead (final review: the
+first pass allowed a partial run to be marked `'succeeded'` and to
+advance the checkpoint, contradicting the B2 contract). Only a clean
+`'succeeded'` run ever advances the checkpoint or runs reconciliation
+(reversible active/inactive tracking on the entity tables themselves —
+see `_persist_snapshot`); a `'partial'` run persists whatever it safely
+can but leaves both alone.
 
 Never logs or persists a pagination token, an access/refresh token, a
 raw response body, a campaign/ad-group name, a targeting expression, a
 search term, or a seller identifier — `failure_detail` is always
 `str(exception)` for one of this module's own typed exceptions or one
-of `app.core.exceptions`'s `Ads*` exceptions, none of which are ever
-constructed with secret- or entity-shaped text.
-"""
+of `app.core.exceptions`'s `Ads*` exceptions (both are always
+constructed with sanitized, non-secret, non-entity-shaped text), or a
+fixed diagnostic string for a broad/unexpected exception (LWA token
+refresh) whose own message is not trusted to be safe to persist."""
 
 from __future__ import annotations
 
@@ -29,7 +46,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, update
 
 from app.amazon.ads_client import AdsRequestContext, AmazonAdsApiClient, EntityParseResult
 from app.amazon.ads_lwa_token import refresh_ads_access_token
@@ -108,7 +125,7 @@ class _FetchResult:
 @dataclass(frozen=True)
 class EntitySyncOutcome:
     run_id: UUID
-    outcome: str  # "succeeded" | "retrying" | "failed" | "no_job" | "lease_lost"
+    outcome: str  # "succeeded" | "partial" | "retrying" | "failed" | "no_job" | "lease_lost"
     pages_processed: int = 0
     items_accepted: int = 0
 
@@ -262,11 +279,24 @@ class AmazonAdsEntitySyncService:
         self._lease_owner = lease_owner
 
     def enqueue_sync_request(self, *, organization_id: UUID, ads_profile_id: UUID, entity_type: str) -> UUID:
+        """Validates that `ads_profile_id` actually belongs to
+        `organization_id` before creating anything — resolves its
+        connection here too, so the resulting run's full scope
+        `(organization_id, ads_connection_id, ads_profile_id,
+        entity_type)` is established at creation time, never inferred
+        or trusted from a caller later. Raises `ValueError` for an
+        unknown entity type or an unowned/nonexistent profile; creates
+        no row in either case."""
         if entity_type not in ENTITY_TYPES:
             raise ValueError(f"Unknown Amazon Ads entity type: {entity_type!r}")
         with session_scope() as session:
+            profile = AmazonAdsProfileRepository(session).get_owned(organization_id, ads_profile_id)
+            if profile is None:
+                raise ValueError(
+                    f"Amazon Ads profile {ads_profile_id} does not belong to organization {organization_id}."
+                )
             run = AmazonAdsEntitySyncRunRepository(session).enqueue(
-                organization_id, ads_profile_id, entity_type=entity_type
+                organization_id, profile.connection_id, ads_profile_id, entity_type=entity_type
             )
             return run.id
 
@@ -296,12 +326,15 @@ class AmazonAdsEntitySyncService:
                 return EntitySyncOutcome(run_id=UUID(int=0), outcome="no_job")
             run_id = run.id
             organization_id = run.organization_id
+            ads_connection_id = run.ads_connection_id
             ads_profile_id = run.ads_profile_id
             entity_type = run.entity_type
             attempt_count = run.attempt_count
 
         try:
-            return await self._process_claimed(run_id, organization_id, ads_profile_id, entity_type, attempt_count)
+            return await self._process_claimed(
+                run_id, organization_id, ads_connection_id, ads_profile_id, entity_type, attempt_count
+            )
         except _LeaseLost:
             logger.info(
                 "ads entity sync run lost its lease to another worker before this attempt finished run_id=%s",
@@ -310,7 +343,13 @@ class AmazonAdsEntitySyncService:
             return EntitySyncOutcome(run_id=run_id, outcome="lease_lost")
 
     async def _process_claimed(
-        self, run_id: UUID, organization_id: UUID, ads_profile_id: UUID, entity_type: str, attempt_count: int
+        self,
+        run_id: UUID,
+        organization_id: UUID,
+        ads_connection_id: UUID,
+        ads_profile_id: UUID,
+        entity_type: str,
+        attempt_count: int,
     ) -> EntitySyncOutcome:
         config = _ENTITY_CONFIG[entity_type]
 
@@ -367,10 +406,18 @@ class AmazonAdsEntitySyncService:
                 token_url=self._cfg.ads_lwa_token_url,
                 timeout_seconds=self._cfg.ads_api_timeout_seconds,
             )
-        except Exception as exc:
+        except Exception:
+            # Deliberately NOT `str(exc)` — an unexpected/broad exception
+            # from the underlying HTTP/LWA client is not this codebase's
+            # own sanitized exception type, so its message is not trusted
+            # to be free of secret- or request-shaped text. A fixed
+            # diagnostic string is persisted instead; the real exception
+            # is available in-process only, never written to failure_detail,
+            # amazon_ads_sync_errors, or any log line.
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
-                failure_class="token_refresh_failed", detail=str(exc),
+                failure_class="token_refresh_failed",
+                detail="Amazon Ads LWA token refresh failed (see run_id for correlation).",
             )
 
         ctx = AdsRequestContext(
@@ -428,7 +475,7 @@ class AmazonAdsEntitySyncService:
             )
 
         return await self._persist_snapshot(
-            run_id, organization_id, ads_profile_id, entity_type, config, fetch_result
+            run_id, organization_id, ads_connection_id, ads_profile_id, entity_type, config, fetch_result
         )
 
     async def _fetch_all_pages(
@@ -488,59 +535,111 @@ class AmazonAdsEntitySyncService:
             total_unsupported_state=total_unsupported_state,
         )
 
+    def _resolve_parents(
+        self, session, organization_id: UUID, ads_profile_id: UUID, config: _EntityConfig, dto
+    ) -> str:
+        """Returns `"ok"`, `"missing"`, or `"mismatched"` — never persists
+        anything itself. `"missing"`: at least one referenced parent does
+        not exist locally at all (ordinary and expected before that
+        parent entity type has ever been synced). `"mismatched"`: BOTH
+        parents were found independently, but the resolved ad group does
+        not actually belong to the resolved campaign — final review's
+        Blocker 1: the first pass resolved `campaign_row` and
+        `ad_group_row` independently and never checked this, so a
+        product ad/keyword/target could be persisted under a campaign it
+        was never actually part of. Every check here is scoped
+        explicitly by `ads_profile_id` (the tenant/profile isolation
+        boundary this codebase already establishes) and defensively
+        re-asserts `organization_id`, even though the repository lookups
+        already imply it, per the review's explicit request."""
+        if config.parent_kind is None:
+            return "ok"
+
+        campaign_repo = AmazonAdsCampaignRepository(session)
+        campaign_row = campaign_repo.get_by_external_id(ads_profile_id, dto.campaign_id)
+        if campaign_row is None:
+            return "missing"
+        if campaign_row.organization_id != organization_id or campaign_row.ads_profile_id != ads_profile_id:
+            return "missing"  # defense-in-depth; repository scoping already prevents this
+        if campaign_row.external_campaign_id != dto.campaign_id:
+            return "missing"  # defense-in-depth; fetched by this exact value
+
+        if config.parent_kind == "campaign":
+            return "ok"
+
+        ad_group_repo = AmazonAdsAdGroupRepository(session)
+        ad_group_row = ad_group_repo.get_by_external_id(ads_profile_id, dto.ad_group_id)
+        if ad_group_row is None:
+            return "missing"
+        if ad_group_row.organization_id != organization_id or ad_group_row.ads_profile_id != ads_profile_id:
+            return "missing"  # defense-in-depth
+        if ad_group_row.external_ad_group_id != dto.ad_group_id:
+            return "missing"  # defense-in-depth
+
+        # The check the first pass was missing: both parents resolved
+        # independently is not proof they belong together.
+        if ad_group_row.ads_campaign_id != campaign_row.id:
+            return "mismatched"
+
+        return "ok"
+
+    def _upsert_with_parents(
+        self, session, organization_id: UUID, ads_profile_id: UUID, config: _EntityConfig, dto
+    ):
+        """Called only after `_resolve_parents` has returned `"ok"` for
+        this exact `dto` — re-resolves the same rows (cheap, indexed
+        lookups; keeps this method free of any trust in a caller having
+        checked correctly, since it independently reproduces the
+        resolution rather than accepting pre-fetched rows as arguments)."""
+        data = config.fields(dto)
+        if config.parent_kind is None:
+            return config.repo_cls(session).upsert(organization_id, ads_profile_id, data)
+
+        campaign_row = AmazonAdsCampaignRepository(session).get_by_external_id(ads_profile_id, dto.campaign_id)
+        if config.parent_kind == "campaign":
+            return config.repo_cls(session).upsert(organization_id, ads_profile_id, campaign_row.id, data)
+
+        ad_group_row = AmazonAdsAdGroupRepository(session).get_by_external_id(ads_profile_id, dto.ad_group_id)
+        return config.repo_cls(session).upsert(
+            organization_id, ads_profile_id, campaign_row.id, ad_group_row.id, data
+        )
+
     async def _persist_snapshot(
         self,
         run_id: UUID,
         organization_id: UUID,
+        ads_connection_id: UUID,
         ads_profile_id: UUID,
         entity_type: str,
         config: _EntityConfig,
         fetch_result: _FetchResult,
     ) -> EntitySyncOutcome:
         """The one and only database transaction this service performs
-        per run: idempotent upserts for every item whose parent(s)
-        resolved successfully, snapshot reconciliation counting, fenced
-        completion, and checkpoint advance — all atomic. If this
-        worker's lease was lost at any point, the fenced `mark_succeeded`
+        per run: coherent-parent-checked, idempotent upserts for every
+        eligible item, a clean/partial terminal-status decision, fenced
+        completion, and — ONLY on a clean run — reversible reconciliation
+        and checkpoint advance. All atomic: if this worker's lease was
+        lost at any point, the fenced `mark_succeeded`/`mark_partial`
         below affects zero rows and `_LeaseLost` rolls back the entire
         transaction, so a stale worker never persists partial hierarchy
-        data or advances the checkpoint (mirrors `ads_report_service.
-        _download_and_ingest`'s own guarantee)."""
+        data, never deactivates/reactivates anything, and never advances
+        the checkpoint (mirrors `ads_report_service._download_and_ingest`'s
+        own guarantee)."""
         items_missing_parent = 0
+        items_mismatched_parent = 0
         items_persisted = 0
         touched_ids: list = []
 
         with session_scope() as session:
-            repo = config.repo_cls(session)
-            campaign_repo = AmazonAdsCampaignRepository(session) if config.parent_kind else None
-            ad_group_repo = (
-                AmazonAdsAdGroupRepository(session) if config.parent_kind == "campaign_and_ad_group" else None
-            )
-
             for dto in fetch_result.items:
-                data = config.fields(dto)
-                if config.parent_kind is None:
-                    row = repo.upsert(organization_id, ads_profile_id, data)
-                    touched_ids.append(row.id)
-                    items_persisted += 1
-                    continue
-
-                campaign_row = campaign_repo.get_by_external_id(ads_profile_id, dto.campaign_id)
-                if campaign_row is None:
+                resolution = self._resolve_parents(session, organization_id, ads_profile_id, config, dto)
+                if resolution == "missing":
                     items_missing_parent += 1
                     continue
-
-                if config.parent_kind == "campaign":
-                    row = repo.upsert(organization_id, ads_profile_id, campaign_row.id, data)
-                    touched_ids.append(row.id)
-                    items_persisted += 1
+                if resolution == "mismatched":
+                    items_mismatched_parent += 1
                     continue
-
-                ad_group_row = ad_group_repo.get_by_external_id(ads_profile_id, dto.ad_group_id)
-                if ad_group_row is None:
-                    items_missing_parent += 1
-                    continue
-                row = repo.upsert(organization_id, ads_profile_id, campaign_row.id, ad_group_row.id, data)
+                row = self._upsert_with_parents(session, organization_id, ads_profile_id, config, dto)
                 touched_ids.append(row.id)
                 items_persisted += 1
 
@@ -550,24 +649,83 @@ class AmazonAdsEntitySyncService:
                     error_code="entity_sync_missing_parent",
                     error_message=f"entity_type={entity_type} missing_parent_count={items_missing_parent}",
                 )
+            if items_mismatched_parent:
+                AmazonAdsSyncErrorRepository(session).record(
+                    organization_id, ads_profile_id,
+                    error_code="entity_sync_mismatched_parent",
+                    error_message=f"entity_type={entity_type} mismatched_parent_count={items_mismatched_parent}",
+                )
 
-            # Reconciliation identifies rows NOT touched by this run's own
-            # upserts — deliberately an explicit id-membership check
-            # against `touched_ids`, not a `last_seen_at` timestamp
-            # comparison. A timestamp comparison would require a single
-            # consistent "before this run" reference point across two
-            # different clocks (this Python process and the database
-            # server) and, worse, across two different SQL dialects in
-            # test vs. production; an id-membership check needs neither
-            # and is exact by construction. Never mutates or deletes the
-            # stale rows themselves — pure counting, per the blueprint's
-            # own read-only guarantee.
+            # Clean success requires EVERY observed item to have been
+            # schema-valid, in a supported state, AND coherently parented
+            # — final review's Blocker 2: the first pass marked the run
+            # 'succeeded' (and advanced the checkpoint) regardless of
+            # rejection/missing/mismatched counts. Any of these nonzero
+            # makes the run 'partial': persisted (what could safely be
+            # persisted was), but never a clean success, and — critically
+            # — reconciliation and the checkpoint are both skipped below.
+            is_clean = (
+                fetch_result.total_schema_rejected == 0
+                and fetch_result.total_unsupported_state == 0
+                and items_missing_parent == 0
+                and items_mismatched_parent == 0
+            )
+
+            if not is_clean:
+                if not AmazonAdsEntitySyncRunRepository(session).mark_partial(
+                    run_id,
+                    lease_owner=self._lease_owner,
+                    pages_processed=fetch_result.pages_processed,
+                    items_observed=fetch_result.total_observed,
+                    items_accepted=items_persisted,
+                    items_schema_rejected=fetch_result.total_schema_rejected,
+                    items_unsupported_state=fetch_result.total_unsupported_state,
+                    items_missing_parent=items_missing_parent,
+                    items_mismatched_parent=items_mismatched_parent,
+                ):
+                    raise _LeaseLost()
+                logger.info(
+                    "ads entity sync partial run_id=%s entity_type=%s pages=%s accepted=%s "
+                    "missing_parent=%s mismatched_parent=%s",
+                    run_id, entity_type, fetch_result.pages_processed, items_persisted,
+                    items_missing_parent, items_mismatched_parent,
+                )
+                return EntitySyncOutcome(
+                    run_id=run_id,
+                    outcome="partial",
+                    pages_processed=fetch_result.pages_processed,
+                    items_accepted=items_persisted,
+                )
+
+            # Reversible snapshot-activity reconciliation — final
+            # review's Blocker 3: the first pass only counted untouched
+            # rows (observability), never actually reactivated or
+            # deactivated anything. This never mutates or deletes
+            # Amazon's own `state` column; `is_active` is this
+            # application's own snapshot-membership signal. Runs ONLY
+            # here, inside the clean-success branch — never for a
+            # disabled gate, a partial result, a pagination failure, a
+            # lease loss, a retry, or a contract mismatch.
             model = config.repo_cls.model
-            base_filter = model.ads_profile_id == ads_profile_id
-            stale_filter = base_filter if not touched_ids else and_(base_filter, model.id.notin_(touched_ids))
-            reconciliation_stale_count = session.execute(
-                select(func.count()).select_from(model).where(stale_filter)
-            ).scalar_one()
+            items_reactivated = 0
+            if touched_ids:
+                items_reactivated = session.execute(
+                    update(model)
+                    .where(model.id.in_(touched_ids), model.is_active.is_(False))
+                    .values(is_active=True, last_seen_entity_sync_run_id=run_id)
+                ).rowcount
+                session.execute(
+                    update(model)
+                    .where(model.id.in_(touched_ids), model.is_active.is_(True))
+                    .values(last_seen_entity_sync_run_id=run_id)
+                )
+
+            deactivate_conditions = [model.ads_profile_id == ads_profile_id, model.is_active.is_(True)]
+            if touched_ids:
+                deactivate_conditions.append(model.id.notin_(touched_ids))
+            items_deactivated = session.execute(
+                update(model).where(and_(*deactivate_conditions)).values(is_active=False)
+            ).rowcount
 
             if not AmazonAdsEntitySyncRunRepository(session).mark_succeeded(
                 run_id,
@@ -575,21 +733,25 @@ class AmazonAdsEntitySyncService:
                 pages_processed=fetch_result.pages_processed,
                 items_observed=fetch_result.total_observed,
                 items_accepted=items_persisted,
-                items_schema_rejected=fetch_result.total_schema_rejected,
-                items_unsupported_state=fetch_result.total_unsupported_state,
-                items_missing_parent=items_missing_parent,
-                reconciliation_stale_count=int(reconciliation_stale_count),
+                items_schema_rejected=0,
+                items_unsupported_state=0,
+                items_missing_parent=0,
+                items_mismatched_parent=0,
+                items_deactivated=int(items_deactivated),
+                items_reactivated=int(items_reactivated),
             ):
                 raise _LeaseLost()
 
             AmazonAdsEntitySyncCheckpointRepository(session).advance(
-                organization_id, ads_profile_id,
+                organization_id, ads_connection_id, ads_profile_id,
                 entity_type=entity_type, synced_at=datetime.now(UTC), run_id=run_id,
             )
 
         logger.info(
-            "ads entity sync succeeded run_id=%s entity_type=%s pages=%s accepted=%s missing_parent=%s",
-            run_id, entity_type, fetch_result.pages_processed, items_persisted, items_missing_parent,
+            "ads entity sync succeeded run_id=%s entity_type=%s pages=%s accepted=%s "
+            "deactivated=%s reactivated=%s",
+            run_id, entity_type, fetch_result.pages_processed, items_persisted,
+            items_deactivated, items_reactivated,
         )
         return EntitySyncOutcome(
             run_id=run_id,
