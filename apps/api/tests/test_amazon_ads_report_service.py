@@ -225,7 +225,17 @@ async def test_terminal_amazon_failure_status_schedules_retry_then_eventually_fa
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_status_check_waits_and_retries_without_failing_the_job(monkeypatch) -> None:
+async def test_rate_limited_status_check_releases_the_lease_instead_of_sleeping_in_process(monkeypatch) -> None:
+    """PR A2's second review: a worker must never sleep in-process
+    through a rate-limited poll while still holding the lease — Amazon's
+    Retry-After could exceed the lease duration, letting another worker
+    reclaim the job mid-sleep. This invocation must release the lease
+    immediately (outcome='retrying', status='waiting_to_retry') and
+    perform exactly one poll call, with no further poll, download, or
+    create in the same invocation — resumption by a later claim is
+    proven separately (test_crash_after_create_then_resume_never_
+    issues_a_second_create and the Retry-After-exceeds-lease-duration
+    test below)."""
     monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
     connection_id, profile_id, secrets = _connected_profile()
 
@@ -253,9 +263,18 @@ async def test_rate_limited_status_check_waits_and_retries_without_failing_the_j
     run_id = service.create_report_request(
         organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2026, 9, 1), end_date=date(2026, 9, 1)
     )
-    outcome = await service.process_one_claimed_job()
-    assert outcome.outcome == "succeeded"
-    assert client.calls.count("get_report_status") == 2
+    first_outcome = await service.process_one_claimed_job()
+
+    assert first_outcome.outcome == "retrying"
+    assert client.calls.count("get_report_status") == 1  # never a second poll in the same invocation
+    assert client.calls.count("create_report") == 1
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run.status == "waiting_to_retry"
+        assert run.lease_owner is None  # lease released, not held through the delay
+        assert run.failure_class == "report_poll_rate_limited"
+        assert run.amazon_report_id == "r-1"  # preserved for resumption
+    assert client.calls.count("download_report") == 0  # never reached download in this invocation
 
 
 # --- HTTP 425 duplicate/in-flight report (a real production run hit a

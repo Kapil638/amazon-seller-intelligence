@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import random
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import InvalidOperation
@@ -41,8 +43,10 @@ from app.amazon.ads_models import AdsReportConfigurationBody, AdsReportRequestCo
 from app.amazon.secrets import SecretNotFoundError, SecretProvider
 from app.core.config import Settings
 from app.core.exceptions import (
+    AdsApiAuthenticationError,
     AdsApiDuplicateReportError,
     AdsApiInvalidRequestError,
+    AdsApiParseFailedError,
     AdsApiRateLimitedError,
     AdsApiRequestFailedError,
     AdsReportFailedError,
@@ -67,8 +71,62 @@ _TERMINAL_FAILURE_STATUSES = frozenset({"CANCELLED", "FAILURE"})
 @dataclass(frozen=True)
 class ReportJobOutcome:
     report_run_id: UUID
-    outcome: str  # "succeeded" | "retrying" | "failed" | "no_job"
+    outcome: str  # "succeeded" | "retrying" | "failed" | "no_job" | "lease_lost"
     records_ingested: int = 0
+
+
+class _LeaseLost(Exception):
+    """Internal-only concurrency-control signal — mirrors
+    `app.amazon.listings_ingestion`'s own `_ClaimFailure`. Raised when a
+    fenced repository mutation's compare-and-set (`status=='started'
+    AND lease_owner==this worker's own lease_owner AND lease_expires_at
+    > now()`) affected zero rows: this worker's lease already expired
+    and another worker has since claimed the row. Never one of
+    `app.core.exceptions`'s `Ads*` exceptions — this is not an Amazon
+    API failure, it is this process losing a race for a database row it
+    no longer owns. Always raised from inside an open `session_scope()`
+    block, whose rollback-on-exception behavior is what makes the
+    ownership check atomic with any dependent writes (fact upserts,
+    checkpoint advance) staged earlier in that same transaction — see
+    `_download_and_ingest`. Caught exactly once, in
+    `process_one_claimed_job`, and converted to `outcome='lease_lost'`;
+    never allowed to propagate further."""
+
+
+def _validate_retry_after(retry_after_seconds: float | None, *, max_seconds: float) -> float | None:
+    """A `Retry-After`-shaped value is untrusted external input — either
+    literally from Amazon, or defensively parsed from an undocumented
+    425 response body (see `AdsApiDuplicateReportError`) — and must
+    never be allowed to become an unbounded (or nonsensical) delay.
+    Returns a validated, capped value, or `None` for anything missing,
+    non-numeric, non-finite, or negative — `None` means "the caller
+    should fall back to its own computed default/backoff," never
+    "wait forever." Applied identically everywhere a Retry-After-shaped
+    value can reach a retry decision: create/poll/download rate
+    limiting and the unresolved-425 duplicate-create path."""
+    if retry_after_seconds is None:
+        return None
+    try:
+        value = float(retry_after_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return min(value, max_seconds)
+
+
+def compute_backoff_delay(
+    attempt_count: int, *, base_seconds: float, max_seconds: float, rng: "random.Random | None" = None
+) -> float:
+    """Full-jitter exponential backoff: `random(0, min(max, base * 2^n))`.
+    Bounded by `max_seconds` regardless of how large `attempt_count`
+    grows, so a long-failing job never waits unboundedly long between
+    retries. `rng` is injectable for deterministic tests; defaults to
+    the module-level `random` functions."""
+    capped = min(max_seconds, base_seconds * (2 ** max(attempt_count, 0)))
+    if rng is not None:
+        return rng.uniform(0, capped)
+    return random.uniform(0, capped)
 
 
 def report_name_for_run(report_run_id: UUID, start_date: date, end_date: date) -> str:
@@ -125,12 +183,53 @@ class AmazonAdsReportService:
             )
             return run.id
 
+    async def _renew_lease_or_raise(self, run_id: UUID) -> None:
+        """Fenced pre-call gate: called immediately before every external
+        call this service makes (LWA token refresh, create_report,
+        get_report_status, download_report). Confirms this worker still
+        owns the row's lease AND extends it by a full lease duration, so
+        the upcoming call has a safe window before natural expiry could
+        occur mid-request — `ads_api_timeout_seconds` is validated at
+        startup to be safely below `ads_report_lease_duration_seconds`
+        (see `Settings._validate_ads_report_timeout_within_lease_
+        duration`), so a single call's own timeout can never itself
+        outlast the lease this renewal just granted.
+
+        Raises `_LeaseLost` immediately — making ZERO external calls —
+        if renewal fails, i.e. this worker's lease was already lost to
+        another claim. This is what prevents the specific race a fenced
+        *post-call* write alone cannot: without this, a stale worker
+        could still issue a duplicate `create_report` against Amazon
+        even though its later database write would correctly be
+        rejected — the external side effect would already be done and
+        cannot be undone by rejecting the write. This does not close
+        every gap (ownership can still change while the network request
+        itself is in flight; that residual case is exactly what the
+        fenced *post-call* write, and PR #35's HTTP 425 duplicate-report
+        handling, exist for) — it closes the specific, avoidable one
+        where this worker enters the call already knowing it does not
+        own the lease."""
+        with session_scope() as session:
+            if not AmazonAdsReportRunRepository(session).heartbeat(
+                run_id, lease_owner=self._lease_owner, lease_duration_seconds=self._cfg.ads_report_lease_duration_seconds
+            ):
+                raise _LeaseLost()
+
     async def process_one_claimed_job(self) -> ReportJobOutcome:
         """Claim exactly one eligible job and drive it to a terminal or
         retry-scheduled state. Never claims/starts a second job for the
         same profile concurrently (see `claim_next_report_job`'s
         per-profile cap) and never enqueues/starts anything itself — the
-        caller (a future Ads worker, or a test) decides when this runs."""
+        caller (a future Ads worker, or a test) decides when this runs.
+
+        `_LeaseLost` is caught exactly once, here — every write this
+        service performs after claiming goes through a fenced repository
+        method keyed on `(status=='started', lease_owner==self._lease_
+        owner)`, so if this worker's lease expired and another worker
+        reclaimed the row anywhere along the way (including mid-sleep
+        during a rate-limited poll — see `_poll_until_terminal`), that
+        surfaces here as `outcome='lease_lost'` rather than this stale
+        worker silently overwriting the new owner's state."""
         with session_scope() as session:
             run = AmazonAdsReportRunRepository(session).claim_next_report_job(
                 lease_owner=self._lease_owner,
@@ -147,6 +246,26 @@ class AmazonAdsReportService:
             amazon_report_id = run.amazon_report_id
             attempt_count = run.attempt_count
 
+        try:
+            return await self._process_claimed(
+                run_id, organization_id, ads_profile_id, start_date, end_date, amazon_report_id, attempt_count
+            )
+        except _LeaseLost:
+            logger.info(
+                "ads report run lost its lease to another worker before this attempt finished run_id=%s", run_id
+            )
+            return ReportJobOutcome(report_run_id=run_id, outcome="lease_lost")
+
+    async def _process_claimed(
+        self,
+        run_id: UUID,
+        organization_id: UUID,
+        ads_profile_id: UUID,
+        start_date: date,
+        end_date: date,
+        amazon_report_id: str | None,
+        attempt_count: int,
+    ) -> ReportJobOutcome:
         # Resolve the profile's connection/token outside any transaction —
         # the LWA refresh + Ads HTTP calls below never run while a
         # database transaction is open.
@@ -155,15 +274,19 @@ class AmazonAdsReportService:
 
             profile = AmazonAdsProfileRepository(session).get_owned(organization_id, ads_profile_id)
             if profile is None:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="profile_missing", failure_detail="Advertiser profile no longer exists."
-                )
+                if not AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, lease_owner=self._lease_owner,
+                    failure_class="profile_missing", failure_detail="Advertiser profile no longer exists.",
+                ):
+                    raise _LeaseLost()
                 return ReportJobOutcome(report_run_id=run_id, outcome="failed")
             connection = AmazonAdsConnectionRepository(session).get_by_id(organization_id, profile.connection_id)
             if connection is None or not connection.token_reference:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="connection_missing", failure_detail="Amazon Ads connection is not authorized."
-                )
+                if not AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, lease_owner=self._lease_owner,
+                    failure_class="connection_missing", failure_detail="Amazon Ads connection is not authorized.",
+                ):
+                    raise _LeaseLost()
                 return ReportJobOutcome(report_run_id=run_id, outcome="failed")
             token_reference = connection.token_reference
             region = profile.region
@@ -173,10 +296,19 @@ class AmazonAdsReportService:
             refresh_token = self._secrets.get_secret(token_reference)
         except SecretNotFoundError:
             with session_scope() as session:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="secret_missing", failure_detail="Stored Ads refresh token was not found."
-                )
+                if not AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, lease_owner=self._lease_owner,
+                    failure_class="secret_missing", failure_detail="Stored Ads refresh token was not found.",
+                ):
+                    raise _LeaseLost()
             return ReportJobOutcome(report_run_id=run_id, outcome="failed")
+
+        # Fenced renewal immediately before the LWA call — "where
+        # practical" per the pre-call-gating requirement: this is an
+        # external network call like the Ads API calls below, so it is
+        # gated the same way, even though it carries no Amazon-side
+        # side effect of its own worth preventing a duplicate of.
+        await self._renew_lease_or_raise(run_id)
 
         try:
             access_token_response = await refresh_ads_access_token(
@@ -200,6 +332,14 @@ class AmazonAdsReportService:
             correlation_id=str(run_id),
         )
 
+        if not amazon_report_id:
+            # The critical pre-call gate: create_report is the one call
+            # in this service whose external side effect (a new Amazon
+            # report) cannot be undone by rejecting this worker's later
+            # database write — see _renew_lease_or_raise's own docstring.
+            # Raises _LeaseLost (making zero calls, including this one)
+            # if this worker's lease was already lost.
+            await self._renew_lease_or_raise(run_id)
         try:
             if not amazon_report_id:
                 created = await self._client.create_report(
@@ -219,9 +359,11 @@ class AmazonAdsReportService:
                 )
                 amazon_report_id = created.report_id
                 with session_scope() as session:
-                    AmazonAdsReportRunRepository(session).set_amazon_report(
-                        run_id, amazon_report_id=amazon_report_id, amazon_report_status=created.status
-                    )
+                    if not AmazonAdsReportRunRepository(session).set_amazon_report(
+                        run_id, lease_owner=self._lease_owner,
+                        amazon_report_id=amazon_report_id, amazon_report_status=created.status,
+                    ):
+                        raise _LeaseLost()
                 if created.status == _TERMINAL_SUCCESS and created.url:
                     return await self._download_and_ingest(
                         run_id, organization_id, ads_profile_id, ctx, created.url
@@ -242,9 +384,11 @@ class AmazonAdsReportService:
                 # two imperfect options, not a confirmed contract.)
                 amazon_report_id = exc.existing_report_id
                 with session_scope() as session:
-                    AmazonAdsReportRunRepository(session).set_amazon_report(
-                        run_id, amazon_report_id=amazon_report_id, amazon_report_status="PENDING"
-                    )
+                    if not AmazonAdsReportRunRepository(session).set_amazon_report(
+                        run_id, lease_owner=self._lease_owner,
+                        amazon_report_id=amazon_report_id, amazon_report_status="PENDING",
+                    ):
+                        raise _LeaseLost()
             else:
                 # No id was discoverable in the response (undocumented
                 # schema — see the exception's docstring). Uses a
@@ -267,25 +411,34 @@ class AmazonAdsReportService:
                 # resumability PR.
                 if attempt_count >= self._cfg.ads_report_duplicate_create_max_attempts:
                     with session_scope() as session:
-                        AmazonAdsReportRunRepository(session).mark_failed(
-                            run_id, failure_class="report_create_duplicate_unresolved", failure_detail=str(exc)
-                        )
+                        if not AmazonAdsReportRunRepository(session).mark_failed(
+                            run_id, lease_owner=self._lease_owner,
+                            failure_class="report_create_duplicate_unresolved", failure_detail=str(exc),
+                        ):
+                            raise _LeaseLost()
                         AmazonAdsSyncErrorRepository(session).record(
                             organization_id, ads_profile_id, error_code="report_create_duplicate_unresolved",
                             error_message=str(exc), report_run_id=run_id,
                         )
                     return ReportJobOutcome(report_run_id=run_id, outcome="failed")
-                delay = (
-                    exc.retry_after_seconds
-                    if exc.retry_after_seconds is not None
-                    else self._cfg.ads_report_duplicate_create_retry_seconds
+                # Bounded consistently with every other retry-after path
+                # (create rate-limit, poll, download) — see
+                # _validate_retry_after's own docstring.
+                bounded = _validate_retry_after(
+                    exc.retry_after_seconds, max_seconds=self._cfg.ads_report_retry_after_max_seconds
                 )
+                if bounded is not None:
+                    delay, delay_source = bounded, "retry_after"
+                else:
+                    delay, delay_source = self._cfg.ads_report_duplicate_create_retry_seconds, "duplicate_create_default"
                 next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
+                annotated_detail = f"{exc} [retry_delay_source={delay_source} retry_delay_seconds={delay:.2f}]"
                 with session_scope() as session:
-                    AmazonAdsReportRunRepository(session).mark_retry(
-                        run_id, next_retry_at=next_retry_at,
-                        failure_class="report_create_duplicate_unresolved", failure_detail=str(exc),
-                    )
+                    if not AmazonAdsReportRunRepository(session).mark_retry(
+                        run_id, lease_owner=self._lease_owner, next_retry_at=next_retry_at,
+                        failure_class="report_create_duplicate_unresolved", failure_detail=annotated_detail,
+                    ):
+                        raise _LeaseLost()
                     AmazonAdsSyncErrorRepository(session).record(
                         organization_id, ads_profile_id, error_code="report_create_duplicate_unresolved",
                         error_message=str(exc), report_run_id=run_id,
@@ -299,15 +452,39 @@ class AmazonAdsReportService:
             # lease recovery — this is a real contract/schema error, not
             # a transient condition retrying could ever resolve.
             with session_scope() as session:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="report_create_invalid_request", failure_detail=str(exc)
-                )
+                if not AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, lease_owner=self._lease_owner,
+                    failure_class="report_create_invalid_request", failure_detail=str(exc),
+                ):
+                    raise _LeaseLost()
                 AmazonAdsSyncErrorRepository(session).record(
                     organization_id, ads_profile_id, error_code="report_create_invalid_request",
                     error_message=str(exc), report_run_id=run_id,
                 )
             return ReportJobOutcome(report_run_id=run_id, outcome="failed")
-        except (AdsApiRateLimitedError, AdsApiRequestFailedError) as exc:
+        except AdsApiAuthenticationError as exc:
+            # Distinct, visible terminal classification — a credential/
+            # authorization failure will not resolve itself by retrying
+            # the same request.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_create_authentication_failed", detail=str(exc),
+            )
+        except AdsApiParseFailedError as exc:
+            # Amazon returned a 2xx that this client could not parse as
+            # the documented create/status response shape — a contract
+            # mismatch, not a transient condition.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_create_contract_mismatch", detail=str(exc),
+            )
+        except AdsApiRateLimitedError as exc:
+            return await self._retry_or_fail(
+                run_id, organization_id, ads_profile_id, attempt_count,
+                failure_class="report_create_rate_limited", detail=str(exc),
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+        except AdsApiRequestFailedError as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
                 failure_class="report_create_failed", detail=str(exc),
@@ -325,15 +502,57 @@ class AmazonAdsReportService:
         amazon_report_id: str,
     ) -> ReportJobOutcome:
         for _attempt in range(self._cfg.ads_report_poll_max_attempts):
-            with session_scope() as session:
-                AmazonAdsReportRunRepository(session).heartbeat(
-                    run_id, lease_owner=self._lease_owner, lease_duration_seconds=self._cfg.ads_report_lease_duration_seconds
-                )
+            # Fenced pre-call gate, same as create_report/download_report
+            # — see _renew_lease_or_raise's own docstring. get_report_status
+            # has no Amazon-side side effect of its own to duplicate, but
+            # gating it the same way keeps every external call under this
+            # one consistent rule rather than special-casing polling.
+            await self._renew_lease_or_raise(run_id)
             try:
                 status_response = await self._client.get_report_status(ctx, amazon_report_id)
             except AdsApiRateLimitedError as exc:
-                await asyncio.sleep(exc.retry_after_seconds or self._cfg.ads_report_poll_interval_seconds)
-                continue
+                # Never sleep in-process through a rate limit while
+                # holding the lease: Amazon's Retry-After can exceed
+                # ads_report_lease_duration_seconds, and a worker
+                # sleeping past its own lease is exactly what lets
+                # another worker reclaim this row while the original
+                # invocation is still alive and later resumes writing
+                # under a lease it no longer holds. Release the lease
+                # via the normal retry path instead — the next claim
+                # (by this worker or another) resumes polling the SAME
+                # amazon_report_id (never a second create, since it
+                # remains persisted on the row) after next_retry_at.
+                return await self._retry_or_fail(
+                    run_id, organization_id, ads_profile_id, attempt_count,
+                    failure_class="report_poll_rate_limited", detail=str(exc),
+                    retry_after_seconds=exc.retry_after_seconds,
+                )
+            except AdsApiAuthenticationError as exc:
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_authentication_failed", detail=str(exc),
+                )
+            except AdsApiInvalidRequestError as exc:
+                # Covers both an ordinary malformed poll request AND a
+                # defensively-adopted 425 report id (see
+                # AdsApiDuplicateReportError's docstring) that Amazon's
+                # status endpoint does not actually recognize — either
+                # way this is a permanent condition: the report id this
+                # run is polling is unusable, and retrying the identical
+                # status request will not change that. Terminalizes
+                # cleanly (lease cleared by mark_failed) and never
+                # triggers a second create request — amazon_report_id
+                # stays exactly what it was, and the create branch above
+                # is never re-entered for this run.
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_invalid_request", detail=str(exc),
+                )
+            except AdsApiParseFailedError as exc:
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_contract_mismatch", detail=str(exc),
+                )
             except AdsApiRequestFailedError as exc:
                 return await self._retry_or_fail(
                     run_id, organization_id, ads_profile_id, attempt_count,
@@ -341,9 +560,10 @@ class AmazonAdsReportService:
                 )
 
             with session_scope() as session:
-                AmazonAdsReportRunRepository(session).update_amazon_status(
-                    run_id, amazon_report_status=status_response.status
-                )
+                if not AmazonAdsReportRunRepository(session).update_amazon_status(
+                    run_id, lease_owner=self._lease_owner, amazon_report_status=status_response.status
+                ):
+                    raise _LeaseLost()
             if status_response.status == _TERMINAL_SUCCESS and status_response.url:
                 return await self._download_and_ingest(run_id, organization_id, ads_profile_id, ctx, status_response.url)
             if status_response.status in _TERMINAL_FAILURE_STATUSES:
@@ -365,11 +585,36 @@ class AmazonAdsReportService:
         with session_scope() as session:
             attempt_count = AmazonAdsReportRunRepository(session).get_owned(organization_id, run_id).attempt_count
 
+        # Fenced pre-call gate — see _renew_lease_or_raise's own
+        # docstring. download_report has no Amazon-side side effect
+        # worth preventing a duplicate of, but a stale worker still has
+        # no business spending its own time/bandwidth downloading a
+        # report it can no longer persist facts or a checkpoint for.
+        await self._renew_lease_or_raise(run_id)
         try:
             body = await self._client.download_report(ctx, url, max_bytes=self._cfg.ads_report_max_download_bytes)
-        except AdsReportOversizedError as exc:
+        except AdsApiAuthenticationError as exc:
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_download_authentication_failed", detail=str(exc),
+            )
+        except AdsApiInvalidRequestError as exc:
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_download_invalid_request", detail=str(exc),
+            )
+        except AdsApiRateLimitedError as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
+                failure_class="report_download_rate_limited", detail=str(exc),
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+        except AdsReportOversizedError as exc:
+            # Permanent: nothing about retrying an identical download
+            # would produce a smaller report. No evidence (documented or
+            # observed) suggests an oversized report is ever transient.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
                 failure_class="report_oversized", detail=str(exc),
             )
         except AdsApiRequestFailedError as exc:
@@ -381,8 +626,13 @@ class AmazonAdsReportService:
         try:
             parsed = _parse_report_body(body, max_bytes=self._cfg.ads_report_max_download_bytes)
         except AdsReportFailedError as exc:
-            return await self._retry_or_fail(
-                run_id, organization_id, ads_profile_id, attempt_count,
+            # Permanent and visible: decompression, JSON, or top-level
+            # shape failure is deterministic given these exact bytes —
+            # retrying would re-download and fail identically, so this
+            # fails immediately rather than consuming the shared retry
+            # budget.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
                 failure_class="report_malformed", detail=str(exc),
             )
 
@@ -396,22 +646,17 @@ class AmazonAdsReportService:
             # advances (both happen only in the block below, which this
             # branch returns before reaching).
             detail = (
-                f"Amazon returned {parsed.total_rows} row(s) but 0 were accepted "
-                f"({parsed.rejected_rows} rejected) — report row-contract mismatch."
+                f"Amazon returned total={parsed.total_rows} accepted=0 "
+                f"rejected={parsed.rejected_rows} — report row-contract mismatch."
             )
-            with session_scope() as session:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="report_row_contract_mismatch", failure_detail=detail
-                )
-                AmazonAdsSyncErrorRepository(session).record(
-                    organization_id, ads_profile_id, error_code="report_row_contract_mismatch",
-                    error_message=detail, report_run_id=run_id,
-                )
             logger.warning(
                 "ads report rejected in full run_id=%s total_rows=%s rejected_rows=%s",
                 run_id, parsed.total_rows, parsed.rejected_rows,
             )
-            return ReportJobOutcome(report_run_id=run_id, outcome="failed")
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_row_contract_mismatch", detail=detail,
+            )
 
         with session_scope() as session:
             fact_repo = AmazonAdsDailyPerformanceFactRepository(session)
@@ -437,14 +682,71 @@ class AmazonAdsReportService:
                     report_run_id=run_id,
                 )
                 ingested += 1
+            if parsed.rejected_rows:
+                # Partial rejection: some rows failed schema validation
+                # but not all (the all-rejected case is handled above
+                # and never reaches here). The run still succeeds — only
+                # the accepted rows are missing data, not the whole
+                # report — but the counts are recorded so a partial
+                # rejection is queryable/visible rather than silently
+                # swallowed into the success outcome.
+                AmazonAdsSyncErrorRepository(session).record(
+                    organization_id, ads_profile_id,
+                    error_code="report_partial_row_rejection",
+                    error_message=(
+                        f"total={parsed.total_rows} accepted={ingested} rejected={parsed.rejected_rows}"
+                    ),
+                    report_run_id=run_id,
+                )
             run = AmazonAdsReportRunRepository(session).get_owned(organization_id, run_id)
-            AmazonAdsReportRunRepository(session).mark_succeeded(run_id, records_ingested=ingested)
+            # Fenced completion, in the SAME transaction as the fact
+            # upserts above: if this worker's lease was already lost,
+            # this affects zero rows and _LeaseLost aborts the whole
+            # transaction — undoing the just-staged facts too, since
+            # nothing here has committed yet. A separate, earlier
+            # ownership check in its own transaction would not be
+            # enough (the lease could be lost in the gap between that
+            # check and this write); checking here, right before commit,
+            # is what makes "a stale worker never persists facts or
+            # advances the checkpoint" actually true rather than merely
+            # likely.
+            if not AmazonAdsReportRunRepository(session).mark_succeeded(
+                run_id, lease_owner=self._lease_owner, records_ingested=ingested
+            ):
+                raise _LeaseLost()
             if run is not None:
                 AmazonAdsSyncCheckpointRepository(session).advance(
                     organization_id, ads_profile_id, synced_through_date=run.end_date, report_run_id=run_id
                 )
         logger.info("ads report ingested run_id=%s records=%s", run_id, ingested)
         return ReportJobOutcome(report_run_id=run_id, outcome="succeeded", records_ingested=ingested)
+
+    async def _fail_permanently(
+        self,
+        run_id: UUID,
+        organization_id: UUID,
+        ads_profile_id: UUID,
+        *,
+        failure_class: str,
+        detail: str,
+    ) -> ReportJobOutcome:
+        """Terminalize immediately — never leaves the row `started`,
+        never schedules a retry. For failure classes that are
+        deterministic given the exact request/response already
+        observed (a permanently-wrong request, an auth failure, a
+        contract mismatch): retrying would reproduce the identical
+        outcome, so this does not consume any part of the retry
+        budget. Fenced: raises `_LeaseLost` (never writes the sync
+        error either) if this worker no longer owns the row's lease."""
+        with session_scope() as session:
+            if not AmazonAdsReportRunRepository(session).mark_failed(
+                run_id, lease_owner=self._lease_owner, failure_class=failure_class, failure_detail=detail
+            ):
+                raise _LeaseLost()
+            AmazonAdsSyncErrorRepository(session).record(
+                organization_id, ads_profile_id, error_code=failure_class, error_message=detail, report_run_id=run_id
+            )
+        return ReportJobOutcome(report_run_id=run_id, outcome="failed")
 
     async def _retry_or_fail(
         self,
@@ -455,17 +757,51 @@ class AmazonAdsReportService:
         *,
         failure_class: str,
         detail: str,
+        retry_after_seconds: float | None = None,
     ) -> ReportJobOutcome:
+        """For genuinely transient failures (transport errors, rate
+        limits, Amazon-side terminal failure statuses, exhausted poll
+        attempts) — bounded by `ads_report_poll_max_attempts` regardless
+        of delay. The delay honors a validated, bounded Amazon
+        `Retry-After` (see `_validate_retry_after`) over computed
+        backoff; an invalid or missing one falls back to bounded
+        exponential backoff with full jitter (`compute_backoff_delay`),
+        never the old flat `ads_report_poll_interval_seconds` wait, and
+        never an unbounded external delay. Fenced: raises `_LeaseLost`
+        (never writes the sync error either) if this worker no longer
+        owns the row's lease — this also clears the lease on release,
+        so a rate-limited poll never sleeps in-process past its own
+        lease (see `_poll_until_terminal`'s own comment)."""
         with session_scope() as session:
             run_repo = AmazonAdsReportRunRepository(session)
             if attempt_count >= self._cfg.ads_report_poll_max_attempts:
-                run_repo.mark_failed(run_id, failure_class=failure_class, failure_detail=detail)
+                if not run_repo.mark_failed(
+                    run_id, lease_owner=self._lease_owner, failure_class=failure_class, failure_detail=detail
+                ):
+                    raise _LeaseLost()
                 outcome = "failed"
             else:
-                next_retry_at = datetime.now(UTC) + timedelta(seconds=self._cfg.ads_report_poll_interval_seconds)
-                run_repo.mark_retry(
-                    run_id, next_retry_at=next_retry_at, failure_class=failure_class, failure_detail=detail
+                bounded = _validate_retry_after(
+                    retry_after_seconds, max_seconds=self._cfg.ads_report_retry_after_max_seconds
                 )
+                if bounded is not None:
+                    delay, delay_source = bounded, "retry_after"
+                else:
+                    delay, delay_source = (
+                        compute_backoff_delay(
+                            attempt_count,
+                            base_seconds=self._cfg.ads_report_retry_base_seconds,
+                            max_seconds=self._cfg.ads_report_retry_max_seconds,
+                        ),
+                        "backoff",
+                    )
+                next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
+                annotated_detail = f"{detail} [retry_delay_source={delay_source} retry_delay_seconds={delay:.2f}]"
+                if not run_repo.mark_retry(
+                    run_id, lease_owner=self._lease_owner, next_retry_at=next_retry_at,
+                    failure_class=failure_class, failure_detail=annotated_detail,
+                ):
+                    raise _LeaseLost()
                 outcome = "retrying"
             AmazonAdsSyncErrorRepository(session).record(
                 organization_id, ads_profile_id, error_code=failure_class, error_message=detail, report_run_id=run_id
