@@ -207,7 +207,13 @@ def test_worker_a_loses_every_fenced_mutation_after_worker_b_reclaims(disposable
         assert row.status == "started"
         assert row.amazon_report_id == "r-pg-fencing-1"  # untouched by the "r-hijack-attempt" write
         assert row.records_ingested == 0
-        assert row.failure_class is None
+        # Left over from the resumable stale-lease-recovery sweep itself
+        # (step 3) — that transition legitimately records this class on
+        # its way through 'waiting_to_retry' before the same claim call
+        # picks the row back up as 'started'; the claim's own UPDATE
+        # does not clear it, and none of worker A's rejected mutations
+        # (which all wrote nothing) could have set it either.
+        assert row.failure_class == "lease_expired_resumable"
 
     # 6. Only Worker B can complete the run and advance its checkpoint.
     with Session(disposable_engine) as session:
