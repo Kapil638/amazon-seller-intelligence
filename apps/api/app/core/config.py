@@ -800,7 +800,13 @@ class Settings(BaseSettings):
             "do not publish an exact numeric maximum (blueprint §13.4 — 'Not documented' beyond "
             "'max page size for given API'); bounded here to the same 1-1000 range Ads API v1's "
             "sibling SPQueryCampaign operation documents for the same kind of call, as a "
-            "conservative, explicit limit rather than an unbounded one."
+            "conservative, explicit limit rather than an unbounded one. Ownership: "
+            "app.amazon.ads_client.HttpAmazonAdsApiClient never reads this setting itself — "
+            "page_size is always an explicit per-call argument on list_campaigns()/list_ad_groups()/"
+            "etc., validated against the same 1-1000 range (rejected, not silently clamped, if "
+            "out of range). PR B1 introduces this setting but does not yet wire it to any caller; "
+            "PR B2's orchestration is the intended reader — it is expected to pass "
+            "settings.ads_entity_list_page_size as page_size on each list call."
         ),
     )
 

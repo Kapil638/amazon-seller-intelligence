@@ -163,6 +163,28 @@ class EntityParseResult(Generic[T]):
         return self.total_items > 0 and self.accepted_items == 0
 
 
+def _parse_next_token(value: object, *, token_present: bool) -> str | None:
+    """Validates `payload.get("nextToken")` per `parse_entity_list_envelope`'s
+    own pagination-token contract table. `token_present` distinguishes a
+    genuinely absent key from a present key whose value happens to be
+    `None` — both currently resolve to "pagination complete", but they
+    are evaluated as two named, disclosed cases (see the docstring
+    table), not one silently-merged default."""
+    if not token_present:
+        return None
+    if value is None:
+        # Production-observed (live-confirmed POST /sp/campaigns/list
+        # terminal page), not stated by document 23's own prose — see
+        # parse_entity_list_envelope's docstring table for the full
+        # disclosure of this decision's basis.
+        return None
+    if not isinstance(value, str):
+        raise AdsApiParseFailedError("Amazon Ads API entity-list response's nextToken field had an unsupported type.")
+    if not value.strip():
+        raise AdsApiParseFailedError("Amazon Ads API entity-list response's nextToken field was blank.")
+    return value
+
+
 def parse_entity_list_envelope(
     payload: dict,
     *,
@@ -184,16 +206,43 @@ def parse_entity_list_envelope(
     (the item failed Pydantic validation entirely, e.g. a missing
     required field or a non-losslessly-convertible id).
 
-    Raises `AdsApiParseFailedError` only for a genuinely malformed
-    top-level envelope: `response_key`'s value is present but is not a
-    JSON array. A MISSING `response_key` is treated as zero items (an
-    ordinary empty page), matching Amazon's own observed campaigns
-    envelope shape — this is a deliberate, narrow exception voiced
-    exactly once, not a general "missing means empty" policy applied to
-    every field."""
-    raw_items = payload.get(response_key, [])
+    Fail-closed envelope contract (second review — a missing or null
+    entity key must NEVER be silently read as "zero entities", since the
+    envelope key itself is an unconfirmed inference for three of the
+    five endpoints; if that inference is wrong, silently returning an
+    empty page would hide the mismatch instead of surfacing it):
+
+    | `payload[response_key]` | Result |
+    |---|---|
+    | key absent | raises `AdsApiParseFailedError` |
+    | `null` | raises `AdsApiParseFailedError` |
+    | present, not a JSON array | raises `AdsApiParseFailedError` |
+    | `[]` | valid, genuinely empty page |
+
+    Every raised message is a fixed, sanitized string naming only
+    `response_key` (a constant this module already knows, never
+    attacker- or seller-controlled) — never the response body, never any
+    entity data.
+
+    Pagination-token contract (also second review):
+
+    | `payload["nextToken"]` | Result |
+    |---|---|
+    | absent | pagination complete (`next_token=None`) |
+    | non-empty string | returned exactly as received — never trimmed or transformed, since no official source states this opaque token has trim-safe whitespace |
+    | `null` | pagination complete (`next_token=None`) — **not** stated by document 23's own prose (which only ever says "follow nextToken until absent"); this is a deliberate, disclosed extension based on this codebase's own live-confirmed `POST /sp/campaigns/list` response, whose observed terminal page sends `"nextToken": null` rather than omitting the key. Labeled **Production-observed but not contract authority** per the blueprint's own §0.1 confidence tier — never asserted as something document 23 itself permits |
+    | blank/whitespace-only string | raises `AdsApiParseFailedError` — cannot function as a continuation token |
+    | any other type (number, bool, array, object) | raises `AdsApiParseFailedError` |
+    """
+    if response_key not in payload:
+        raise AdsApiParseFailedError(
+            f"Amazon Ads API entity-list response was missing the {response_key!r} field."
+        )
+    raw_items = payload[response_key]
     if raw_items is None:
-        raw_items = []
+        raise AdsApiParseFailedError(
+            f"Amazon Ads API entity-list response's {response_key!r} field was null, not an array."
+        )
     if not isinstance(raw_items, list):
         raise AdsApiParseFailedError(
             f"Amazon Ads API entity-list response's {response_key!r} field was not a JSON array."
@@ -213,13 +262,7 @@ def parse_entity_list_envelope(
             continue
         accepted.append(parsed)
 
-    next_token = payload.get("nextToken")
-    if next_token is not None and not isinstance(next_token, str):
-        # A malformed pagination token is treated as absent rather than
-        # propagated with a wrong type — the caller's own cyclic-token
-        # detection (PR B2) must never be handed something it can't hash
-        # or compare.
-        next_token = None
+    next_token = _parse_next_token(payload.get("nextToken", None), token_present="nextToken" in payload)
 
     return EntityParseResult(
         items=accepted,
@@ -531,18 +574,29 @@ class HttpAmazonAdsApiClient:
     async def _list_entities(
         self, ctx, path, model, *, media_type, response_key, next_token, page_size, allowed_states
     ) -> EntityParseResult:
-        # Page-size bound is enforced here, not trusted from the caller —
-        # blueprint §13.4 leaves SP v3's own exact maxResults ceiling
-        # "Not documented"; ads_entity_list_page_size's own Settings
-        # bound (1-1000) is the configured limit this clamps to.
-        bounded_page_size = max(1, min(int(page_size), 1000))
+        # Rejects an out-of-range page_size rather than silently
+        # clamping it (second review): silent clamping could paper over
+        # a caller-side configuration error (e.g. Settings.
+        # ads_entity_list_page_size misconfigured, or an integer
+        # overflow/typo upstream) instead of surfacing it. The bound
+        # itself (1-1000) mirrors ads_entity_list_page_size's own Field
+        # constraint — see that setting's docstring for why 1000: SP v3's
+        # own exact maxResults ceiling is "Not documented" (blueprint
+        # §13.4), so this is a conservative number borrowed from Ads API
+        # v1's sibling SPQueryCampaign operation, not an SP v3 fact. This
+        # client never reads Settings itself — page_size is always an
+        # explicit argument from the caller (PR B2's orchestration is
+        # expected to read ads_entity_list_page_size and pass it
+        # through).
+        if not isinstance(page_size, int) or isinstance(page_size, bool) or not (1 <= page_size <= 1000):
+            raise ValueError(f"page_size must be an integer between 1 and 1000, got {page_size!r}.")
         payload = await self._request_json(
             ctx,
             "POST",
             path,
             with_scope=True,
             media_type=media_type,
-            json_body={"maxResults": bounded_page_size, **({"nextToken": next_token} if next_token else {})},
+            json_body={"maxResults": page_size, **({"nextToken": next_token} if next_token else {})},
         )
         return parse_entity_list_envelope(
             payload, response_key=response_key, model=model, allowed_states=allowed_states

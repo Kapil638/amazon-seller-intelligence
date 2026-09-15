@@ -206,11 +206,25 @@ def test_parse_entity_list_envelope_treats_a_genuinely_empty_page_as_not_a_contr
     assert not result.is_contract_mismatch
 
 
-def test_parse_entity_list_envelope_missing_response_key_is_an_empty_page_not_malformed() -> None:
+# --------------------------------------------------------------------
+# Top-level envelope truth table (second review, blocker 1) — a missing
+# or null entity key must never be silently read as "zero entities":
+# the envelope key itself is an unconfirmed inference for product ads/
+# keywords/product targets, so a wrong inference must surface as a
+# contract mismatch, not vanish as an empty page.
+# --------------------------------------------------------------------
+
+
+def test_parse_entity_list_envelope_rejects_a_missing_response_key() -> None:
     payload = {"nextToken": None}
-    result = parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
-    assert result.total_items == 0
-    assert not result.is_contract_mismatch
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_parse_entity_list_envelope_rejects_a_null_response_key() -> None:
+    payload = {"campaigns": None, "nextToken": None}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
 
 
 def test_parse_entity_list_envelope_rejects_a_non_array_top_level_value() -> None:
@@ -221,10 +235,86 @@ def test_parse_entity_list_envelope_rejects_a_non_array_top_level_value() -> Non
         parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
 
 
-def test_parse_entity_list_envelope_ignores_a_malformed_next_token_type() -> None:
-    payload = {"campaigns": [], "nextToken": 12345}
+def test_parse_entity_list_envelope_accepts_an_explicit_empty_array() -> None:
+    payload = {"campaigns": [], "nextToken": None}
+    result = parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+    assert result.total_items == 0
+    assert not result.is_contract_mismatch
+
+
+def test_parse_entity_list_envelope_error_never_contains_response_body_or_entity_data() -> None:
+    payload = {"campaigns": [{"campaignId": "super-secret-name-should-never-leak", "name": "Confidential Co"}]}
+    with pytest.raises(AdsApiParseFailedError) as exc_info:
+        parse_entity_list_envelope(payload, response_key="adGroups", model=AdsCampaignResponse)
+    message = str(exc_info.value)
+    assert "super-secret-name-should-never-leak" not in message
+    assert "Confidential Co" not in message
+
+
+# --------------------------------------------------------------------
+# Pagination-token truth table (second review, blocker 2).
+# --------------------------------------------------------------------
+
+
+def test_next_token_absent_means_pagination_complete() -> None:
+    payload = {"campaigns": []}
     result = parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
     assert result.next_token is None
+
+
+def test_next_token_valid_opaque_string_is_returned_exactly() -> None:
+    payload = {"campaigns": [], "nextToken": "  opaque-token-with-incidental-spacing  "}
+    result = parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+    # Never trimmed or transformed — no official source states this
+    # opaque token has trim-safe whitespace.
+    assert result.next_token == "  opaque-token-with-incidental-spacing  "
+
+
+def test_next_token_null_means_pagination_complete() -> None:
+    """Production-observed (live-confirmed POST /sp/campaigns/list
+    terminal page sends null, not an absent key) — NOT stated by
+    document 23's own prose, which only ever says 'follow nextToken
+    until absent'. See parse_entity_list_envelope's own docstring for
+    the full disclosure of this decision's basis."""
+    payload = {"campaigns": [], "nextToken": None}
+    result = parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+    assert result.next_token is None
+
+
+def test_next_token_blank_string_raises() -> None:
+    payload = {"campaigns": [], "nextToken": "   "}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_next_token_empty_string_raises() -> None:
+    payload = {"campaigns": [], "nextToken": ""}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_next_token_integer_raises() -> None:
+    payload = {"campaigns": [], "nextToken": 12345}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_next_token_boolean_raises() -> None:
+    payload = {"campaigns": [], "nextToken": True}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_next_token_array_raises() -> None:
+    payload = {"campaigns": [], "nextToken": ["not", "a", "string"]}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
+
+
+def test_next_token_object_raises() -> None:
+    payload = {"campaigns": [], "nextToken": {"unexpected": "object"}}
+    with pytest.raises(AdsApiParseFailedError):
+        parse_entity_list_envelope(payload, response_key="campaigns", model=AdsCampaignResponse)
 
 
 # --------------------------------------------------------------------
@@ -365,18 +455,19 @@ async def test_list_campaigns_parses_the_nested_budget_object_not_a_flat_daily_b
 
 
 @pytest.mark.asyncio
-async def test_list_campaigns_with_an_items_envelope_finds_no_campaigns() -> None:
+async def test_list_campaigns_with_an_items_envelope_raises_instead_of_silently_finding_nothing() -> None:
     """Regression guard for the exact bug found live: a response shaped
     to the OLD (wrong) assumption ("items" key) must not be silently
-    accepted as if it had campaigns in it — the real key is "campaigns"."""
+    accepted as an empty page — the real key is "campaigns", and a
+    response that never sends "campaigns" at all must surface as a
+    contract mismatch (second review, blocker 1), not vanish."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"items": [{"campaignId": "1", "name": "A", "state": "ENABLED"}], "nextToken": None})
 
     client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
-    result = await client.list_campaigns(_ctx())
-    assert result.items == []
-    assert result.total_items == 0  # genuinely empty (missing "campaigns"), not a contract mismatch
+    with pytest.raises(AdsApiParseFailedError):
+        await client.list_campaigns(_ctx())
 
 
 @pytest.mark.asyncio
@@ -503,7 +594,25 @@ async def test_entity_list_endpoints_reject_a_malformed_top_level_envelope() -> 
 
 
 @pytest.mark.asyncio
-async def test_entity_list_page_size_is_bounded_even_if_caller_passes_an_absurd_value() -> None:
+async def test_entity_list_rejects_an_out_of_range_page_size_instead_of_silently_clamping_it() -> None:
+    """Second review: silent clamping could conceal a caller-side
+    configuration error. An out-of-range page_size must be rejected
+    before any HTTP request is even attempted, not coerced into range."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent for an invalid page_size")
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match="page_size"):
+        await client.list_campaigns(_ctx(), page_size=999_999)
+    with pytest.raises(ValueError, match="page_size"):
+        await client.list_campaigns(_ctx(), page_size=0)
+    with pytest.raises(ValueError, match="page_size"):
+        await client.list_campaigns(_ctx(), page_size=-1)
+
+
+@pytest.mark.asyncio
+async def test_entity_list_accepts_the_full_valid_page_size_range() -> None:
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -511,11 +620,10 @@ async def test_entity_list_page_size_is_bounded_even_if_caller_passes_an_absurd_
         return httpx.Response(200, json={"campaigns": [], "nextToken": None})
 
     client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
-    await client.list_campaigns(_ctx(), page_size=999_999)
-    assert captured["body"]["maxResults"] == 1000  # clamped, never sent unbounded
-
-    await client.list_campaigns(_ctx(), page_size=0)
-    assert captured["body"]["maxResults"] == 1  # clamped up, never zero/negative
+    await client.list_campaigns(_ctx(), page_size=1)
+    assert captured["body"]["maxResults"] == 1
+    await client.list_campaigns(_ctx(), page_size=1000)
+    assert captured["body"]["maxResults"] == 1000
 
 
 # --------------------------------------------------------------------

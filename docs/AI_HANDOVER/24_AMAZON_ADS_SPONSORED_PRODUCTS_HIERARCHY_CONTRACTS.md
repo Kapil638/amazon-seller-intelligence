@@ -142,16 +142,42 @@ Document 22 does not exist and is not used.
 
 - validates every item independently (one malformed item never discards its valid siblings);
 - reports `total_items` / `accepted_items` / `schema_rejected_items` / `unsupported_state_items` separately;
-- exposes `is_contract_mismatch` (`total_items > 0 and accepted_items == 0`) — a nonempty, all-rejected page is never indistinguishable from an ordinary empty one;
-- raises only for a genuinely malformed top-level envelope (the entity key present but not a JSON array).
+- exposes `is_contract_mismatch` (`total_items > 0 and accepted_items == 0`) — a nonempty, all-rejected page is never indistinguishable from an ordinary empty one.
 
 This is the function PR B2's orchestration is expected to call directly; PR B1 does not itself call it from any synchronization loop, checkpoint, or persistence-writing code path.
+
+### 5.1 Top-level envelope truth table (second review)
+
+A missing or null entity key must never be silently read as "zero entities" — the envelope key itself is an unconfirmed inference for product ads/keywords/product targets (§2.3–2.5), so a wrong inference must surface as a contract mismatch, not vanish as an empty page:
+
+| `payload[response_key]` | Result |
+|---|---|
+| key absent | raises `AdsApiParseFailedError` |
+| `null` | raises `AdsApiParseFailedError` |
+| present, not a JSON array | raises `AdsApiParseFailedError` |
+| `[]` | valid, genuinely empty page |
+
+Every raised message names only `response_key` itself (a constant this module already knows) — never the response body or any entity data.
+
+### 5.2 Pagination-token truth table (second review)
+
+| `payload["nextToken"]` | Result | Basis |
+|---|---|---|
+| absent | pagination complete (`next_token=None`) | Blueprint §13.4/§17: "Follow `nextToken` until absent" |
+| non-empty string | returned exactly as received (never trimmed/transformed) | No official source states this opaque token has trim-safe whitespace |
+| `null` | pagination complete (`next_token=None`) | **Not** stated by document 23's own prose, which only ever says "until absent". This codebase's own live-confirmed `POST /sp/campaigns/list` response has its observed terminal page send `"nextToken": null` rather than omit the key. Labeled **Production-observed but not contract authority** per the blueprint's own §0.1 confidence tier — deliberately never asserted as something document 23 itself permits. Decision confirmed with the operator during PR B1's second review specifically to avoid this client raising a parse error on the exact, already-verified shape of the one endpoint confirmed live |
+| blank/whitespace-only string | raises `AdsApiParseFailedError` | Cannot function as a continuation token |
+| any other type (number, bool, array, object) | raises `AdsApiParseFailedError` | Not an opaque token |
 
 ## 6. Identifier normalization
 
 `app.amazon.ads_models.normalize_ads_entity_id()`, applied via `field_validator(mode="before")` to every own-id and parent-id field on all five entity DTOs (and, separately, `portfolioId` — opaque but still normalized).
 
 Accepted: non-blank string (whitespace-trimmed), Python `int` (lossless `str()` conversion, arbitrary precision). Rejected: `bool`, `float` (even integral), blank/whitespace-only string, any other type. Test coverage: `tests/test_amazon_ads_client.py` — integer, string, whitespace-padded string, oversized integer (precision-preserving), boolean, float, blank string, `None`, list, dict.
+
+## 6.1 Page-size bound (second review — ownership clarified)
+
+`Settings.ads_entity_list_page_size` (default 100, bounded 1–1000) exists but is **not read by `ads_client.py` itself** — `page_size` is always an explicit per-call argument on `list_campaigns()`/`list_ad_groups()`/etc. `HttpAmazonAdsApiClient._list_entities()` validates that argument against the same 1–1000 range and **rejects** (`ValueError`, raised before any HTTP request) a value outside it — it no longer silently clamps, since clamping could mask a caller-side configuration error instead of surfacing it. PR B1 introduces the setting but wires nothing to read it; PR B2's orchestration is the intended reader, expected to pass `settings.ads_entity_list_page_size` as `page_size` on each list call. The 1000 ceiling itself remains a conservative, undocumented-maximum stand-in (blueprint §13.4: SP v3's own exact `maxResults` ceiling is "Not documented"), borrowed from Ads API v1's sibling `SPQueryCampaign` operation.
 
 ## 7. Hierarchy
 
