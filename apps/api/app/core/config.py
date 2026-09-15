@@ -757,6 +757,19 @@ class Settings(BaseSettings):
         default=52_428_800, ge=1_024,
         description="Hard cap on a downloaded Ads report body size, checked before and during download — never trust Content-Length alone.",
     )
+    ads_report_retry_base_seconds: float = Field(
+        default=5.0, gt=0, le=600,
+        description=(
+            "Base delay for bounded exponential backoff with full jitter between retry "
+            "attempts on a transient Ads report failure (create/poll/download transport or "
+            "rate-limit failures without a usable Retry-After). Replaces the previous flat "
+            "ads_report_poll_interval_seconds delay for these retry paths."
+        ),
+    )
+    ads_report_retry_max_seconds: float = Field(
+        default=600.0, gt=0, le=3600,
+        description="Cap on the exponential backoff delay between retry attempts, regardless of attempt count.",
+    )
     ads_sync_max_global_concurrent_jobs: int = Field(
         default=4, ge=1, le=100,
         description="Maximum number of Ads report jobs any future worker fleet may run simultaneously, across all organizations and profiles.",

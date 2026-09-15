@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import InvalidOperation
@@ -41,8 +42,10 @@ from app.amazon.ads_models import AdsReportConfigurationBody, AdsReportRequestCo
 from app.amazon.secrets import SecretNotFoundError, SecretProvider
 from app.core.config import Settings
 from app.core.exceptions import (
+    AdsApiAuthenticationError,
     AdsApiDuplicateReportError,
     AdsApiInvalidRequestError,
+    AdsApiParseFailedError,
     AdsApiRateLimitedError,
     AdsApiRequestFailedError,
     AdsReportFailedError,
@@ -69,6 +72,20 @@ class ReportJobOutcome:
     report_run_id: UUID
     outcome: str  # "succeeded" | "retrying" | "failed" | "no_job"
     records_ingested: int = 0
+
+
+def compute_backoff_delay(
+    attempt_count: int, *, base_seconds: float, max_seconds: float, rng: "random.Random | None" = None
+) -> float:
+    """Full-jitter exponential backoff: `random(0, min(max, base * 2^n))`.
+    Bounded by `max_seconds` regardless of how large `attempt_count`
+    grows, so a long-failing job never waits unboundedly long between
+    retries. `rng` is injectable for deterministic tests; defaults to
+    the module-level `random` functions."""
+    capped = min(max_seconds, base_seconds * (2 ** max(attempt_count, 0)))
+    if rng is not None:
+        return rng.uniform(0, capped)
+    return random.uniform(0, capped)
 
 
 def report_name_for_run(report_run_id: UUID, start_date: date, end_date: date) -> str:
@@ -307,7 +324,29 @@ class AmazonAdsReportService:
                     error_message=str(exc), report_run_id=run_id,
                 )
             return ReportJobOutcome(report_run_id=run_id, outcome="failed")
-        except (AdsApiRateLimitedError, AdsApiRequestFailedError) as exc:
+        except AdsApiAuthenticationError as exc:
+            # Distinct, visible terminal classification — a credential/
+            # authorization failure will not resolve itself by retrying
+            # the same request.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_create_authentication_failed", detail=str(exc),
+            )
+        except AdsApiParseFailedError as exc:
+            # Amazon returned a 2xx that this client could not parse as
+            # the documented create/status response shape — a contract
+            # mismatch, not a transient condition.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_create_contract_mismatch", detail=str(exc),
+            )
+        except AdsApiRateLimitedError as exc:
+            return await self._retry_or_fail(
+                run_id, organization_id, ads_profile_id, attempt_count,
+                failure_class="report_create_rate_limited", detail=str(exc),
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+        except AdsApiRequestFailedError as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
                 failure_class="report_create_failed", detail=str(exc),
@@ -334,6 +373,32 @@ class AmazonAdsReportService:
             except AdsApiRateLimitedError as exc:
                 await asyncio.sleep(exc.retry_after_seconds or self._cfg.ads_report_poll_interval_seconds)
                 continue
+            except AdsApiAuthenticationError as exc:
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_authentication_failed", detail=str(exc),
+                )
+            except AdsApiInvalidRequestError as exc:
+                # Covers both an ordinary malformed poll request AND a
+                # defensively-adopted 425 report id (see
+                # AdsApiDuplicateReportError's docstring) that Amazon's
+                # status endpoint does not actually recognize — either
+                # way this is a permanent condition: the report id this
+                # run is polling is unusable, and retrying the identical
+                # status request will not change that. Terminalizes
+                # cleanly (lease cleared by mark_failed) and never
+                # triggers a second create request — amazon_report_id
+                # stays exactly what it was, and the create branch above
+                # is never re-entered for this run.
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_invalid_request", detail=str(exc),
+                )
+            except AdsApiParseFailedError as exc:
+                return await self._fail_permanently(
+                    run_id, organization_id, ads_profile_id,
+                    failure_class="report_poll_contract_mismatch", detail=str(exc),
+                )
             except AdsApiRequestFailedError as exc:
                 return await self._retry_or_fail(
                     run_id, organization_id, ads_profile_id, attempt_count,
@@ -367,9 +432,28 @@ class AmazonAdsReportService:
 
         try:
             body = await self._client.download_report(ctx, url, max_bytes=self._cfg.ads_report_max_download_bytes)
-        except AdsReportOversizedError as exc:
+        except AdsApiAuthenticationError as exc:
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_download_authentication_failed", detail=str(exc),
+            )
+        except AdsApiInvalidRequestError as exc:
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_download_invalid_request", detail=str(exc),
+            )
+        except AdsApiRateLimitedError as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,
+                failure_class="report_download_rate_limited", detail=str(exc),
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+        except AdsReportOversizedError as exc:
+            # Permanent: nothing about retrying an identical download
+            # would produce a smaller report. No evidence (documented or
+            # observed) suggests an oversized report is ever transient.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
                 failure_class="report_oversized", detail=str(exc),
             )
         except AdsApiRequestFailedError as exc:
@@ -381,8 +465,13 @@ class AmazonAdsReportService:
         try:
             parsed = _parse_report_body(body, max_bytes=self._cfg.ads_report_max_download_bytes)
         except AdsReportFailedError as exc:
-            return await self._retry_or_fail(
-                run_id, organization_id, ads_profile_id, attempt_count,
+            # Permanent and visible: decompression, JSON, or top-level
+            # shape failure is deterministic given these exact bytes —
+            # retrying would re-download and fail identically, so this
+            # fails immediately rather than consuming the shared retry
+            # budget.
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
                 failure_class="report_malformed", detail=str(exc),
             )
 
@@ -396,22 +485,17 @@ class AmazonAdsReportService:
             # advances (both happen only in the block below, which this
             # branch returns before reaching).
             detail = (
-                f"Amazon returned {parsed.total_rows} row(s) but 0 were accepted "
-                f"({parsed.rejected_rows} rejected) — report row-contract mismatch."
+                f"Amazon returned total={parsed.total_rows} accepted=0 "
+                f"rejected={parsed.rejected_rows} — report row-contract mismatch."
             )
-            with session_scope() as session:
-                AmazonAdsReportRunRepository(session).mark_failed(
-                    run_id, failure_class="report_row_contract_mismatch", failure_detail=detail
-                )
-                AmazonAdsSyncErrorRepository(session).record(
-                    organization_id, ads_profile_id, error_code="report_row_contract_mismatch",
-                    error_message=detail, report_run_id=run_id,
-                )
             logger.warning(
                 "ads report rejected in full run_id=%s total_rows=%s rejected_rows=%s",
                 run_id, parsed.total_rows, parsed.rejected_rows,
             )
-            return ReportJobOutcome(report_run_id=run_id, outcome="failed")
+            return await self._fail_permanently(
+                run_id, organization_id, ads_profile_id,
+                failure_class="report_row_contract_mismatch", detail=detail,
+            )
 
         with session_scope() as session:
             fact_repo = AmazonAdsDailyPerformanceFactRepository(session)
@@ -437,6 +521,22 @@ class AmazonAdsReportService:
                     report_run_id=run_id,
                 )
                 ingested += 1
+            if parsed.rejected_rows:
+                # Partial rejection: some rows failed schema validation
+                # but not all (the all-rejected case is handled above
+                # and never reaches here). The run still succeeds — only
+                # the accepted rows are missing data, not the whole
+                # report — but the counts are recorded so a partial
+                # rejection is queryable/visible rather than silently
+                # swallowed into the success outcome.
+                AmazonAdsSyncErrorRepository(session).record(
+                    organization_id, ads_profile_id,
+                    error_code="report_partial_row_rejection",
+                    error_message=(
+                        f"total={parsed.total_rows} accepted={ingested} rejected={parsed.rejected_rows}"
+                    ),
+                    report_run_id=run_id,
+                )
             run = AmazonAdsReportRunRepository(session).get_owned(organization_id, run_id)
             AmazonAdsReportRunRepository(session).mark_succeeded(run_id, records_ingested=ingested)
             if run is not None:
@@ -445,6 +545,29 @@ class AmazonAdsReportService:
                 )
         logger.info("ads report ingested run_id=%s records=%s", run_id, ingested)
         return ReportJobOutcome(report_run_id=run_id, outcome="succeeded", records_ingested=ingested)
+
+    async def _fail_permanently(
+        self,
+        run_id: UUID,
+        organization_id: UUID,
+        ads_profile_id: UUID,
+        *,
+        failure_class: str,
+        detail: str,
+    ) -> ReportJobOutcome:
+        """Terminalize immediately — never leaves the row `started`,
+        never schedules a retry. For failure classes that are
+        deterministic given the exact request/response already
+        observed (a permanently-wrong request, an auth failure, a
+        contract mismatch): retrying would reproduce the identical
+        outcome, so this does not consume any part of the retry
+        budget."""
+        with session_scope() as session:
+            AmazonAdsReportRunRepository(session).mark_failed(run_id, failure_class=failure_class, failure_detail=detail)
+            AmazonAdsSyncErrorRepository(session).record(
+                organization_id, ads_profile_id, error_code=failure_class, error_message=detail, report_run_id=run_id
+            )
+        return ReportJobOutcome(report_run_id=run_id, outcome="failed")
 
     async def _retry_or_fail(
         self,
@@ -455,14 +578,31 @@ class AmazonAdsReportService:
         *,
         failure_class: str,
         detail: str,
+        retry_after_seconds: float | None = None,
     ) -> ReportJobOutcome:
+        """For genuinely transient failures (transport errors, rate
+        limits, Amazon-side terminal failure statuses, exhausted poll
+        attempts) — bounded by `ads_report_poll_max_attempts` regardless
+        of delay. The delay itself honors Amazon's own `Retry-After`
+        when the caller supplies one; otherwise it is bounded
+        exponential backoff with full jitter (`compute_backoff_delay`),
+        never the old flat `ads_report_poll_interval_seconds` wait."""
         with session_scope() as session:
             run_repo = AmazonAdsReportRunRepository(session)
             if attempt_count >= self._cfg.ads_report_poll_max_attempts:
                 run_repo.mark_failed(run_id, failure_class=failure_class, failure_detail=detail)
                 outcome = "failed"
             else:
-                next_retry_at = datetime.now(UTC) + timedelta(seconds=self._cfg.ads_report_poll_interval_seconds)
+                delay = (
+                    retry_after_seconds
+                    if retry_after_seconds is not None
+                    else compute_backoff_delay(
+                        attempt_count,
+                        base_seconds=self._cfg.ads_report_retry_base_seconds,
+                        max_seconds=self._cfg.ads_report_retry_max_seconds,
+                    )
+                )
+                next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
                 run_repo.mark_retry(
                     run_id, next_retry_at=next_retry_at, failure_class=failure_class, failure_detail=detail
                 )

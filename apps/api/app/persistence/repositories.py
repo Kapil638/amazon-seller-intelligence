@@ -7183,14 +7183,44 @@ class AmazonAdsReportRunRepository:
                 text("SELECT pg_advisory_xact_lock(:key)"), {"key": self._CLAIM_ADVISORY_LOCK_KEY}
             )
 
+        # Stale-lease recovery splits on whether Amazon already accepted
+        # the report (amazon_report_id set). A crash before create ever
+        # succeeded has nothing to resume — that row terminalizes to
+        # `timed_out` exactly as before (never auto-retried, matching
+        # AmazonIngestionRun's own documented guarantee). A crash AFTER
+        # create succeeded leaves a real report sitting on Amazon's
+        # side; abandoning it as `timed_out` would silently orphan work
+        # Amazon already did and — worse — risk a future run re-creating
+        # a duplicate report for the same window. That case instead
+        # becomes `waiting_to_retry`, immediately eligible, so the next
+        # claim resumes polling the SAME amazon_report_id
+        # (process_one_claimed_job already skips create whenever
+        # amazon_report_id is set — see its own `if not
+        # amazon_report_id` guard).
         self.session.execute(
             update(AmazonAdsReportRun)
             .where(
                 AmazonAdsReportRun.status == "started",
                 AmazonAdsReportRun.lease_expires_at.is_not(None),
                 AmazonAdsReportRun.lease_expires_at < func.now(),
+                AmazonAdsReportRun.amazon_report_id.is_(None),
             )
             .values(status="timed_out", completed_at=func.now(), failure_class="lease_expired", lease_owner=None)
+        )
+        self.session.execute(
+            update(AmazonAdsReportRun)
+            .where(
+                AmazonAdsReportRun.status == "started",
+                AmazonAdsReportRun.lease_expires_at.is_not(None),
+                AmazonAdsReportRun.lease_expires_at < func.now(),
+                AmazonAdsReportRun.amazon_report_id.is_not(None),
+            )
+            .values(
+                status="waiting_to_retry",
+                next_retry_at=func.now(),
+                failure_class="lease_expired_resumable",
+                lease_owner=None,
+            )
         )
         self.session.flush()
 
@@ -7327,11 +7357,20 @@ class AmazonAdsSyncCheckpointRepository:
     def advance(
         self, organization_id: UUID, ads_profile_id: UUID, *, synced_through_date: date, report_run_id: UUID
     ) -> AmazonAdsSyncCheckpoint:
+        """Never moves `synced_through_date` backward. A historical
+        reconciliation report (an older window re-requested after the
+        checkpoint has already advanced past it — e.g. a mature-
+        attribution re-pull) must not regress the sync frontier. When
+        the new date would not advance it, the checkpoint row (including
+        `last_successful_report_run_id`, which tracks the run that set
+        the current frontier, not merely "most recently processed") is
+        left completely untouched and simply returned as-is."""
         existing = self.get(ads_profile_id)
         if existing is not None:
-            existing.synced_through_date = synced_through_date
-            existing.last_successful_report_run_id = report_run_id
-            self.session.flush()
+            if synced_through_date > existing.synced_through_date:
+                existing.synced_through_date = synced_through_date
+                existing.last_successful_report_run_id = report_run_id
+                self.session.flush()
             return existing
         row = AmazonAdsSyncCheckpoint(
             ads_profile_id=ads_profile_id,
