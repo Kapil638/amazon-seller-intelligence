@@ -51,9 +51,9 @@ jobs:
         working-directory: apps/api
         run: |
           uv run alembic heads | tee /tmp/heads.txt
-          grep -q "0020_ads_campaign_state_enum (head)" /tmp/heads.txt
+          grep -q "0021_ads_entity_sync_runs (head)" /tmp/heads.txt
           uv run alembic current | tee /tmp/current.txt
-          grep -q "0020_ads_campaign_state_enum" /tmp/current.txt
+          grep -q "0021_ads_entity_sync_runs" /tmp/current.txt
 
   existing-database-upgrade:
     name: Existing PostgreSQL (0008) — upgrade to 0009
@@ -595,6 +595,50 @@ jobs:
       # represent) lives in `tests/postgres/
       # test_disposable_postgres_amazon_ads_migration.py`, exercised by
       # the `postgres-identity-concurrency` job below (`pytest tests/
+      # postgres/`) rather than duplicated here as raw shell/SQL.
+
+  existing-database-upgrade-0021:
+    name: Existing PostgreSQL (0020) — upgrade to 0021
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: asi_ci_existing_0021
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/asi_ci_existing_0021
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install backend dependencies
+        working-directory: apps/api
+        run: uv sync
+      - name: alembic upgrade to 0020 (simulates an existing pre-PR-B2 database, already carrying PR B1)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0020_ads_campaign_state_enum
+      - name: alembic upgrade to 0021 (PR B2's own upgrade path — adds the entity-sync ledger/checkpoint tables only)
+        working-directory: apps/api
+        run: uv run alembic upgrade 0021_ads_entity_sync_runs
+      - name: Confirm final revision
+        working-directory: apps/api
+        run: uv run alembic current | grep -q "0021_ads_entity_sync_runs"
+      # The deeper behavioral proof (table/constraint shape, downgrade
+      # refusal while populated, lease-fencing concurrency under real
+      # Postgres) lives in `tests/postgres/
+      # test_disposable_postgres_ads_entity_sync_migration.py`, exercised
+      # by the `postgres-identity-concurrency` job below (`pytest tests/
       # postgres/`) rather than duplicated here as raw shell/SQL.
 
   postgres-identity-concurrency:

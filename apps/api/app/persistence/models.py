@@ -2830,6 +2830,112 @@ class AmazonAdsSyncCheckpoint(Base):
     )
 
 
+class AmazonAdsEntitySyncRun(Base):
+    """Sponsored Products entity-hierarchy sync lease/claim ledger — PR
+    B2. A dedicated table, never `amazon_ads_report_runs` (see migration
+    `0021`'s own module note: entity-list sync is a bounded-page GET
+    snapshot, not an async create/poll/download lifecycle, and shares no
+    Amazon-side state worth protecting against duplication). Lease
+    columns/vocabulary otherwise mirror `AmazonAdsReportRun` exactly, so
+    the claim/heartbeat/fenced-completion repository methods reuse the
+    same proven CAS shape.
+
+    Deliberately simpler resumption than Reporting v3: a stale lease
+    always terminalizes to `timed_out`, never auto-resumed — restarting
+    a paginated entity list from page 1 is always safe and idempotent."""
+
+    __tablename__ = "amazon_ads_entity_sync_runs"
+    __table_args__ = (
+        Index("ix_amazon_ads_entity_sync_runs_org", "organization_id"),
+        Index("ix_amazon_ads_entity_sync_runs_profile", "ads_profile_id"),
+        Index("ix_amazon_ads_entity_sync_runs_claimable", "status", "next_retry_at"),
+        CheckConstraint(
+            "entity_type IN ('campaign', 'ad_group', 'product_ad', 'keyword', 'product_target')",
+            name="ck_amazon_ads_entity_sync_runs_entity_type",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'started', 'waiting_to_retry', 'succeeded', 'failed', 'timed_out')",
+            name="ck_amazon_ads_entity_sync_runs_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pages_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_observed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_accepted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_schema_rejected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_unsupported_state: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_missing_parent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Populated only for a successful run — count of previously-known
+    # local rows this run's complete snapshot did NOT touch (see
+    # AmazonAdsEntitySyncCheckpointRepository's reconciliation query).
+    # Never mutates those rows; observability only.
+    reconciliation_stale_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
+class AmazonAdsEntitySyncCheckpoint(Base):
+    """One row per (advertiser profile, entity type) — records only the
+    timestamp of the last COMPLETE, successful full-snapshot sync. No
+    date-range semantics (unlike `AmazonAdsSyncCheckpoint`'s Reporting
+    v3 `synced_through_date`) — entity-list sync is a snapshot, not a
+    windowed pull."""
+
+    __tablename__ = "amazon_ads_entity_sync_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "ads_profile_id", "entity_type", name="uq_amazon_ads_entity_sync_checkpoints_profile_entity_type"
+        ),
+        Index("ix_amazon_ads_entity_sync_checkpoints_org", "organization_id"),
+        CheckConstraint(
+            "entity_type IN ('campaign', 'ad_group', 'product_ad', 'keyword', 'product_target')",
+            name="ck_amazon_ads_entity_sync_checkpoints_entity_type",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Guid(), primary_key=True, default=_uuid)
+    organization_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    ads_profile_id: Mapped[UUID] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_successful_run_id: Mapped[UUID | None] = mapped_column(
+        Guid(), ForeignKey("amazon_ads_entity_sync_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    organization: Mapped[Organization] = relationship()
+    profile: Mapped[AmazonAdsProfile] = relationship()
+
+
 class AmazonAdsSyncError(Base):
     """Queryable synchronization-failure history for one profile,
     independent of `amazon_ads_report_runs`' own retention — support can
