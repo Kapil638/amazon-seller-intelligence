@@ -303,11 +303,13 @@ async def test_425_without_a_report_id_retries_conservatively_not_permanently(mo
     connection_id, profile_id, secrets = _connected_profile()
     client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiDuplicateReportError("duplicate, no id")})
     service = AmazonAdsReportService(
-        settings=_settings(ads_report_poll_max_attempts=40), secret_provider=secrets, ads_client=client, lease_owner="w1"
+        settings=_settings(ads_report_duplicate_create_max_attempts=5),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
     )
     run_id = service.create_report_request(
         organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
     )
+    before = datetime.now(UTC)
     outcome = await service.process_one_claimed_job()
 
     assert outcome.outcome == "retrying"  # not "failed" — this is not treated as a permanent contract mismatch
@@ -316,21 +318,110 @@ async def test_425_without_a_report_id_retries_conservatively_not_permanently(mo
         assert run.status == "waiting_to_retry"
         assert run.failure_class == "report_create_duplicate_unresolved"
         assert run.amazon_report_id is None  # nothing fabricated
+        # Uses the dedicated duplicate-create delay setting, not the
+        # general poll interval — proven by an explicit, distinct value.
+        delta = (run.next_retry_at.replace(tzinfo=UTC) - before).total_seconds()
+        assert 0 < delta <= _settings(ads_report_duplicate_create_max_attempts=5).ads_report_duplicate_create_retry_seconds + 1
 
 
 @pytest.mark.asyncio
-async def test_425_without_a_report_id_cannot_loop_forever_and_eventually_fails_visibly(monkeypatch) -> None:
-    """Bounded by the same attempt-count budget as any other retryable
-    failure — repeated 425s (never resolving to an id) must terminate,
-    not hammer Amazon with identical creates indefinitely. Uses a
-    max-attempts of 1 so the very first claim already exhausts the
-    budget, matching the same proven pattern used for a genuine
-    permanent contract failure below."""
+async def test_425_without_a_report_id_honors_retry_after_over_the_dedicated_default(monkeypatch) -> None:
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(
+        raise_on={"create_report": AdsApiDuplicateReportError("duplicate, no id", retry_after_seconds=77.0)}
+    )
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_duplicate_create_retry_seconds=5.0),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(
+        organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
+    )
+    before = datetime.now(UTC)
+    await service.process_one_claimed_job()
+
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        # 77s is far outside the configured 5s default — only possible
+        # if Retry-After was honored directly, not the dedicated default.
+        delta = (run.next_retry_at.replace(tzinfo=UTC) - before).total_seconds()
+        assert 60 < delta < 95
+
+
+@pytest.mark.asyncio
+async def test_425_without_a_report_id_uses_its_own_small_budget_not_the_poll_budget(monkeypatch) -> None:
+    """Proves the dedicated ads_report_duplicate_create_max_attempts
+    budget is what's enforced, NOT ads_report_poll_max_attempts:
+    deliberately sets the poll budget large (40) and the duplicate-
+    create budget small (2), pre-seeds the row's attempt_count to
+    simulate it already being on its final allowed duplicate-create
+    attempt, and confirms it fails on exactly this attempt rather than
+    being allowed anywhere near 40."""
     monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
     connection_id, profile_id, secrets = _connected_profile()
     client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiDuplicateReportError("duplicate, no id")})
     service = AmazonAdsReportService(
-        settings=_settings(ads_report_poll_max_attempts=1), secret_provider=secrets, ads_client=client, lease_owner="w1"
+        settings=_settings(ads_report_poll_max_attempts=40, ads_report_duplicate_create_max_attempts=2),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(
+        organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
+    )
+    from app.persistence.models import AmazonAdsReportRun
+    import sqlalchemy as sa
+
+    # Pre-seed attempt_count=1 so THIS claim becomes the 2nd (final
+    # allowed) duplicate-create attempt under the small budget.
+    with session_scope() as session:
+        session.execute(sa.update(AmazonAdsReportRun).where(AmazonAdsReportRun.id == run_id).values(attempt_count=1))
+
+    outcome = await service.process_one_claimed_job()
+
+    assert outcome.outcome == "failed"
+    assert client.calls.count("create_report") == 1  # exactly one create call this invocation
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run.attempt_count == 2  # claim incremented 1 -> 2; 2 >= max(2) -> failed, proving the exact boundary
+        assert run.status == "failed"
+        assert run.failure_class == "report_create_duplicate_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_425_without_a_report_id_below_its_budget_still_retries(monkeypatch) -> None:
+    """Complements the exhaustion test above: one attempt below the
+    small dedicated budget must still retry, not fail early."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiDuplicateReportError("duplicate, no id")})
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_duplicate_create_max_attempts=3),
+        secret_provider=secrets, ads_client=client, lease_owner="w1",
+    )
+    run_id = service.create_report_request(
+        organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
+    )
+    outcome = await service.process_one_claimed_job()  # attempt_count becomes 1, 1 < 3
+
+    assert outcome.outcome == "retrying"
+    with session_scope() as session:
+        run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
+        assert run.attempt_count == 1
+        assert run.status == "waiting_to_retry"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_invalid_request_fails_immediately_not_left_started(monkeypatch) -> None:
+    """Fixes the exact bug flagged in PR #35 review: a non-425
+    AdsApiInvalidRequestError from create() must be caught, mark the
+    ledger row failed immediately with a distinct failure_class, record
+    a sanitized sync error, never schedule a retry, and never leave the
+    job `started` waiting for lease recovery."""
+    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
+    connection_id, profile_id, secrets = _connected_profile()
+    client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiInvalidRequestError("bad request shape")})
+    service = AmazonAdsReportService(
+        settings=_settings(ads_report_poll_max_attempts=40), secret_provider=secrets, ads_client=client, lease_owner="w1"
     )
     run_id = service.create_report_request(
         organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
@@ -338,35 +429,14 @@ async def test_425_without_a_report_id_cannot_loop_forever_and_eventually_fails_
     outcome = await service.process_one_claimed_job()
 
     assert outcome.outcome == "failed"
-    assert client.calls.count("create_report") == 1  # exactly one attempt — bounded, no retry storm
+    assert client.calls.count("create_report") == 1
+    assert client.calls.count("get_report_status") == 0  # never reached polling
     with session_scope() as session:
         run = AmazonAdsReportRunRepository(session).get_owned(ORG_ID, run_id)
-        assert run.status == "failed"
-        assert run.failure_class == "report_create_duplicate_unresolved"
-
-
-@pytest.mark.asyncio
-async def test_ordinary_invalid_request_is_never_caught_by_the_425_clause(monkeypatch) -> None:
-    """Regression guard: `AdsApiDuplicateReportError` and
-    `AdsApiInvalidRequestError` are unrelated exception types (no
-    inheritance) — adding the new 425 except clause must not somehow
-    start swallowing or reclassifying a genuine invalid-request error as
-    a duplicate-report case. On this baseline, AdsApiInvalidRequestError
-    is not yet caught by any clause in process_one_claimed_job (a
-    pre-existing gap addressed separately, not by this PR) — so it must
-    propagate exactly as it did before this PR, proving the new 425
-    clause is precisely scoped and does not intercept it."""
-    monkeypatch.setattr("app.amazon.ads_report_service.refresh_ads_access_token", _fake_refresh)
-    connection_id, profile_id, secrets = _connected_profile()
-    client = MockAmazonAdsApiClient(raise_on={"create_report": AdsApiInvalidRequestError("bad request shape")})
-    service = AmazonAdsReportService(
-        settings=_settings(ads_report_poll_max_attempts=40), secret_provider=secrets, ads_client=client, lease_owner="w1"
-    )
-    service.create_report_request(
-        organization_id=ORG_ID, ads_profile_id=profile_id, start_date=date(2020, 1, 1), end_date=date(2020, 1, 1)
-    )
-    with pytest.raises(AdsApiInvalidRequestError):
-        await service.process_one_claimed_job()
+        assert run.status == "failed"  # never left `started`
+        assert run.failure_class == "report_create_invalid_request"
+        assert run.next_retry_at is None  # no retry was ever scheduled
+        assert run.lease_owner is None
 
 
 @pytest.mark.asyncio

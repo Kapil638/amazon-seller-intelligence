@@ -263,6 +263,71 @@ def test_create_report_425_is_a_distinct_type_from_invalid_request() -> None:
     assert isinstance(raised, AdsApiDuplicateReportError)
 
 
+def test_create_report_425_with_a_whitespace_only_report_id_rejects_it() -> None:
+    """A structurally invalid identifier (blank once stripped) must
+    never be adopted — 'reject whitespace-only or structurally invalid
+    identifiers' per review."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "   "})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_with_a_non_string_report_id_rejects_it() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": 12345})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_id_is_stripped_of_incidental_whitespace() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "  r-padded-1  "})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id == "r-padded-1"
+
+
+# --- 425 interpretation is scoped to report creation only, never any
+# other Ads operation (per review) -----------------------------------
+
+
+def test_a_425_from_report_status_polling_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.get_report_status(_ctx(), "r-1"))
+
+
+def test_a_425_from_campaign_list_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.list_campaigns(_ctx()))
+
+
+def test_a_425_from_profiles_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.list_profiles(_ctx()))
+
+
 # --- Report status parsing strictness ----------------------------------
 
 
