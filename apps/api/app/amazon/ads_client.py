@@ -59,6 +59,7 @@ from app.amazon.ads_models import (
 )
 from app.core.exceptions import (
     AdsApiAuthenticationError,
+    AdsApiDuplicateReportError,
     AdsApiInvalidRequestError,
     AdsApiParseFailedError,
     AdsApiRateLimitedError,
@@ -281,7 +282,7 @@ class HttpAmazonAdsApiClient:
             headers[HEADER_SCOPE] = ctx.profile_id
         return headers
 
-    def _raise_for_status(self, response: httpx.Response) -> None:
+    def _raise_for_status(self, response: httpx.Response, *, treat_425_as_duplicate_report: bool = False) -> None:
         status = response.status_code
         if status < 300:
             return
@@ -291,6 +292,45 @@ class HttpAmazonAdsApiClient:
             retry_after = response.headers.get("Retry-After")
             retry_seconds = float(retry_after) if retry_after and retry_after.strip().isdigit() else None
             raise AdsApiRateLimitedError("Amazon Ads API rate limit reached.", retry_after_seconds=retry_seconds)
+        if status == 425 and treat_425_as_duplicate_report:
+            # Amazon's documented duplicate/in-flight-report response,
+            # scoped deliberately to the ONE operation this is actually
+            # documented for (POST /reporting/reports — see
+            # AdsApiDuplicateReportError's docstring). `treat_425_as_
+            # duplicate_report` must be passed explicitly by that one
+            # call site; every other operation (entity lists, profiles,
+            # report-status polling, download) falls through to the
+            # generic 4xx branch below for a 425, since Amazon's own
+            # documentation never states this interpretation applies
+            # there — inferring it would be exactly the kind of
+            # unverified generalization this codebase has been burned by
+            # twice already (campaign media type, reporting body shape).
+            #
+            # The 425 response BODY schema itself is not documented
+            # anywhere consulted — this defensively checks for the one
+            # field name Amazon's own documented 200 create/status
+            # response is confirmed to use (`reportId`), treating a
+            # well-formed, non-blank value as a cautiously usable
+            # identifier — never inventing one when absent, and never
+            # accepting a whitespace-only or non-string value.
+            # response.json() is safe to call here: httpx has already
+            # fully read the body for this non-streaming request.
+            existing_report_id: str | None = None
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                candidate = body.get("reportId")
+                if isinstance(candidate, str) and candidate.strip():
+                    existing_report_id = candidate.strip()
+            retry_after = response.headers.get("Retry-After")
+            retry_seconds = float(retry_after) if retry_after and retry_after.strip().isdigit() else None
+            raise AdsApiDuplicateReportError(
+                "Amazon Ads API reported a duplicate/in-flight report request (HTTP 425).",
+                existing_report_id=existing_report_id,
+                retry_after_seconds=retry_seconds,
+            )
         if 400 <= status < 500:
             raise AdsApiInvalidRequestError("Amazon Ads API rejected the request.")
         raise AdsApiRequestFailedError("Amazon Ads API request failed.")
@@ -304,6 +344,7 @@ class HttpAmazonAdsApiClient:
         with_scope: bool,
         json_body: dict | None = None,
         media_type: str | None = None,
+        treat_425_as_duplicate_report: bool = False,
     ) -> dict:
         base = resolve_region_base_url(ctx.region)
         headers = self._headers(ctx, with_scope=with_scope)
@@ -324,7 +365,7 @@ class HttpAmazonAdsApiClient:
             raise AdsApiRequestFailedError("Amazon Ads API request timed out.") from None
         except httpx.HTTPError:
             raise AdsApiRequestFailedError("Could not reach the Amazon Ads API.") from None
-        self._raise_for_status(response)
+        self._raise_for_status(response, treat_425_as_duplicate_report=treat_425_as_duplicate_report)
         try:
             payload = response.json()
         except ValueError:
@@ -420,8 +461,23 @@ class HttpAmazonAdsApiClient:
         )
 
     async def create_report(self, ctx: AdsRequestContext, configuration: AdsReportRequestConfiguration) -> AdsReportStatusResponse:
+        # Media type per the Reporting v3 get-started guide (see
+        # docs/AI_HANDOVER/23_AMAZON_ADS_API_OFFICIAL_RESEARCH_AND_INGESTION_BLUEPRINT.md
+        # §9). Previously sent generic application/json — that succeeded
+        # live twice (PR #33/#34) despite not matching the documented
+        # contract; this brings the request in line with the documented
+        # media type. Not yet independently live-verified with this
+        # exact header — flagged for the next authorized live check.
         payload = await self._request_json(
-            ctx, "POST", "/reporting/reports", with_scope=True, json_body=configuration.model_dump(by_alias=True, mode="json")
+            ctx,
+            "POST",
+            "/reporting/reports",
+            with_scope=True,
+            media_type="application/vnd.createasyncreportrequest.v3+json",
+            json_body=configuration.model_dump(by_alias=True, mode="json"),
+            # The 425-duplicate-report interpretation applies ONLY to
+            # this operation — see _raise_for_status's own comment.
+            treat_425_as_duplicate_report=True,
         )
         try:
             return AdsReportStatusResponse.model_validate(payload)

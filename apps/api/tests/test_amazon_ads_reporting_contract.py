@@ -34,7 +34,12 @@ from app.amazon.ads_models import (
 from app.amazon.ads_report_service import AmazonAdsReportService, report_name_for_run
 from app.amazon.secrets import DevelopmentSecretProvider, build_asi_secret_reference
 from app.core.config import DEFAULT_DEVELOPMENT_ORGANIZATION_ID, Settings
-from app.core.exceptions import AdsApiInvalidRequestError, AdsApiParseFailedError, AdsApiRequestFailedError
+from app.core.exceptions import (
+    AdsApiDuplicateReportError,
+    AdsApiInvalidRequestError,
+    AdsApiParseFailedError,
+    AdsApiRequestFailedError,
+)
 from app.persistence.database import reset_persistence, session_scope
 from app.persistence.repositories import (
     AmazonAdsConnectionRepository,
@@ -151,6 +156,24 @@ def test_http_client_sends_the_exact_nested_body_on_the_wire() -> None:
     assert captured["body"]["configuration"]["adProduct"] == "SPONSORED_PRODUCTS"
 
 
+def test_create_report_sends_the_documented_media_type() -> None:
+    """Per docs/AI_HANDOVER/23_..._BLUEPRINT.md §9 (Reporting v3
+    get-started guide, officially verified): Content-Type must be
+    application/vnd.createasyncreportrequest.v3+json."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content_type"] = request.headers.get("content-type")
+        captured["accept"] = request.headers.get("accept")
+        return httpx.Response(200, json={"reportId": "r-live-1", "status": "PENDING"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    asyncio.run(client.create_report(_ctx(), _configuration()))
+
+    assert captured["content_type"] == "application/vnd.createasyncreportrequest.v3+json"
+    assert captured["accept"] == "application/vnd.createasyncreportrequest.v3+json"
+
+
 def test_create_report_never_logs_secrets(caplog: pytest.LogCaptureFixture) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"reportId": "r-1", "status": "PENDING"})
@@ -176,6 +199,133 @@ def test_create_report_reproduces_the_real_400_when_configuration_is_missing() -
     client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
     with pytest.raises(AdsApiInvalidRequestError):
         asyncio.run(client.create_report(_ctx(), _configuration()))
+
+
+# --- HTTP 425 duplicate/in-flight report (docs/AI_HANDOVER/23_...
+# _BLUEPRINT.md §9/§13.9: "wait and poll the in-flight identical
+# report; do not treat as malformed body") ------------------------------
+
+
+def test_create_report_425_with_a_report_id_is_never_invalid_request() -> None:
+    """The single field name Amazon's own documented 200 response uses
+    (reportId) is checked defensively; when present, it must be surfaced
+    on the exception, never dropped or treated as a generic 4xx."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-existing-1", "message": "duplicate request"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id == "r-existing-1"
+
+
+def test_create_report_425_without_a_report_id_leaves_it_none_not_fabricated() -> None:
+    """No official schema is documented for the 425 body. When no
+    reportId field is present, existing_report_id must be None — never
+    guessed from something else in the body."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"message": "duplicate request", "details": "try again later"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_with_a_non_json_body_still_raises_cleanly() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, content=b"not json")
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_is_a_distinct_type_from_invalid_request() -> None:
+    """Regression guard for the exact bug this PR fixes: a 425 must
+    never be catchable by an `except AdsApiInvalidRequestError` clause —
+    that exception's own contract is "never retried"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-x"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    try:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - inspecting the exact type deliberately
+        raised = exc
+    assert raised is not None
+    assert not isinstance(raised, AdsApiInvalidRequestError)
+    assert isinstance(raised, AdsApiDuplicateReportError)
+
+
+def test_create_report_425_with_a_whitespace_only_report_id_rejects_it() -> None:
+    """A structurally invalid identifier (blank once stripped) must
+    never be adopted — 'reject whitespace-only or structurally invalid
+    identifiers' per review."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "   "})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_with_a_non_string_report_id_rejects_it() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": 12345})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id is None
+
+
+def test_create_report_425_id_is_stripped_of_incidental_whitespace() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "  r-padded-1  "})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiDuplicateReportError) as excinfo:
+        asyncio.run(client.create_report(_ctx(), _configuration()))
+    assert excinfo.value.existing_report_id == "r-padded-1"
+
+
+# --- 425 interpretation is scoped to report creation only, never any
+# other Ads operation (per review) -----------------------------------
+
+
+def test_a_425_from_report_status_polling_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.get_report_status(_ctx(), "r-1"))
+
+
+def test_a_425_from_campaign_list_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.list_campaigns(_ctx()))
+
+
+def test_a_425_from_profiles_is_not_classified_as_duplicate_report() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(425, json={"reportId": "r-should-not-matter"})
+
+    client = HttpAmazonAdsApiClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdsApiInvalidRequestError):
+        asyncio.run(client.list_profiles(_ctx()))
 
 
 # --- Report status parsing strictness ----------------------------------

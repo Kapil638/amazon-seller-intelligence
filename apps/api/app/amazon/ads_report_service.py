@@ -41,6 +41,8 @@ from app.amazon.ads_models import AdsReportConfigurationBody, AdsReportRequestCo
 from app.amazon.secrets import SecretNotFoundError, SecretProvider
 from app.core.config import Settings
 from app.core.exceptions import (
+    AdsApiDuplicateReportError,
+    AdsApiInvalidRequestError,
     AdsApiRateLimitedError,
     AdsApiRequestFailedError,
     AdsReportFailedError,
@@ -224,6 +226,87 @@ class AmazonAdsReportService:
                     return await self._download_and_ingest(
                         run_id, organization_id, ads_profile_id, ctx, created.url
                     )
+        except AdsApiDuplicateReportError as exc:
+            # HTTP 425 on create only (see _raise_for_status's
+            # treat_425_as_duplicate_report scoping). Never
+            # AdsApiInvalidRequestError, never a fabricated report id —
+            # see AdsApiDuplicateReportError's own docstring for exactly
+            # what is and is not officially confirmed here.
+            if exc.existing_report_id:
+                # A cautiously usable id was present in the response —
+                # adopt it exactly like a normal successful create and
+                # fall through to polling below. No second create is
+                # ever issued for it. (Whether Amazon's 425 body always
+                # names the existing report this way is NOT confirmed —
+                # see the exception's docstring; this is the safer of
+                # two imperfect options, not a confirmed contract.)
+                amazon_report_id = exc.existing_report_id
+                with session_scope() as session:
+                    AmazonAdsReportRunRepository(session).set_amazon_report(
+                        run_id, amazon_report_id=amazon_report_id, amazon_report_status="PENDING"
+                    )
+            else:
+                # No id was discoverable in the response (undocumented
+                # schema — see the exception's docstring). Uses a
+                # deliberately separate, small budget
+                # (ads_report_duplicate_create_max_attempts, default 3)
+                # — NEVER ads_report_poll_max_attempts (~40) — since
+                # Amazon is telling us an identical report already
+                # exists; that many repeated identical creates would be
+                # far too aggressive for a condition this narrow. Reuses
+                # the ledger row's existing attempt_count counter (no
+                # schema change) against this smaller threshold rather
+                # than introducing a second persisted counter; a run
+                # that already accumulated attempts from unrelated
+                # earlier failures before hitting a 425 will exhaust
+                # this budget sooner, which is conservative, not wrong.
+                # Prefers Amazon's own Retry-After when present (425
+                # does not typically carry one, but this is not assumed
+                # either way); handled directly here rather than through
+                # _retry_or_fail, which stays untouched for the separate
+                # resumability PR.
+                if attempt_count >= self._cfg.ads_report_duplicate_create_max_attempts:
+                    with session_scope() as session:
+                        AmazonAdsReportRunRepository(session).mark_failed(
+                            run_id, failure_class="report_create_duplicate_unresolved", failure_detail=str(exc)
+                        )
+                        AmazonAdsSyncErrorRepository(session).record(
+                            organization_id, ads_profile_id, error_code="report_create_duplicate_unresolved",
+                            error_message=str(exc), report_run_id=run_id,
+                        )
+                    return ReportJobOutcome(report_run_id=run_id, outcome="failed")
+                delay = (
+                    exc.retry_after_seconds
+                    if exc.retry_after_seconds is not None
+                    else self._cfg.ads_report_duplicate_create_retry_seconds
+                )
+                next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
+                with session_scope() as session:
+                    AmazonAdsReportRunRepository(session).mark_retry(
+                        run_id, next_retry_at=next_retry_at,
+                        failure_class="report_create_duplicate_unresolved", failure_detail=str(exc),
+                    )
+                    AmazonAdsSyncErrorRepository(session).record(
+                        organization_id, ads_profile_id, error_code="report_create_duplicate_unresolved",
+                        error_message=str(exc), report_run_id=run_id,
+                    )
+                return ReportJobOutcome(report_run_id=run_id, outcome="retrying")
+        except AdsApiInvalidRequestError as exc:
+            # Permanent: Amazon rejected the request shape outright —
+            # unrelated to the 425 duplicate-report case above (a 425
+            # never reaches this branch; see _raise_for_status). Fails
+            # immediately rather than leaving the row `started` until
+            # lease recovery — this is a real contract/schema error, not
+            # a transient condition retrying could ever resolve.
+            with session_scope() as session:
+                AmazonAdsReportRunRepository(session).mark_failed(
+                    run_id, failure_class="report_create_invalid_request", failure_detail=str(exc)
+                )
+                AmazonAdsSyncErrorRepository(session).record(
+                    organization_id, ads_profile_id, error_code="report_create_invalid_request",
+                    error_message=str(exc), report_run_id=run_id,
+                )
+            return ReportJobOutcome(report_run_id=run_id, outcome="failed")
         except (AdsApiRateLimitedError, AdsApiRequestFailedError) as exc:
             return await self._retry_or_fail(
                 run_id, organization_id, ads_profile_id, attempt_count,

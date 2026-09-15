@@ -735,6 +735,24 @@ class Settings(BaseSettings):
         default=300, ge=30, le=3600,
         description="How long a claimed Ads report job's lease is valid before it is eligible for stale-lease recovery.",
     )
+    ads_report_duplicate_create_max_attempts: int = Field(
+        default=3, ge=1, le=10,
+        description=(
+            "Deliberately separate, small budget for HTTP 425 'duplicate/in-flight report' "
+            "responses on create that never resolve to a usable report id. NEVER reuse "
+            "ads_report_poll_max_attempts (~40) for this — Amazon is telling us an identical "
+            "report already exists; repeated identical creates at that scale would be far too "
+            "aggressive for a condition this narrow."
+        ),
+    )
+    ads_report_duplicate_create_retry_seconds: float = Field(
+        default=15.0, gt=0, le=300,
+        description=(
+            "Delay before retrying a create after an unresolved HTTP 425, when Amazon did not "
+            "supply a usable Retry-After value. Deliberately its own setting, independent of "
+            "ads_report_poll_interval_seconds."
+        ),
+    )
     ads_report_max_download_bytes: int = Field(
         default=52_428_800, ge=1_024,
         description="Hard cap on a downloaded Ads report body size, checked before and during download — never trust Content-Length alone.",
